@@ -474,6 +474,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "e_bdk_electrum"
+version = "0.1.0"
+
+[[package]]
 name = "e_electrum_client"
 version = "0.1.0"
 dependencies = [
