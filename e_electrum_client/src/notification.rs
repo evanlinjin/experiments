@@ -1,39 +1,34 @@
 use serde::Deserialize;
-use serde_json::Value;
 
-use crate::{
-    CowStr, ElectrumScriptHash, ElectrumScriptStatus, HeadersSubscribeResp,
-    NotificationMethodAndParams,
-};
+use crate::{response, ElectrumScriptHash, ElectrumScriptStatus, RawNotification};
 
 #[derive(Debug, Clone)]
 pub enum Notification {
     Header(HeaderNotification),
     ScriptHash(ScriptHashNotification),
-    Unknown { method: CowStr, params: Value },
+    Unknown(UnknownNotification),
 }
 
-impl TryFrom<NotificationMethodAndParams> for Notification {
-    type Error = serde_json::Error;
-
-    fn try_from((method, params): NotificationMethodAndParams) -> Result<Self, Self::Error> {
+impl Notification {
+    pub fn new(raw: &RawNotification) -> Result<Self, serde_json::Error> {
+        let RawNotification { method, params, .. } = raw;
         match method.as_ref() {
             "blockchain.headers.subscribe" => {
-                let inner = HeaderNotification::deserialize(params)?;
-                Ok(Self::Header(inner))
+                HeaderNotification::deserialize(params).map(Notification::Header)
             }
             "blockchain.scripthash.subscribe" => {
-                let inner = ScriptHashNotification::deserialize(params)?;
-                Ok(Self::ScriptHash(inner))
+                ScriptHashNotification::deserialize(params).map(Notification::ScriptHash)
             }
-            _ => Ok(Self::Unknown { method, params }),
+            _ => Ok(Notification::Unknown(raw.clone())),
         }
     }
 }
 
+pub type UnknownNotification = RawNotification;
+
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct HeaderNotification {
-    param_0: HeadersSubscribeResp,
+    param_0: response::HeadersSubscribeResp,
 }
 
 impl HeaderNotification {

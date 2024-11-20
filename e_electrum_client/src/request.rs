@@ -1,45 +1,57 @@
 use bitcoin::{consensus::Encodable, hex::DisplayHex, Script, Txid};
 use serde::Deserialize;
+use serde_json::Value;
 
-use crate::{
-    ElectrumScriptHash, ElectrumScriptStatus, EstimateFeeResp, FeePair, FullTx, GetBalanceResp,
-    HeaderResp, HeadersResp, HeadersSubscribeResp, MempoolTx, RelayFeeResp, RequestMethodAndParams,
-    Tx, TxMerkle, TxidFromPos, Utxo,
-};
+use crate::{response, CowStr, ElectrumScriptHash, ElectrumScriptStatus, MethodAndParams};
 
 /// The caller-facing [`Request`].
-///
-/// TODO: check_response(&self, resp: &Self::Response) method.
-pub trait Request {
+pub trait Request: Clone {
     /// The associated response type of this request.
-    type Response: for<'a> Deserialize<'a>;
-    fn into_method_and_params(self) -> RequestMethodAndParams;
+    type Response: for<'a> Deserialize<'a> + Clone + Send + Sync + 'static;
+
+    fn to_method_and_params(&self) -> MethodAndParams;
 }
 
-impl Request for RequestMethodAndParams {
+#[derive(Debug, Clone)]
+pub struct Custom {
+    pub method: CowStr,
+    pub params: Vec<Value>,
+}
+
+impl Request for Custom {
     type Response = serde_json::Value;
 
-    fn into_method_and_params(self) -> RequestMethodAndParams {
-        self
+    fn to_method_and_params(&self) -> MethodAndParams {
+        (self.method.clone(), self.params.clone())
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct Header {
     pub height: u32,
-    pub cp_height: Option<u32>,
 }
 
 impl Request for Header {
-    type Response = HeaderResp;
-    fn into_method_and_params(self) -> RequestMethodAndParams {
-        ("blockchain.block.header".into(), {
-            let mut params = vec![self.height.into()];
-            if let Some(cp_height) = self.cp_height {
-                params.push(cp_height.into());
-            }
-            params
-        })
+    type Response = response::HeaderResp;
+    fn to_method_and_params(&self) -> MethodAndParams {
+        ("blockchain.block.header".into(), vec![self.height.into()])
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct HeaderWithProof {
+    pub height: u32,
+    pub cp_height: u32,
+}
+
+impl Request for HeaderWithProof {
+    type Response = response::HeaderWithProofResp;
+
+    fn to_method_and_params(&self) -> MethodAndParams {
+        (
+            "blockchain.block.header".into(),
+            vec![self.height.into(), self.cp_height.into()],
+        )
     }
 }
 
@@ -51,9 +63,9 @@ pub struct Headers {
 }
 
 impl Request for Headers {
-    type Response = HeadersResp;
+    type Response = response::HeadersResp;
 
-    fn into_method_and_params(self) -> RequestMethodAndParams {
+    fn to_method_and_params(&self) -> MethodAndParams {
         ("blockchain.block.headers".into(), {
             let mut params = vec![self.start_height.into(), self.count.into()];
             if let Some(cp_height) = self.cp_height {
@@ -70,9 +82,9 @@ pub struct EstimateFee {
 }
 
 impl Request for EstimateFee {
-    type Response = EstimateFeeResp;
+    type Response = response::EstimateFeeResp;
 
-    fn into_method_and_params(self) -> RequestMethodAndParams {
+    fn to_method_and_params(&self) -> MethodAndParams {
         ("blockchain.estimatefee".into(), vec![self.number.into()])
     }
 }
@@ -81,9 +93,9 @@ impl Request for EstimateFee {
 pub struct HeadersSubscribe;
 
 impl Request for HeadersSubscribe {
-    type Response = HeadersSubscribeResp;
+    type Response = response::HeadersSubscribeResp;
 
-    fn into_method_and_params(self) -> RequestMethodAndParams {
+    fn to_method_and_params(&self) -> MethodAndParams {
         ("blockchain.headers.subscribe".into(), vec![])
     }
 }
@@ -92,9 +104,9 @@ impl Request for HeadersSubscribe {
 pub struct RelayFee;
 
 impl Request for RelayFee {
-    type Response = RelayFeeResp;
+    type Response = response::RelayFeeResp;
 
-    fn into_method_and_params(self) -> RequestMethodAndParams {
+    fn to_method_and_params(&self) -> MethodAndParams {
         ("blockchain.relayfee".into(), vec![])
     }
 }
@@ -112,9 +124,9 @@ impl GetBalance {
 }
 
 impl Request for GetBalance {
-    type Response = GetBalanceResp;
+    type Response = response::GetBalanceResp;
 
-    fn into_method_and_params(self) -> RequestMethodAndParams {
+    fn to_method_and_params(&self) -> MethodAndParams {
         (
             "blockchain.scripthash.get_balance".into(),
             vec![self.script_hash.to_string().into()],
@@ -135,9 +147,9 @@ impl GetHistory {
 }
 
 impl Request for GetHistory {
-    type Response = Vec<Tx>;
+    type Response = Vec<response::Tx>;
 
-    fn into_method_and_params(self) -> RequestMethodAndParams {
+    fn to_method_and_params(&self) -> MethodAndParams {
         (
             "blockchain.scripthash.get_history".into(),
             vec![self.script_hash.to_string().into()],
@@ -162,9 +174,9 @@ impl GetMempool {
 
 impl Request for GetMempool {
     // TODO: Dedicated type.
-    type Response = Vec<MempoolTx>;
+    type Response = Vec<response::MempoolTx>;
 
-    fn into_method_and_params(self) -> RequestMethodAndParams {
+    fn to_method_and_params(&self) -> MethodAndParams {
         (
             "blockchain.scripthash.get_mempool".into(),
             vec![self.script_hash.to_string().into()],
@@ -185,9 +197,9 @@ impl ListUnspent {
 }
 
 impl Request for ListUnspent {
-    type Response = Vec<Utxo>;
+    type Response = Vec<response::Utxo>;
 
-    fn into_method_and_params(self) -> RequestMethodAndParams {
+    fn to_method_and_params(&self) -> MethodAndParams {
         (
             "blockchain.scripthash.listunspent".into(),
             vec![self.script_hash.to_string().into()],
@@ -210,7 +222,7 @@ impl ScriptHashSubscribe {
 impl Request for ScriptHashSubscribe {
     type Response = Option<ElectrumScriptStatus>;
 
-    fn into_method_and_params(self) -> RequestMethodAndParams {
+    fn to_method_and_params(&self) -> MethodAndParams {
         (
             "blockchain.scripthash.subscribe".into(),
             vec![self.script_hash.to_string().into()],
@@ -233,7 +245,7 @@ impl ScriptHashUnsubscribe {
 impl Request for ScriptHashUnsubscribe {
     type Response = bool;
 
-    fn into_method_and_params(self) -> RequestMethodAndParams {
+    fn to_method_and_params(&self) -> MethodAndParams {
         (
             "blockchain.scripthash.unsubscribe".into(),
             vec![self.script_hash.to_string().into()],
@@ -247,7 +259,7 @@ pub struct BroadcastTx(pub bitcoin::Transaction);
 impl Request for BroadcastTx {
     type Response = bitcoin::Txid;
 
-    fn into_method_and_params(self) -> RequestMethodAndParams {
+    fn to_method_and_params(&self) -> MethodAndParams {
         let mut tx_bytes = Vec::<u8>::new();
         self.0.consensus_encode(&mut tx_bytes).expect("must encode");
         (
@@ -257,12 +269,13 @@ impl Request for BroadcastTx {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct GetTx(pub bitcoin::Txid);
 
 impl Request for GetTx {
-    type Response = FullTx;
+    type Response = response::FullTx;
 
-    fn into_method_and_params(self) -> RequestMethodAndParams {
+    fn to_method_and_params(&self) -> MethodAndParams {
         (
             "blockchain.transaction.get".into(),
             vec![self.0.to_string().into()],
@@ -277,9 +290,9 @@ pub struct GetTxMerkle {
 }
 
 impl Request for GetTxMerkle {
-    type Response = TxMerkle;
+    type Response = response::TxMerkle;
 
-    fn into_method_and_params(self) -> RequestMethodAndParams {
+    fn to_method_and_params(&self) -> MethodAndParams {
         (
             "blockchain.transaction.get_merkle".into(),
             vec![self.txid.to_string().into(), self.height.into()],
@@ -294,9 +307,9 @@ pub struct GetTxidFromPos {
 }
 
 impl Request for GetTxidFromPos {
-    type Response = TxidFromPos;
+    type Response = response::TxidFromPos;
 
-    fn into_method_and_params(self) -> RequestMethodAndParams {
+    fn to_method_and_params(&self) -> MethodAndParams {
         (
             "blockchain.transaction.id_from_pos".into(),
             vec![self.height.into(), self.tx_pos.into()],
@@ -308,9 +321,9 @@ impl Request for GetTxidFromPos {
 pub struct GetFeeHistogram;
 
 impl Request for GetFeeHistogram {
-    type Response = Vec<FeePair>;
+    type Response = Vec<response::FeePair>;
 
-    fn into_method_and_params(self) -> RequestMethodAndParams {
+    fn to_method_and_params(&self) -> MethodAndParams {
         ("mempool.get_fee_histogram".into(), vec![])
     }
 }
@@ -321,7 +334,7 @@ pub struct Banner;
 impl Request for Banner {
     type Response = String;
 
-    fn into_method_and_params(self) -> RequestMethodAndParams {
+    fn to_method_and_params(&self) -> MethodAndParams {
         ("server.banner".into(), vec![])
     }
 }
@@ -332,7 +345,7 @@ pub struct Ping;
 impl Request for Ping {
     type Response = ();
 
-    fn into_method_and_params(self) -> RequestMethodAndParams {
+    fn to_method_and_params(&self) -> MethodAndParams {
         ("server.ping".into(), vec![])
     }
 }

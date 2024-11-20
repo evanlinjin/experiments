@@ -1,36 +1,24 @@
 use bitcoin::{
     absolute,
-    block::Header,
     hashes::{Hash, HashEngine},
-    Amount, TxMerkleNode,
+    Amount,
 };
 
 use crate::DoubleSHA;
 
-#[derive(Debug, Clone, serde::Deserialize)]
-#[serde(untagged)]
-pub enum HeaderResp {
+#[derive(Debug, Clone, serde::Deserialize, PartialEq, Eq)]
+#[serde(transparent)]
+pub struct HeaderResp {
     #[serde(deserialize_with = "crate::custom_serde::from_consensus_hex")]
-    Header(Header),
-    HeaderWithProof {
-        branch: Vec<DoubleSHA>,
-        #[serde(deserialize_with = "crate::custom_serde::from_consensus_hex")]
-        header: Header,
-        root: DoubleSHA,
-    },
+    pub header: bitcoin::block::Header,
 }
 
-impl HeaderResp {
-    pub fn as_header(&self) -> &Header {
-        match self {
-            HeaderResp::Header(header) => header,
-            HeaderResp::HeaderWithProof { header, .. } => header,
-        }
-    }
-
-    pub fn into_header(self) -> Header {
-        *self.as_header()
-    }
+#[derive(Debug, Clone, serde::Deserialize, PartialEq, Eq)]
+pub struct HeaderWithProofResp {
+    pub branch: Vec<DoubleSHA>,
+    #[serde(deserialize_with = "crate::custom_serde::from_consensus_hex")]
+    pub header: bitcoin::block::Header,
+    pub root: DoubleSHA,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -40,7 +28,7 @@ pub struct HeadersResp {
         rename = "hex",
         deserialize_with = "crate::custom_serde::from_cancat_consensus_hex"
     )]
-    pub headers: Vec<Header>,
+    pub headers: Vec<bitcoin::block::Header>,
     pub max: usize,
     pub root: DoubleSHA,
     pub branch: Vec<DoubleSHA>,
@@ -59,7 +47,7 @@ pub struct HeadersSubscribeResp {
         rename = "hex",
         deserialize_with = "crate::custom_serde::from_consensus_hex"
     )]
-    pub header: Header,
+    pub header: bitcoin::block::Header,
     pub height: u32,
 }
 
@@ -90,6 +78,13 @@ impl Tx {
         match self {
             Tx::Mempool(MempoolTx { txid, .. }) => *txid,
             Tx::Confirmed(ConfirmedTx { txid, .. }) => *txid,
+        }
+    }
+
+    pub fn confirmation_height(&self) -> Option<absolute::Height> {
+        match self {
+            Tx::Mempool(_) => None,
+            Tx::Confirmed(ConfirmedTx { height, .. }) => Some(*height),
         }
     }
 }
@@ -140,7 +135,7 @@ pub struct TxMerkle {
 
 impl TxMerkle {
     /// Returns the merkle root of a [`Header`] which satisfies this proof.
-    pub fn expected_merkle_root(&self, txid: bitcoin::Txid) -> TxMerkleNode {
+    pub fn expected_merkle_root(&self, txid: bitcoin::Txid) -> bitcoin::TxMerkleNode {
         let mut index = self.pos;
         let mut cur = txid.to_raw_hash();
         for next_hash in &self.merkle {

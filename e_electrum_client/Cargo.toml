@@ -1,6 +1,6 @@
 [package]
 name = "e_electrum_client"
-version = "0.1.0"
+version = "0.2.0"
 description = "Experimental but sane electrum client by @evanlinjin."
 license = "MIT OR Apache-2.0"
 edition = "2021"
@@ -18,4 +18,4 @@ bitcoin = { version = "0.32", features = ["serde"] }
 [dev-dependencies]
 async-std = "1.13.0"
 bdk_testenv = "0.10.0"
-futures = { version = "0.3", features = ["executor"] }
+futures = { version = "0.3", features = ["thread-pool"] }

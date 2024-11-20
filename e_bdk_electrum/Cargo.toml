@@ -1,6 +1,17 @@
 [package]
 name = "e_bdk_electrum"
 version = "0.1.0"
+description = "Experimental but sane BDK electrum client by @evanlinjin."
+license = "MIT OR Apache-2.0"
 edition = "2021"
+rust-version = "1.63"
+repository = "https://github.com/evanlinjin/experiments"
+documentation = "https://docs.rs/e_bdk_electrum"
+readme = "README.md"
 
 [dependencies]
+futures = "0.3"
+anyhow = "1.0"
+bdk_core = "0.3.0"
+miniscript = { version = "12.0.0" }
+e_electrum_client = { path = "../e_electrum_client", version = "0.2.0" }
