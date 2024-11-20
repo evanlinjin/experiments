@@ -6,6 +6,9 @@ use serde::{
     de::{Error, Unexpected},
     Deserialize, Deserializer,
 };
+use serde_json::Value;
+
+use crate::{CowStr, Version, JSONRPC_VERSION_2_0};
 
 pub fn from_consensus_hex<'de, T, D>(deserializer: D) -> Result<T, D::Error>
 where
@@ -105,4 +108,32 @@ where
             &"0 or -1",
         ))),
     }
+}
+
+pub fn result<'de, D>(deserializer: D) -> Result<Result<Value, Value>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Debug, Deserialize)]
+    pub enum T {
+        #[serde(rename(deserialize = "result"))]
+        Result(Value),
+        #[serde(rename(deserialize = "error"))]
+        Error(Value),
+    }
+    T::deserialize(deserializer).map(|r| match r {
+        T::Result(v) => Ok(v),
+        T::Error(e) => Err(e),
+    })
+}
+
+pub fn version<'de, D>(deserializer: D) -> Result<Version, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let version_str = CowStr::deserialize(deserializer)?;
+    if version_str != JSONRPC_VERSION_2_0 {
+        return Err(serde::de::Error::custom("JSON-RPC version is not 2.0"));
+    }
+    Ok(Version)
 }
