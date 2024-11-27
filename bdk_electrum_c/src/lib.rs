@@ -1,10 +1,11 @@
 //! BDK Electrum goodness.
 
 use bdk_core::spk_client::FullScanResult;
-use e_electrum_client::client::TrySendRequestError;
-use e_electrum_client::notification::Notification;
-use e_electrum_client::pending_request::SatisfiedRequest;
-use e_electrum_client::{request, Client, ElectrumScriptHash, Event};
+use electrum_c::notification::Notification;
+use electrum_c::pending_request::SatisfiedRequest;
+use electrum_c::{request, Client, ElectrumScriptHash, Event};
+use futures::channel::mpsc::{self, UnboundedReceiver};
+use futures::{pin_mut, select, AsyncRead, AsyncWrite, FutureExt, StreamExt};
 
 use std::collections::{btree_map, hash_map, BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -48,12 +49,7 @@ impl<K: Clone + Ord + Send + Sync + 'static> DerivedSpkTracker<K> {
         self.derived_spks.values().copied()
     }
 
-    async fn _track_derived_spk(
-        &mut self,
-        client: &Client,
-        keychain: K,
-        index: u32,
-    ) -> Result<bool, TrySendRequestError> {
+    fn _add_derived_spk(&mut self, keychain: K, index: u32) -> Option<ElectrumScriptHash> {
         if let btree_map::Entry::Vacant(spk_hash_entry) =
             self.derived_spks.entry((keychain.clone(), index))
         {
@@ -71,10 +67,9 @@ impl<K: Clone + Ord + Send + Sync + 'static> DerivedSpkTracker<K> {
                 .derived_spks_rev
                 .insert(script_hash, (keychain, index))
                 .is_none());
-            client.request_event(request::ScriptHashSubscribe { script_hash })?;
-            return Ok(true);
+            return Some(script_hash);
         }
-        Ok(false)
+        None
     }
 
     fn _clear_tracked_spks_of_keychain(&mut self, keychain: K) {
@@ -89,43 +84,41 @@ impl<K: Clone + Ord + Send + Sync + 'static> DerivedSpkTracker<K> {
         }
     }
 
-    pub async fn add_descriptor(
+    pub fn insert_descriptor(
         &mut self,
-        client: &Client,
         keychain: K,
         descriptor: Descriptor<DescriptorPublicKey>,
-    ) -> Result<bool, TrySendRequestError> {
+        next_index: u32,
+    ) -> Vec<ElectrumScriptHash> {
         if let Some(old_descriptor) = self
             .descriptors
             .insert(keychain.clone(), descriptor.clone())
         {
             if old_descriptor == descriptor {
-                return Ok(false);
+                return vec![];
             }
             self._clear_tracked_spks_of_keychain(keychain.clone());
         }
-        for index in 0_u32..=self.lookahead {
-            self._track_derived_spk(client, keychain.clone(), index)
-                .await?;
-        }
-        Ok(true)
+        (0_u32..=next_index + self.lookahead + 1)
+            .filter_map(|index| self._add_derived_spk(keychain.clone(), index))
+            .collect()
     }
 
-    pub async fn handle_script_notification(
+    pub fn handle_script_status(
         &mut self,
-        client: &Client,
         script_hash: ElectrumScriptHash,
-    ) -> Result<Option<(K, u32)>, TrySendRequestError> {
-        let (k, i) = match self.derived_spks_rev.get(&script_hash) {
-            Some(spk_i) => spk_i.clone(),
-            None => return Ok(None),
-        };
-        for index in (i + 1..=i + 1 + self.lookahead).rev() {
-            if !self._track_derived_spk(client, k.clone(), index).await? {
-                break;
+    ) -> Option<(K, u32, Vec<ElectrumScriptHash>)> {
+        let (k, mut next_index) = self.derived_spks_rev.get(&script_hash).cloned()?;
+        next_index += 1;
+
+        let mut spk_hashes = Vec::new();
+        for index in (next_index..=next_index + 1 + self.lookahead).rev() {
+            match self._add_derived_spk(k.clone(), index) {
+                Some(spk_hash) => spk_hashes.push(spk_hash),
+                None => break,
             }
         }
-        Ok(None)
+        Some((k, next_index, spk_hashes))
     }
 }
 
@@ -293,6 +286,11 @@ impl Txs {
         Self::default()
     }
 
+    pub fn insert_tx(&mut self, tx: impl Into<Arc<Transaction>>) {
+        let tx: Arc<Transaction> = tx.into();
+        self.txs.insert(tx.compute_txid(), tx);
+    }
+
     pub async fn fetch_tx(
         &mut self,
         client: &Client,
@@ -363,11 +361,13 @@ where
             if resp.is_none() {
                 return Ok(None);
             }
-            let keychain_index_opt = spk_tracker
-                .handle_script_notification(client, req.script_hash)
-                .await?;
-            let (k, i) = match keychain_index_opt {
-                Some((k, i)) => (k, i),
+            let (k, i) = match spk_tracker.handle_script_status(req.script_hash) {
+                Some((k, i, new_spk_hashes)) => {
+                    for script_hash in new_spk_hashes {
+                        client.request_event(request::ScriptHashSubscribe { script_hash })?;
+                    }
+                    (k, i)
+                }
                 None => return Ok(None),
             };
             let tx_update = script_hash_update(client, headers, txs, req.script_hash).await?;
@@ -380,11 +380,13 @@ where
             }))
         }
         Event::Notification(Notification::ScriptHash(inner)) => {
-            let keychain_index_opt = spk_tracker
-                .handle_script_notification(client, inner.script_hash())
-                .await?;
-            let (k, i) = match keychain_index_opt {
-                Some((k, i)) => (k, i),
+            let (k, i) = match spk_tracker.handle_script_status(inner.script_hash()) {
+                Some((k, i, new_spk_hashes)) => {
+                    for script_hash in new_spk_hashes {
+                        client.request_event(request::ScriptHashSubscribe { script_hash })?;
+                    }
+                    (k, i)
+                }
                 None => return Ok(None),
             };
             let tx_update = script_hash_update(client, headers, txs, inner.script_hash()).await?;
@@ -456,4 +458,113 @@ async fn script_hash_update(
     }
 
     Ok(tx_update)
+}
+
+#[derive(Debug)]
+pub struct Emitter<K: Clone + Ord + Send + Sync + 'static> {
+    spk_tracker: DerivedSpkTracker<K>,
+    header_cache: Headers,
+    tx_cache: Txs,
+
+    cmd_rx: CmdRx<K>,
+    update_tx: mpsc::UnboundedSender<Update<K>>,
+}
+
+impl<K> Emitter<K>
+where
+    K: Clone + Ord + Send + Sync + 'static,
+{
+    pub fn new(
+        wallet_tip: CheckPoint,
+        lookahead: u32,
+    ) -> (Self, CmdTx<K>, UnboundedReceiver<Update<K>>) {
+        let (cmd_tx, cmd_rx) = mpsc::unbounded::<Cmd<K>>();
+        let (update_tx, update_rx) = mpsc::unbounded::<Update<K>>();
+        (
+            Self {
+                spk_tracker: DerivedSpkTracker::new(lookahead),
+                header_cache: Headers::new(wallet_tip),
+                tx_cache: Txs::new(),
+                cmd_rx,
+                update_tx,
+            },
+            cmd_tx,
+            update_rx,
+        )
+    }
+
+    /// Populate tx cache.
+    pub fn insert_txs<Tx>(&mut self, txs: impl IntoIterator<Item = Tx>)
+    where
+        Tx: Into<Arc<Transaction>>,
+    {
+        for tx in txs {
+            self.tx_cache.insert_tx(tx);
+        }
+    }
+
+    pub async fn run<C>(&mut self, conn: C) -> anyhow::Result<()>
+    where
+        C: AsyncRead + AsyncWrite + Send,
+    {
+        let (client, mut event_rx, event_fut) = electrum_c::run(conn);
+        let event_fut = event_fut.fuse();
+        pin_mut!(event_fut);
+
+        client.request_event(request::HeadersSubscribe)?;
+        for script_hash in self.spk_tracker.all_spk_hashes() {
+            client.request_event(request::ScriptHashSubscribe { script_hash })?;
+        }
+
+        loop {
+            select! {
+                res = event_fut => {
+                    res?;
+                    break;
+                },
+                opt = event_rx.next() => match opt {
+                    Some(event) => {
+                        let update_opt = handle_event(
+                            &client,
+                            &mut self.spk_tracker,
+                            &mut self.header_cache,
+                            &mut self.tx_cache,
+                            event,
+                        ).await?;
+                        match update_opt {
+                            Some(update) => {
+                                if let Err(_err) = self.update_tx.unbounded_send(update) {
+                                    break;
+                                }
+                            },
+                            None => continue,
+                        }
+                    },
+                    None => break,
+                },
+                // The effect of the cmd always takes place regardless whether this errors.
+                opt = self.cmd_rx.next() => match opt {
+                    Some(Cmd::InsertDescriptor { keychain, descriptor, next_index }) => {
+                        for script_hash in self.spk_tracker.insert_descriptor(keychain, descriptor, next_index) {
+                            client.request_event(request::ScriptHashSubscribe { script_hash })?;
+                        }
+                    }
+                    None => break,
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+pub type CmdRx<K> = mpsc::UnboundedReceiver<Cmd<K>>;
+pub type CmdTx<K> = mpsc::UnboundedSender<Cmd<K>>;
+
+pub enum Cmd<K> {
+    InsertDescriptor {
+        keychain: K,
+        descriptor: Descriptor<DescriptorPublicKey>,
+        next_index: u32,
+    },
 }

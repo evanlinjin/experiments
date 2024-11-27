@@ -1,9 +1,12 @@
-use std::{collections::HashMap, io, task::Poll};
+use std::{
+    collections::HashMap,
+    io::{self, ErrorKind},
+};
 
 use bitcoin::block::Header;
 use futures::{
-    channel::mpsc, pin_mut, select, AsyncRead, AsyncReadExt, AsyncWrite, FutureExt, Stream,
-    StreamExt,
+    channel::mpsc::{self, UnboundedReceiver},
+    select, AsyncRead, AsyncReadExt, AsyncWrite, Future, StreamExt,
 };
 use serde_json::Value;
 
@@ -128,52 +131,51 @@ impl std::fmt::Display for ProcessError {
 
 impl std::error::Error for ProcessError {}
 
-pub fn run_async<C>(conn: C) -> (Client, impl Stream<Item = io::Result<Event>> + Send)
+pub fn run<C>(
+    conn: C,
+) -> (
+    Client,
+    UnboundedReceiver<Event>,
+    impl Future<Output = io::Result<()>> + Send,
+)
 where
     C: AsyncRead + AsyncWrite + Send,
 {
-    use std::io::ErrorKind;
-
-    let (req_sender, mut req_recv) = mpsc::unbounded::<MaybeBatch<PendingRequest>>();
-    let client = Client::new(req_sender);
+    let (event_tx, event_recv) = mpsc::unbounded::<Event>();
+    let (req_tx, mut req_recv) = mpsc::unbounded::<MaybeBatch<PendingRequest>>();
 
     let (reader, mut writer) = conn.split();
     let mut incoming_stream =
         crate::io::ReadStreamer::new(futures::io::BufReader::new(reader)).fuse();
     let mut state = State::new(0);
 
-    let event_stream = futures::stream::poll_fn(move |cx| -> Poll<Option<io::Result<Event>>> {
-        let fut = async {
-            loop {
-                select! {
-                    req_opt = req_recv.next() => match req_opt {
-                        Some(req) => {
-                            let raw_req = state.add_request(req);
-                            crate::io::write_async(&mut writer, raw_req).await?;
-                            continue;
-                        },
-                        None => break,
+    let fut = async move {
+        loop {
+            select! {
+                req_opt = req_recv.next() => match req_opt {
+                    Some(req) => {
+                        let raw_req = state.add_request(req);
+                        crate::io::write_async(&mut writer, raw_req).await?;
                     },
-                    incoming_opt = incoming_stream.next() => match incoming_opt {
-                        Some(incoming_res) => {
-                            let event_opt = state
-                                .consume(incoming_res?)
-                                .map_err(|error| std::io::Error::new(ErrorKind::Other, error))?;
-                            if let Some(event) = event_opt {
-                                return Ok(Some(event));
+                    None => break,
+                },
+                incoming_opt = incoming_stream.next() => match incoming_opt {
+                    Some(incoming_res) => {
+                        let event_opt = state
+                            .consume(incoming_res?)
+                            .map_err(|error| std::io::Error::new(ErrorKind::Other, error))?;
+                        if let Some(event) = event_opt {
+                            if let Err(_err) = event_tx.unbounded_send(event) {
+                                break;
                             }
-                            continue;
-                        },
-                        None => break,
-                    }
+                        }
+                    },
+                    None => break,
                 }
             }
-            Result::<Option<Event>, std::io::Error>::Ok(None)
         }
-        .map(|r| r.transpose());
-        pin_mut!(fut);
-        fut.poll_unpin(cx)
-    });
+        io::Result::<()>::Ok(())
+    };
 
-    (client, event_stream)
+    (Client::new(req_tx), event_recv, fut)
 }
