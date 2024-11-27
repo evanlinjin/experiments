@@ -3,11 +3,10 @@ use std::time::Duration;
 use async_std::{net::TcpStream, stream::StreamExt};
 use bdk_testenv::{anyhow, bitcoincore_rpc::RpcApi, TestEnv};
 use bitcoin::Amount;
-use e_electrum_client::{
-    notification::Notification, pending_request::SatisfiedRequest, request, run_async, Event,
+use electrum_c::{
+    notification::Notification, pending_request::SatisfiedRequest, request, run, Event,
 };
 use futures::{
-    channel::mpsc,
     executor::{block_on, ThreadPool},
     task::SpawnExt,
     FutureExt,
@@ -26,16 +25,9 @@ fn synopsis() -> anyhow::Result<()> {
 
     let pool = ThreadPool::new()?;
     block_on(async {
-        let (client, mut event_stream) =
-            run_async(TcpStream::connect(electrum_addr.as_str()).await?);
-
-        let (event_tx, mut event_rx) = mpsc::unbounded();
-        let run_handle = pool.spawn_with_handle(async move {
-            while let Some(event_res) = event_stream.next().await {
-                event_tx.unbounded_send(event_res?)?;
-            }
-            anyhow::Result::<()>::Ok(())
-        })?;
+        let (client, mut event_rx, run_fut) =
+            run(TcpStream::connect(electrum_addr.as_str()).await?);
+        let run_handle = pool.spawn_with_handle(run_fut)?;
 
         client.request_event(request::HeadersSubscribe)?;
         client.request_event(request::ScriptHashSubscribe::from_script(

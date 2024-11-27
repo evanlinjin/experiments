@@ -1,12 +1,12 @@
 [package]
-name = "e_electrum_client"
+name = "electrum_c"
 version = "0.2.0"
 description = "Experimental but sane electrum client by @evanlinjin."
 license = "MIT OR Apache-2.0"
 edition = "2021"
 rust-version = "1.63"
 repository = "https://github.com/evanlinjin/experiments"
-documentation = "https://docs.rs/e_electrum_client"
+documentation = "https://docs.rs/electrum_c"
 readme = "README.md"
 
 [dependencies]
