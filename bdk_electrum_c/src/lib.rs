@@ -638,6 +638,7 @@ pub enum Cmd<K> {
     },
 }
 
+#[derive(Debug, Clone)]
 pub struct CmdSender<K> {
     tx: CmdTx<K>,
 }
