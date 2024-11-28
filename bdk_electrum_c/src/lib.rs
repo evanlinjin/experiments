@@ -608,7 +608,7 @@ where
                             broadcast_queue.add(tx.clone(), resp_tx);
                             client.request_event(request::BroadcastTx(tx))?;
                         }
-                        None => break,
+                        Some(Cmd::Close) | None => break,
                     },
                 }
             }
@@ -636,6 +636,7 @@ pub enum Cmd<K> {
         tx: Transaction,
         resp_tx: oneshot::Sender<Result<(), ResponseError>>,
     },
+    Close,
 }
 
 #[derive(Debug, Clone)]
@@ -662,6 +663,11 @@ impl<K: Send + Sync + 'static> CmdSender<K> {
         let (resp_tx, rx) = oneshot::channel();
         self.tx.unbounded_send(Cmd::Broadcast { tx, resp_tx })?;
         rx.await??;
+        Ok(())
+    }
+
+    pub async fn close(&self) -> anyhow::Result<()> {
+        self.tx.unbounded_send(Cmd::Close)?;
         Ok(())
     }
 }
