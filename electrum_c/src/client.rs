@@ -9,14 +9,16 @@ use crate::{
 };
 
 pub type TrySendRequestError = mpsc::TrySendError<MaybeBatch<PendingRequest>>;
+pub type RequestSender = mpsc::UnboundedSender<MaybeBatch<PendingRequest>>;
+pub type RequestReceiver = mpsc::UnboundedReceiver<MaybeBatch<PendingRequest>>;
 
 #[derive(Debug, Clone)]
 pub struct Client {
-    tx: mpsc::UnboundedSender<MaybeBatch<PendingRequest>>,
+    tx: RequestSender,
 }
 
 impl Client {
-    pub fn new(tx: mpsc::UnboundedSender<MaybeBatch<PendingRequest>>) -> Self {
+    pub fn new(tx: RequestSender) -> Self {
         Self { tx }
     }
 

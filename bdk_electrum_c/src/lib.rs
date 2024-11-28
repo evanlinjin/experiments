@@ -2,12 +2,13 @@
 
 use bdk_core::spk_client::FullScanResult;
 use electrum_c::notification::Notification;
-use electrum_c::pending_request::SatisfiedRequest;
-use electrum_c::{request, Client, ElectrumScriptHash, Event};
+use electrum_c::pending_request::{ErroredRequest, SatisfiedRequest};
+use electrum_c::{request, Client, ElectrumScriptHash, Event, ResponseError};
 use futures::channel::mpsc::{self, UnboundedReceiver};
-use futures::{pin_mut, select, AsyncRead, AsyncWrite, FutureExt, StreamExt};
+use futures::channel::oneshot;
+use futures::{select, AsyncRead, AsyncWrite, FutureExt, StreamExt};
 
-use std::collections::{btree_map, hash_map, BTreeMap, BTreeSet};
+use std::collections::{btree_map, hash_map, BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 
 use bdk_core::bitcoin::block::Header;
@@ -150,6 +151,8 @@ impl Headers {
         const ASSUME_FINAL_DEPTH: u32 = 8;
         const CONSECUTIVE_THRESHOLD: usize = 3;
 
+        // TODO: Get rid of `ASSUME_FINAL_DEPTH`. Instead, get headers one by one and stop when we
+        // connect with a checkpoint.
         let start_height = tip_height.saturating_sub(ASSUME_FINAL_DEPTH);
         let count = (tip_height - start_height) as usize;
         let mut new_headers = (start_height..)
@@ -337,6 +340,7 @@ pub async fn handle_event<K>(
     spk_tracker: &mut DerivedSpkTracker<K>,
     headers: &mut Headers,
     txs: &mut Txs,
+    broadcast_queue: &mut BroadcastQueue,
     event: Event,
 ) -> anyhow::Result<Option<Update<K>>>
 where
@@ -397,6 +401,14 @@ where
                 last_active_indices,
                 chain_update,
             }))
+        }
+        Event::Response(SatisfiedRequest::BroadcastTx { resp, .. }) => {
+            broadcast_queue.handle_resp_ok(resp);
+            Ok(None)
+        }
+        Event::ResponseError(ErroredRequest::BroadcastTx { req, error }) => {
+            broadcast_queue.handle_resp_err(req.0.compute_txid(), error);
+            Ok(None)
         }
         Event::ResponseError(err) => Err(err.into()),
         _ => Ok(None),
@@ -460,6 +472,49 @@ async fn script_hash_update(
     Ok(tx_update)
 }
 
+#[derive(Debug, Default)]
+pub struct BroadcastQueue {
+    queue: VecDeque<(Transaction, oneshot::Sender<Result<(), ResponseError>>)>,
+}
+
+impl BroadcastQueue {
+    pub fn txs(&self) -> impl Iterator<Item = Transaction> + '_ {
+        self.queue.iter().map(|(tx, _)| tx.clone())
+    }
+
+    pub fn add(&mut self, tx: Transaction, resp: oneshot::Sender<Result<(), ResponseError>>) {
+        self.queue.push_back((tx, resp));
+    }
+
+    pub fn handle_resp_ok(&mut self, txid: Txid) {
+        let i_opt = self.queue.iter().enumerate().find_map(|(i, (tx, _))| {
+            if tx.compute_txid() == txid {
+                Some(i)
+            } else {
+                None
+            }
+        });
+        if let Some(i) = i_opt {
+            let (_, resp_tx) = self.queue.remove(i).expect("must exist");
+            let _ = resp_tx.send(Ok(()));
+        }
+    }
+
+    pub fn handle_resp_err(&mut self, txid: Txid, err: ResponseError) {
+        let i_opt = self.queue.iter().enumerate().find_map(|(i, (tx, _))| {
+            if tx.compute_txid() == txid {
+                Some(i)
+            } else {
+                None
+            }
+        });
+        if let Some(i) = i_opt {
+            let (_, resp_tx) = self.queue.remove(i).expect("must exist");
+            let _ = resp_tx.send(Err(err));
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Emitter<K: Clone + Ord + Send + Sync + 'static> {
     spk_tracker: DerivedSpkTracker<K>,
@@ -468,6 +523,7 @@ pub struct Emitter<K: Clone + Ord + Send + Sync + 'static> {
 
     cmd_rx: CmdRx<K>,
     update_tx: mpsc::UnboundedSender<Update<K>>,
+    broadcast_queue: BroadcastQueue,
 }
 
 impl<K> Emitter<K>
@@ -477,7 +533,7 @@ where
     pub fn new(
         wallet_tip: CheckPoint,
         lookahead: u32,
-    ) -> (Self, CmdTx<K>, UnboundedReceiver<Update<K>>) {
+    ) -> (Self, CmdSender<K>, UnboundedReceiver<Update<K>>) {
         let (cmd_tx, cmd_rx) = mpsc::unbounded::<Cmd<K>>();
         let (update_tx, update_rx) = mpsc::unbounded::<Update<K>>();
         (
@@ -487,8 +543,9 @@ where
                 tx_cache: Txs::new(),
                 cmd_rx,
                 update_tx,
+                broadcast_queue: BroadcastQueue::default(),
             },
-            cmd_tx,
+            CmdSender { tx: cmd_tx },
             update_rx,
         )
     }
@@ -507,53 +564,61 @@ where
     where
         C: AsyncRead + AsyncWrite + Send,
     {
-        let (client, mut event_rx, event_fut) = electrum_c::run(conn);
-        let event_fut = event_fut.fuse();
-        pin_mut!(event_fut);
+        let (client, mut event_rx, run_fut) = electrum_c::run(conn);
 
         client.request_event(request::HeadersSubscribe)?;
         for script_hash in self.spk_tracker.all_spk_hashes() {
             client.request_event(request::ScriptHashSubscribe { script_hash })?;
         }
-
-        loop {
-            select! {
-                res = event_fut => {
-                    res?;
-                    break;
-                },
-                opt = event_rx.next() => match opt {
-                    Some(event) => {
-                        let update_opt = handle_event(
-                            &client,
-                            &mut self.spk_tracker,
-                            &mut self.header_cache,
-                            &mut self.tx_cache,
-                            event,
-                        ).await?;
-                        match update_opt {
-                            Some(update) => {
-                                if let Err(_err) = self.update_tx.unbounded_send(update) {
-                                    break;
-                                }
-                            },
-                            None => continue,
-                        }
-                    },
-                    None => break,
-                },
-                // The effect of the cmd always takes place regardless whether this errors.
-                opt = self.cmd_rx.next() => match opt {
-                    Some(Cmd::InsertDescriptor { keychain, descriptor, next_index }) => {
-                        for script_hash in self.spk_tracker.insert_descriptor(keychain, descriptor, next_index) {
-                            client.request_event(request::ScriptHashSubscribe { script_hash })?;
-                        }
-                    }
-                    None => break,
-                }
-            }
+        for tx in self.broadcast_queue.txs() {
+            client.request_event(request::BroadcastTx(tx))?;
         }
 
+        let spk_tracker = &mut self.spk_tracker;
+        let header_cache = &mut self.header_cache;
+        let tx_cache = &mut self.tx_cache;
+        let cmd_rx = &mut self.cmd_rx;
+        let update_tx = &mut self.update_tx;
+        let broadcast_queue = &mut self.broadcast_queue;
+
+        let process_fut = async move {
+            // TODO: We should not await in the select branches. Instead, have a struct that keeps
+            // state and mutate this state in the `handle_event` logic (which should be inlined).
+            loop {
+                select! {
+                    opt = event_rx.next() => match opt {
+                        Some(event) => {
+                            let update_opt =
+                                handle_event(&client, spk_tracker, header_cache, tx_cache, broadcast_queue, event).await?;
+                            if let Some(update) = update_opt {
+                                if let Err(_err) = update_tx.unbounded_send(update) {
+                                    break;
+                                }
+                            }
+                        },
+                        None => break,
+                    },
+                    opt = cmd_rx.next() => match opt {
+                        Some(Cmd::InsertDescriptor { keychain, descriptor, next_index }) => {
+                            for script_hash in spk_tracker.insert_descriptor(keychain, descriptor, next_index) {
+                                client.request_event(request::ScriptHashSubscribe { script_hash })?;
+                            }
+                        }
+                        Some(Cmd::Broadcast { tx, resp_tx }) => {
+                            broadcast_queue.add(tx.clone(), resp_tx);
+                            client.request_event(request::BroadcastTx(tx))?;
+                        }
+                        None => break,
+                    },
+                }
+            }
+            anyhow::Ok(())
+        };
+
+        select! {
+            res = run_fut.fuse() => res?,
+            res = process_fut.fuse() => res?,
+        }
         Ok(())
     }
 }
@@ -567,4 +632,35 @@ pub enum Cmd<K> {
         descriptor: Descriptor<DescriptorPublicKey>,
         next_index: u32,
     },
+    Broadcast {
+        tx: Transaction,
+        resp_tx: oneshot::Sender<Result<(), ResponseError>>,
+    },
+}
+
+pub struct CmdSender<K> {
+    tx: CmdTx<K>,
+}
+
+impl<K: Send + Sync + 'static> CmdSender<K> {
+    pub fn insert_descriptor(
+        &self,
+        keychain: K,
+        descriptor: Descriptor<DescriptorPublicKey>,
+        next_index: u32,
+    ) -> anyhow::Result<()> {
+        self.tx.unbounded_send(Cmd::InsertDescriptor {
+            keychain,
+            descriptor,
+            next_index,
+        })?;
+        Ok(())
+    }
+
+    pub async fn broadcast_tx(&self, tx: Transaction) -> anyhow::Result<()> {
+        let (resp_tx, rx) = oneshot::channel();
+        self.tx.unbounded_send(Cmd::Broadcast { tx, resp_tx })?;
+        rx.await??;
+        Ok(())
+    }
 }
