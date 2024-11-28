@@ -200,7 +200,7 @@ dependencies = [
 
 [[package]]
 name = "bdk_electrum_c"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "bdk_core",
