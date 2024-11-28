@@ -624,8 +624,8 @@ where
 }
 
 pub type CmdRx<K> = mpsc::UnboundedReceiver<Cmd<K>>;
-pub type CmdTx<K> = mpsc::UnboundedSender<Cmd<K>>;
 
+#[non_exhaustive]
 pub enum Cmd<K> {
     InsertDescriptor {
         keychain: K,
@@ -641,7 +641,7 @@ pub enum Cmd<K> {
 
 #[derive(Debug, Clone)]
 pub struct CmdSender<K> {
-    tx: CmdTx<K>,
+    tx: mpsc::UnboundedSender<Cmd<K>>,
 }
 
 impl<K: Send + Sync + 'static> CmdSender<K> {
