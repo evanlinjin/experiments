@@ -6,7 +6,7 @@ use electrum_c::pending_request::{ErroredRequest, SatisfiedRequest};
 use electrum_c::{request, Client, ElectrumScriptHash, Event, ResponseError};
 use futures::channel::mpsc::{self, UnboundedReceiver};
 use futures::channel::oneshot;
-use futures::{select, AsyncRead, AsyncWrite, FutureExt, StreamExt};
+use futures::{select, AsyncRead, AsyncWrite, Future, FutureExt, StreamExt};
 
 use std::collections::{btree_map, hash_map, BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
@@ -521,7 +521,6 @@ pub struct Emitter<K: Clone + Ord + Send + Sync + 'static> {
     header_cache: Headers,
     tx_cache: Txs,
 
-    cmd_rx: CmdRx<K>,
     update_tx: mpsc::UnboundedSender<Update<K>>,
     broadcast_queue: BroadcastQueue,
 }
@@ -530,22 +529,16 @@ impl<K> Emitter<K>
 where
     K: Clone + Ord + Send + Sync + 'static,
 {
-    pub fn new(
-        wallet_tip: CheckPoint,
-        lookahead: u32,
-    ) -> (Self, CmdSender<K>, UnboundedReceiver<Update<K>>) {
-        let (cmd_tx, cmd_rx) = mpsc::unbounded::<Cmd<K>>();
+    pub fn new(wallet_tip: CheckPoint, lookahead: u32) -> (Self, UnboundedReceiver<Update<K>>) {
         let (update_tx, update_rx) = mpsc::unbounded::<Update<K>>();
         (
             Self {
                 spk_tracker: DerivedSpkTracker::new(lookahead),
                 header_cache: Headers::new(wallet_tip),
                 tx_cache: Txs::new(),
-                cmd_rx,
                 update_tx,
                 broadcast_queue: BroadcastQueue::default(),
             },
-            CmdSender { tx: cmd_tx },
             update_rx,
         )
     }
@@ -560,66 +553,78 @@ where
         }
     }
 
-    pub async fn run<C>(&mut self, conn: C) -> anyhow::Result<()>
+    pub fn run<'a, C>(
+        &'a mut self,
+        conn: C,
+    ) -> (
+        CmdSender<K>,
+        impl Future<Output = anyhow::Result<()>> + Send + 'a,
+    )
     where
-        C: AsyncRead + AsyncWrite + Send,
+        C: AsyncRead + AsyncWrite + Send + 'a,
     {
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded::<Cmd<K>>();
         let (client, mut event_rx, run_fut) = electrum_c::run(conn);
 
-        client.request_event(request::HeadersSubscribe)?;
-        for script_hash in self.spk_tracker.all_spk_hashes() {
-            client.request_event(request::ScriptHashSubscribe { script_hash })?;
-        }
-        for tx in self.broadcast_queue.txs() {
-            client.request_event(request::BroadcastTx(tx))?;
-        }
+        let fut = async move {
+            client.request_event(request::HeadersSubscribe)?;
+            for script_hash in self.spk_tracker.all_spk_hashes() {
+                client.request_event(request::ScriptHashSubscribe { script_hash })?;
+            }
+            for tx in self.broadcast_queue.txs() {
+                client.request_event(request::BroadcastTx(tx))?;
+            }
 
-        let spk_tracker = &mut self.spk_tracker;
-        let header_cache = &mut self.header_cache;
-        let tx_cache = &mut self.tx_cache;
-        let cmd_rx = &mut self.cmd_rx;
-        let update_tx = &mut self.update_tx;
-        let broadcast_queue = &mut self.broadcast_queue;
+            let spk_tracker = &mut self.spk_tracker;
+            let header_cache = &mut self.header_cache;
+            let tx_cache = &mut self.tx_cache;
+            let update_tx = &mut self.update_tx;
+            let broadcast_queue = &mut self.broadcast_queue;
 
-        let process_fut = async move {
-            // TODO: We should not await in the select branches. Instead, have a struct that keeps
-            // state and mutate this state in the `handle_event` logic (which should be inlined).
-            loop {
-                select! {
-                    opt = event_rx.next() => match opt {
-                        Some(event) => {
-                            let update_opt =
-                                handle_event(&client, spk_tracker, header_cache, tx_cache, broadcast_queue, event).await?;
-                            if let Some(update) = update_opt {
-                                if let Err(_err) = update_tx.unbounded_send(update) {
-                                    break;
+            let process_fut = async move {
+                // TODO: We should not await in the select branches. Instead, have a struct that keeps
+                // state and mutate this state in the `handle_event` logic (which should be inlined).
+                loop {
+                    select! {
+                        opt = event_rx.next() => match opt {
+                            Some(event) => {
+                                let update_opt =
+                                    handle_event(&client, spk_tracker, header_cache, tx_cache, broadcast_queue, event).await?;
+                                if let Some(update) = update_opt {
+                                    if let Err(_err) = update_tx.unbounded_send(update) {
+                                        break;
+                                    }
+                                }
+                            },
+                            None => break,
+                        },
+                        opt = cmd_rx.next() => match opt {
+                            Some(Cmd::InsertDescriptor { keychain, descriptor, next_index }) => {
+                                for script_hash in spk_tracker.insert_descriptor(keychain, descriptor, next_index) {
+                                    client.request_event(request::ScriptHashSubscribe { script_hash })?;
                                 }
                             }
-                        },
-                        None => break,
-                    },
-                    opt = cmd_rx.next() => match opt {
-                        Some(Cmd::InsertDescriptor { keychain, descriptor, next_index }) => {
-                            for script_hash in spk_tracker.insert_descriptor(keychain, descriptor, next_index) {
-                                client.request_event(request::ScriptHashSubscribe { script_hash })?;
+                            Some(Cmd::Broadcast { tx, resp_tx }) => {
+                                broadcast_queue.add(tx.clone(), resp_tx);
+                                client.request_event(request::BroadcastTx(tx))?;
                             }
-                        }
-                        Some(Cmd::Broadcast { tx, resp_tx }) => {
-                            broadcast_queue.add(tx.clone(), resp_tx);
-                            client.request_event(request::BroadcastTx(tx))?;
-                        }
-                        Some(Cmd::Close) | None => break,
-                    },
+                            Some(Cmd::Ping) => {
+                                client.request_event(request::Ping)?;
+                            }
+                            Some(Cmd::Close) | None => break,
+                        },
+                    }
                 }
-            }
-            anyhow::Ok(())
-        };
+                anyhow::Ok(())
+            };
 
-        select! {
-            res = run_fut.fuse() => res?,
-            res = process_fut.fuse() => res?,
-        }
-        Ok(())
+            select! {
+                res = run_fut.fuse() => res?,
+                res = process_fut.fuse() => res?,
+            }
+            Ok(())
+        };
+        (CmdSender { tx: cmd_tx }, fut)
     }
 }
 
@@ -636,6 +641,7 @@ pub enum Cmd<K> {
         tx: Transaction,
         resp_tx: oneshot::Sender<Result<(), ResponseError>>,
     },
+    Ping,
     Close,
 }
 
@@ -663,6 +669,11 @@ impl<K: Send + Sync + 'static> CmdSender<K> {
         let (resp_tx, rx) = oneshot::channel();
         self.tx.unbounded_send(Cmd::Broadcast { tx, resp_tx })?;
         rx.await??;
+        Ok(())
+    }
+
+    pub fn ping(&self) -> anyhow::Result<()> {
+        self.tx.unbounded_send(Cmd::Ping)?;
         Ok(())
     }
 
