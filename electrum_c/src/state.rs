@@ -32,6 +32,9 @@ impl Event {
             Event::Response(SatisfiedRequest::Headers { req, resp }) => {
                 Some((req.start_height..).zip(resp.headers.clone()).collect())
             }
+            Event::Response(SatisfiedRequest::HeadersWithCheckpoint { req, resp }) => {
+                Some((req.start_height..).zip(resp.headers.clone()).collect())
+            }
             Event::Notification(Notification::Header(n)) => Some(vec![(n.height(), *n.header())]),
             _ => None,
         }

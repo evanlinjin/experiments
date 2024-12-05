@@ -76,7 +76,6 @@ fn synopsis() -> anyhow::Result<()> {
                 .request(request::Headers {
                     start_height: 1,
                     count: 2,
-                    cp_height: Some(3),
                 })
                 .await?
         );

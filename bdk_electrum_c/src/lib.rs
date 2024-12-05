@@ -155,19 +155,15 @@ impl Headers {
 
         // TODO: Get rid of `ASSUME_FINAL_DEPTH`. Instead, get headers one by one and stop when we
         // connect with a checkpoint.
-        let start_height = tip_height.saturating_sub(ASSUME_FINAL_DEPTH);
-        let count = (tip_height - start_height) as usize;
+        let start_height = tip_height.saturating_sub(ASSUME_FINAL_DEPTH - 1);
+        let headers_resp = client
+            .request(request::Headers {
+                start_height,
+                count: ASSUME_FINAL_DEPTH as _,
+            })
+            .await;
         let mut new_headers = (start_height..)
-            .zip(
-                client
-                    .request(request::Headers {
-                        start_height,
-                        count,
-                        cp_height: None,
-                    })
-                    .await?
-                    .headers,
-            )
+            .zip(headers_resp?.headers)
             .collect::<BTreeMap<u32, Header>>();
 
         // Check that the tip is still the same.
@@ -356,6 +352,13 @@ where
                 chain_update: Some(cp),
                 ..Default::default()
             })),
+        Event::Response(SatisfiedRequest::HeadersSubscribe { resp, .. }) => Ok(headers
+            .update(client, resp.height, resp.header.block_hash())
+            .await?
+            .map(|cp| Update {
+                chain_update: Some(cp),
+                ..Default::default()
+            })),
         Event::Notification(Notification::Header(h)) => Ok(headers
             .update(client, h.height(), h.header().block_hash())
             .await?
@@ -530,7 +533,7 @@ pub struct Emitter<K: Clone + Ord + Send + Sync + 'static> {
 
 impl<K> Emitter<K>
 where
-    K: Clone + Ord + Send + Sync + 'static,
+    K: core::fmt::Debug + Clone + Ord + Send + Sync + 'static,
 {
     pub fn new(
         wallet_tip: CheckPoint,

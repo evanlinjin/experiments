@@ -200,7 +200,7 @@ dependencies = [
 
 [[package]]
 name = "bdk_electrum_c"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "bdk_core",
@@ -521,7 +521,7 @@ dependencies = [
 
 [[package]]
 name = "electrum_c"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "async-std",
  "bdk_testenv",

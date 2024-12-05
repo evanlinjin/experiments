@@ -92,6 +92,7 @@ gen_any_pending_request! {
     Header,
     HeaderWithProof,
     Headers,
+    HeadersWithCheckpoint,
     EstimateFee,
     HeadersSubscribe,
     RelayFee,

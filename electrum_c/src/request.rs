@@ -59,7 +59,6 @@ impl Request for HeaderWithProof {
 pub struct Headers {
     pub start_height: u32,
     pub count: usize,
-    pub cp_height: Option<u32>,
 }
 
 impl Request for Headers {
@@ -67,11 +66,28 @@ impl Request for Headers {
 
     fn to_method_and_params(&self) -> MethodAndParams {
         ("blockchain.block.headers".into(), {
-            let mut params = vec![self.start_height.into(), self.count.into()];
-            if let Some(cp_height) = self.cp_height {
-                params.push(cp_height.into());
-            }
-            params
+            vec![self.start_height.into(), self.count.into()]
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct HeadersWithCheckpoint {
+    pub start_height: u32,
+    pub count: usize,
+    pub cp_height: u32,
+}
+
+impl Request for HeadersWithCheckpoint {
+    type Response = response::HeadersWithCheckpointResp;
+
+    fn to_method_and_params(&self) -> MethodAndParams {
+        ("blockchain.block.headers".into(), {
+            vec![
+                self.start_height.into(),
+                self.count.into(),
+                self.cp_height.into(),
+            ]
         })
     }
 }

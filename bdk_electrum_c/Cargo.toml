@@ -1,6 +1,6 @@
 [package]
 name = "bdk_electrum_c"
-version = "0.6.0"
+version = "0.7.0"
 description = "Experimental but sane BDK electrum client by @evanlinjin."
 license = "MIT OR Apache-2.0"
 edition = "2021"
@@ -15,4 +15,4 @@ futures-timer = "3.0.3"
 anyhow = "1.0"
 bdk_core = "0.3.0"
 miniscript = { version = "12.0.0" }
-electrum_c = { path = "../electrum_c", version = "0.2.1" }
+electrum_c = { path = "../electrum_c", version = "0.3.0" }

@@ -30,6 +30,17 @@ pub struct HeadersResp {
     )]
     pub headers: Vec<bitcoin::block::Header>,
     pub max: usize,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct HeadersWithCheckpointResp {
+    pub count: usize,
+    #[serde(
+        rename = "hex",
+        deserialize_with = "crate::custom_serde::from_cancat_consensus_hex"
+    )]
+    pub headers: Vec<bitcoin::block::Header>,
+    pub max: usize,
     pub root: DoubleSHA,
     pub branch: Vec<DoubleSHA>,
 }
