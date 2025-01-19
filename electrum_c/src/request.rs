@@ -94,6 +94,7 @@ impl Request for HeadersWithCheckpoint {
 
 #[derive(Debug, Clone)]
 pub struct EstimateFee {
+    /// The number of blocks to target for confirmation.
     pub number: usize,
 }
 

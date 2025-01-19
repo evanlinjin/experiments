@@ -61,7 +61,7 @@ pub struct BatchRequest<'a> {
     request: Option<MaybeBatch<PendingRequest>>,
 }
 
-impl<'a> BatchRequest<'a> {
+impl BatchRequest<'_> {
     /// Add `request` to the batch.
     ///
     /// Returns a future which becomes ready once this single request is satisfied. No not await on

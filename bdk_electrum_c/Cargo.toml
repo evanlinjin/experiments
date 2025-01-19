@@ -1,6 +1,6 @@
 [package]
 name = "bdk_electrum_c"
-version = "0.7.0"
+version = "0.7.1"
 description = "Experimental but sane BDK electrum client by @evanlinjin."
 license = "MIT OR Apache-2.0"
 edition = "2021"
