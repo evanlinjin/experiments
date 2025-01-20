@@ -1,6 +1,8 @@
 //! BDK Electrum goodness.
 
 use bdk_core::spk_client::FullScanResult;
+/// Re-export.
+pub use electrum_c;
 use electrum_c::client::RequestError;
 use electrum_c::notification::Notification;
 use electrum_c::pending_request::{ErroredRequest, PendingRequestTuple, SatisfiedRequest};
