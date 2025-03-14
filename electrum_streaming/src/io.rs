@@ -4,8 +4,6 @@ use std::{
     task::{Context, Poll},
 };
 
-use futures::{FutureExt, Stream};
-
 use crate::{MaybeBatch, RawNotificationOrResponse, RawRequest};
 
 #[derive(Debug)]
@@ -67,11 +65,12 @@ impl<R: std::io::BufRead> Iterator for ReadStreamer<R> {
     }
 }
 
-impl<R: futures::AsyncBufRead + Unpin> Stream for ReadStreamer<R> {
+impl<R: futures::AsyncBufRead + Unpin> futures::Stream for ReadStreamer<R> {
     type Item = std::io::Result<RawNotificationOrResponse>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         use futures::AsyncBufReadExt;
+        use futures::FutureExt;
         Poll::Ready(loop {
             if let Some(item) = self.queue.pop_front() {
                 break Some(Ok(item));
@@ -102,7 +101,7 @@ impl<R: futures::AsyncBufRead + Unpin> Stream for ReadStreamer<R> {
     }
 }
 
-pub fn write<W, T>(mut writer: W, msg: T) -> std::io::Result<()>
+pub fn blocking_write<W, T>(mut writer: W, msg: T) -> std::io::Result<()>
 where
     T: Into<MaybeBatch<RawRequest>>,
     W: std::io::Write,
@@ -112,7 +111,7 @@ where
     writer.write_all(&b)
 }
 
-pub async fn write_async<W, T>(mut writer: W, msg: T) -> std::io::Result<()>
+pub async fn async_write<W, T>(mut writer: W, msg: T) -> std::io::Result<()>
 where
     T: Into<MaybeBatch<RawRequest>>,
     W: futures::AsyncWrite + Unpin,

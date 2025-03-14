@@ -1,16 +1,17 @@
-pub mod client;
+mod batch_request;
+mod client;
+pub use client::*;
 mod custom_serde;
 mod hash_types;
 pub mod io;
 pub mod notification;
-pub mod pending_request;
+mod pending_request;
 pub mod request;
 pub mod response;
 mod state;
-
-pub use client::Client;
-use futures::channel::{mpsc, oneshot};
+pub use batch_request::*;
 pub use hash_types::*;
+pub use pending_request::*;
 pub use request::Request;
 use serde_json::Value;
 pub use state::*;
@@ -22,12 +23,54 @@ pub type CowStr = std::borrow::Cow<'static, str>;
 pub type DoubleSHA = bitcoin::hashes::sha256d::Hash;
 pub type MethodAndParams = (CowStr, Vec<Value>);
 
-pub type Response<Resp> = Result<Resp, ResponseError>;
-pub type ResponseSender<Resp> = oneshot::Sender<Response<Resp>>;
-pub type ResponseReceiver<Resp> = oneshot::Receiver<Response<Resp>>;
+/// TODO: Rename as `ResponseResult`?
+pub type ResponseResult<Resp> = Result<Resp, ResponseError>;
 
-pub type EventSender = mpsc::UnboundedSender<Event>;
-pub type EventReceiver = mpsc::UnboundedReceiver<Event>;
+mod async_aliases {
+    use super::*;
+    use futures::channel::{
+        mpsc::{TrySendError, UnboundedReceiver, UnboundedSender},
+        oneshot::{Receiver, Sender},
+    };
+    use pending_request::AsyncPendingRequest;
+
+    pub type AsyncState = State<AsyncPendingRequest>;
+
+    /// Sends [`Request`]s from [`Client`] to be consumed by [`State::add_request`].
+    pub type AsyncRequestSender = UnboundedSender<MaybeBatch<AsyncPendingRequest>>;
+
+    /// Receives [`Request`]s from [`Client`] to be consumed by [`State::add_request`].
+    pub type AsyncRequestReceiver = UnboundedReceiver<MaybeBatch<AsyncPendingRequest>>;
+
+    /// Occurs when [`Client::request`] fails.
+    pub type AsyncRequestError = request::Error<AsyncRequestSendError>;
+
+    /// Occurs when [`Request`] cannot be sent into the channel.
+    pub type AsyncRequestSendError = TrySendError<MaybeBatch<AsyncPendingRequest>>;
+
+    pub type AsyncResponseSender<Resp> = Sender<ResponseResult<Resp>>;
+    pub type AsyncResponseReceiver<Resp> = Receiver<ResponseResult<Resp>>;
+    pub type AsyncEventSender = UnboundedSender<Event>;
+    pub type AsyncEventReceiver = UnboundedReceiver<Event>;
+}
+pub use async_aliases::*;
+
+mod blocking_aliases {
+    use super::*;
+    use pending_request::BlockingPendingRequest;
+    use std::sync::mpsc::{Receiver, SendError, Sender, SyncSender};
+
+    pub type BlockingState = State<BlockingPendingRequest>;
+    pub type BlockingRequestSender = Sender<MaybeBatch<BlockingPendingRequest>>;
+    pub type BlockingRequestReceiver = Receiver<MaybeBatch<BlockingPendingRequest>>;
+    pub type BlockingRequestError = request::Error<BlockingRequestSendError>;
+    pub type BlockingRequestSendError = SendError<MaybeBatch<BlockingPendingRequest>>;
+    pub type BlockingResponseSender<Resp> = SyncSender<ResponseResult<Resp>>;
+    pub type BlockingResponseReceiver<Resp> = Receiver<ResponseResult<Resp>>;
+    pub type BlockingEventSender = Sender<Event>;
+    pub type BlockingEventReceiver = Receiver<Event>;
+}
+pub use blocking_aliases::*;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Version;

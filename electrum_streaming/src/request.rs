@@ -2,9 +2,11 @@ use bitcoin::{consensus::Encodable, hex::DisplayHex, Script, Txid};
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::{response, CowStr, ElectrumScriptHash, ElectrumScriptStatus, MethodAndParams};
+use crate::{
+    response, CowStr, ElectrumScriptHash, ElectrumScriptStatus, MethodAndParams, ResponseError,
+};
 
-/// The caller-facing [`Request`].
+/// The caller-facing [`Request`] data type.
 pub trait Request: Clone {
     /// The associated response type of this request.
     type Response: for<'a> Deserialize<'a> + Clone + Send + Sync + 'static;
@@ -25,6 +27,26 @@ impl Request for Custom {
         (self.method.clone(), self.params.clone())
     }
 }
+
+/// Occurs when a request fails.
+#[derive(Debug)]
+pub enum Error<DispatchError> {
+    Dispatch(DispatchError),
+    Canceled,
+    Response(ResponseError),
+}
+
+impl<SendError: std::fmt::Display> std::fmt::Display for Error<SendError> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Dispatch(e) => write!(f, "Failed to dispatch request: {}", e),
+            Self::Canceled => write!(f, "Request was canceled before being satisfied."),
+            Self::Response(e) => write!(f, "Request satisfied with error: {}", e),
+        }
+    }
+}
+
+impl<SendError: std::error::Error> std::error::Error for Error<SendError> {}
 
 #[derive(Debug, Clone)]
 pub struct Header {

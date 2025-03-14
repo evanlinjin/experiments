@@ -3,9 +3,7 @@ use std::time::Duration;
 use async_std::{net::TcpStream, stream::StreamExt};
 use bdk_testenv::{anyhow, bitcoincore_rpc::RpcApi, TestEnv};
 use bitcoin::Amount;
-use electrum_streaming::{
-    notification::Notification, pending_request::SatisfiedRequest, request, run, Event,
-};
+use electrum_streaming::{async_run, notification::Notification, request, Event, SatisfiedRequest};
 use futures::{
     executor::{block_on, ThreadPool},
     task::SpawnExt,
@@ -26,11 +24,11 @@ fn synopsis() -> anyhow::Result<()> {
     let pool = ThreadPool::new()?;
     block_on(async {
         let (client, mut event_rx, run_fut) =
-            run(TcpStream::connect(electrum_addr.as_str()).await?);
+            async_run(TcpStream::connect(electrum_addr.as_str()).await?);
         let run_handle = pool.spawn_with_handle(run_fut)?;
 
-        client.request_event(request::HeadersSubscribe)?;
-        client.request_event(request::ScriptHashSubscribe::from_script(
+        client.send_event_request(request::HeadersSubscribe)?;
+        client.send_event_request(request::ScriptHashSubscribe::from_script(
             wallet_addr.script_pubkey(),
         ))?;
         assert!(matches!(
@@ -57,7 +55,7 @@ fn synopsis() -> anyhow::Result<()> {
 
         assert_eq!(
             client
-                .request(request::HeaderWithProof {
+                .send_request(request::HeaderWithProof {
                     height: 3,
                     cp_height: 3
                 })
@@ -73,7 +71,7 @@ fn synopsis() -> anyhow::Result<()> {
         println!(
             "HEADERS: {:?}",
             client
-                .request(request::Headers {
+                .send_request(request::Headers {
                     start_height: 1,
                     count: 2,
                 })
@@ -94,24 +92,26 @@ fn synopsis() -> anyhow::Result<()> {
         )?;
         env.wait_until_electrum_sees_txid(txid, Duration::from_secs(10))?;
 
-        let tx_resp = client.request(request::GetTx(txid)).await?;
+        let tx_resp = client.send_request(request::GetTx(txid)).await?;
         println!("GOT TX: {:?}", tx_resp);
         println!(
             "BROADCAST RESULT: {}",
-            client.request(request::BroadcastTx(tx_resp.tx)).await?
+            client
+                .send_request(request::BroadcastTx(tx_resp.tx))
+                .await?
         );
 
         println!(
             "GET BALANCE RESP: {:?}",
             client
-                .request(request::GetBalance::from_script(
+                .send_request(request::GetBalance::from_script(
                     wallet_addr.script_pubkey(),
                 ))
                 .await?
         );
 
         let history_resp = client
-            .request(request::GetHistory::from_script(
+            .send_request(request::GetHistory::from_script(
                 wallet_addr.script_pubkey(),
             ))
             .await?;
@@ -126,7 +126,7 @@ fn synopsis() -> anyhow::Result<()> {
         env.wait_until_electrum_sees_block(Duration::from_secs(5))?;
 
         let tx_merkle = client
-            .request(request::GetTxMerkle {
+            .send_request(request::GetTxMerkle {
                 txid,
                 height: block_height,
             })
@@ -134,7 +134,7 @@ fn synopsis() -> anyhow::Result<()> {
         println!("GET MERKLE: {:?}", tx_merkle);
 
         let from_pos = client
-            .request(request::GetTxidFromPos {
+            .send_request(request::GetTxidFromPos {
                 height: block_height,
                 tx_pos: tx_merkle.pos,
             })
@@ -149,7 +149,7 @@ fn synopsis() -> anyhow::Result<()> {
         // println!("GET MEMPOOL RESP: {:?}", mempool_history);
 
         let utxos = client
-            .request(request::ListUnspent::from_script(
+            .send_request(request::ListUnspent::from_script(
                 wallet_addr.script_pubkey(),
             ))
             .await?;
@@ -165,13 +165,13 @@ fn synopsis() -> anyhow::Result<()> {
         //     .await??;
         // println!("UNSUB RESP: {:?}", unsub_resp);
 
-        let fee_histogram = client.request(request::GetFeeHistogram).await?;
+        let fee_histogram = client.send_request(request::GetFeeHistogram).await?;
         println!("FEE HISTOGRAM: {:?}", fee_histogram);
 
-        let server_banner = client.request(request::Banner).await?;
+        let server_banner = client.send_request(request::Banner).await?;
         println!("SERVER BANNER: {}", server_banner);
 
-        client.request(request::Ping).await?;
+        client.send_request(request::Ping).await?;
         println!("PING SUCCESS!");
 
         // // NOTE: Batching does not work until https://github.com/Blockstream/electrs/pull/108 is

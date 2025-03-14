@@ -1,20 +1,8 @@
-use std::{
-    collections::HashMap,
-    io::{self, ErrorKind},
-};
-
+use crate::*;
 use bitcoin::block::Header;
-use futures::{
-    channel::mpsc::{self, UnboundedReceiver},
-    select, AsyncRead, AsyncReadExt, AsyncWrite, Future, StreamExt,
-};
-use serde_json::Value;
-
-use crate::{
-    notification::Notification,
-    pending_request::{ErroredRequest, PendingRequest, SatisfiedRequest},
-    Client, CowStr, MaybeBatch, RawNotificationOrResponse, RawRequest,
-};
+use notification::Notification;
+use pending_request::{ErroredRequest, PendingRequest, SatisfiedRequest};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
 pub enum Event {
@@ -41,12 +29,12 @@ impl Event {
     }
 }
 
-pub struct State {
+pub struct State<PReq: PendingRequest> {
     next_id: usize,
-    pending: HashMap<usize, PendingRequest>,
+    pending: HashMap<usize, PReq>,
 }
 
-impl State {
+impl<PReq: PendingRequest> State<PReq> {
     pub fn new(next_id: usize) -> Self {
         Self {
             next_id,
@@ -61,23 +49,22 @@ impl State {
         })
     }
 
-    pub fn add_single_request(&mut self, req: PendingRequest) -> RawRequest {
-        let id = self.next_id;
-        self.next_id = id + 1;
-        let (method, params) = req.to_method_and_params();
-        self.pending.insert(id, req);
-        RawRequest::new(id, method, params)
-    }
-
     pub fn add_request<R>(&mut self, req: R) -> MaybeBatch<RawRequest>
     where
-        R: Into<MaybeBatch<PendingRequest>>,
+        R: Into<MaybeBatch<PReq>>,
     {
+        fn _add_request<PReq: PendingRequest>(state: &mut State<PReq>, req: PReq) -> RawRequest {
+            let id = state.next_id;
+            state.next_id = id + 1;
+            let (method, params) = req.to_method_and_params();
+            state.pending.insert(id, req);
+            RawRequest::new(id, method, params)
+        }
         match req.into() {
-            MaybeBatch::Single(req) => self.add_single_request(req).into(),
+            MaybeBatch::Single(req) => _add_request(self, req).into(),
             MaybeBatch::Batch(v) => v
                 .into_iter()
-                .map(|req| self.add_single_request(req))
+                .map(|req| _add_request(self, req))
                 .collect::<Vec<_>>()
                 .into(),
         }
@@ -121,7 +108,7 @@ pub enum ProcessError {
     CannotDeserializeResponse(usize, serde_json::Error),
     CannotDeserializeNotification {
         method: CowStr,
-        params: Value,
+        params: serde_json::Value,
         error: serde_json::Error,
     },
 }
@@ -133,52 +120,3 @@ impl std::fmt::Display for ProcessError {
 }
 
 impl std::error::Error for ProcessError {}
-
-pub fn run<C>(
-    conn: C,
-) -> (
-    Client,
-    UnboundedReceiver<Event>,
-    impl Future<Output = io::Result<()>> + Send,
-)
-where
-    C: AsyncRead + AsyncWrite + Send,
-{
-    let (event_tx, event_recv) = mpsc::unbounded::<Event>();
-    let (req_tx, mut req_recv) = mpsc::unbounded::<MaybeBatch<PendingRequest>>();
-
-    let (reader, mut writer) = conn.split();
-    let mut incoming_stream =
-        crate::io::ReadStreamer::new(futures::io::BufReader::new(reader)).fuse();
-    let mut state = State::new(0);
-
-    let fut = async move {
-        loop {
-            select! {
-                req_opt = req_recv.next() => match req_opt {
-                    Some(req) => {
-                        let raw_req = state.add_request(req);
-                        crate::io::write_async(&mut writer, raw_req).await?;
-                    },
-                    None => break,
-                },
-                incoming_opt = incoming_stream.next() => match incoming_opt {
-                    Some(incoming_res) => {
-                        let event_opt = state
-                            .consume(incoming_res?)
-                            .map_err(|error| std::io::Error::new(ErrorKind::Other, error))?;
-                        if let Some(event) = event_opt {
-                            if let Err(_err) = event_tx.unbounded_send(event) {
-                                break;
-                            }
-                        }
-                    },
-                    None => break,
-                }
-            }
-        }
-        io::Result::<()>::Ok(())
-    };
-
-    (Client::new(req_tx), event_recv, fut)
-}

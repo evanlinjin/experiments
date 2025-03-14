@@ -1,140 +1,192 @@
-use futures::{
-    channel::{mpsc, oneshot},
-    Future, TryFutureExt,
-};
-
-use crate::{
-    pending_request::{PendingRequest, PendingRequestTuple},
-    MaybeBatch, Request, ResponseError,
-};
-
-pub type TrySendRequestError = mpsc::TrySendError<MaybeBatch<PendingRequest>>;
-pub type RequestSender = mpsc::UnboundedSender<MaybeBatch<PendingRequest>>;
-pub type RequestReceiver = mpsc::UnboundedReceiver<MaybeBatch<PendingRequest>>;
+use crate::*;
 
 #[derive(Debug, Clone)]
-pub struct Client {
-    tx: RequestSender,
+pub struct AsyncClient {
+    tx: AsyncRequestSender,
 }
 
-impl Client {
-    pub fn new(tx: RequestSender) -> Self {
+impl From<AsyncRequestSender> for AsyncClient {
+    fn from(tx: AsyncRequestSender) -> Self {
         Self { tx }
     }
+}
 
-    pub async fn request<Req>(&self, request: Req) -> Result<Req::Response, RequestError>
+impl AsyncClient {
+    pub fn new<C>(
+        conn: C,
+    ) -> (
+        Self,
+        AsyncEventReceiver,
+        impl std::future::Future<Output = std::io::Result<()>> + Send,
+    )
     where
-        Req: Request,
-        PendingRequestTuple<Req, Req::Response>: Into<PendingRequest>,
+        C: futures::AsyncRead + futures::AsyncWrite + Send,
     {
-        let mut batch = self.batch();
-        let fut = batch.request(request).map_err(|e| match e {
-            BatchedRequestError::Canceled => RequestError::Canceled,
-            BatchedRequestError::Response(e) => RequestError::Response(e),
-        });
-        batch.send().map_err(RequestError::SendFailed)?;
-        fut.await
+        use futures::{channel::mpsc, AsyncReadExt, StreamExt};
+        let (event_tx, event_recv) = mpsc::unbounded::<Event>();
+        let (req_tx, mut req_recv) = mpsc::unbounded::<MaybeBatch<AsyncPendingRequest>>();
+
+        let (reader, mut writer) = conn.split();
+        let mut incoming_stream =
+            crate::io::ReadStreamer::new(futures::io::BufReader::new(reader)).fuse();
+        let mut state = State::<AsyncPendingRequest>::new(0);
+
+        let fut = async move {
+            loop {
+                futures::select! {
+                    req_opt = req_recv.next() => match req_opt {
+                        Some(req) => {
+                            let raw_req = state.add_request(req);
+                            crate::io::async_write(&mut writer, raw_req).await?;
+                        },
+                        None => break,
+                    },
+                    incoming_opt = incoming_stream.next() => match incoming_opt {
+                        Some(incoming_res) => {
+                            let event_opt = state
+                                .consume(incoming_res?)
+                                .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?;
+                            if let Some(event) = event_opt {
+                                if let Err(_err) = event_tx.unbounded_send(event) {
+                                    break;
+                                }
+                            }
+                        },
+                        None => break,
+                    }
+                }
+            }
+            std::io::Result::<()>::Ok(())
+        };
+
+        (Self { tx: req_tx }, event_recv, fut)
     }
 
-    pub fn request_event<Req>(&self, request: Req) -> Result<(), TrySendRequestError>
+    pub async fn send_request<Req>(&self, req: Req) -> Result<Req::Response, AsyncRequestError>
     where
         Req: Request,
-        PendingRequestTuple<Req, Req::Response>: Into<PendingRequest>,
+        AsyncPendingRequestTuple<Req, Req::Response>: Into<AsyncPendingRequest>,
     {
-        let mut batch = self.batch();
-        batch.request_event(request);
-        batch.send()?;
+        use futures::TryFutureExt;
+        let mut batch = AsyncBatchRequest::new();
+        let resp_fut = batch.request(req).map_err(|e| match e {
+            BatchRequestError::Canceled => AsyncRequestError::Canceled,
+            BatchRequestError::Response(e) => AsyncRequestError::Response(e),
+        });
+        self.send_batch(batch)
+            .map_err(AsyncRequestError::Dispatch)?;
+        resp_fut.await
+    }
+
+    pub fn send_event_request<Req>(&self, request: Req) -> Result<(), AsyncRequestSendError>
+    where
+        Req: Request,
+        AsyncPendingRequestTuple<Req, Req::Response>: Into<AsyncPendingRequest>,
+    {
+        let mut batch = AsyncBatchRequest::new();
+        batch.event_request(request);
+        self.send_batch(batch)?;
         Ok(())
     }
 
-    pub fn batch(&self) -> BatchRequest<'_> {
-        BatchRequest {
-            tx: &self.tx,
-            request: None,
-        }
-    }
-}
-
-#[must_use]
-pub struct BatchRequest<'a> {
-    tx: &'a mpsc::UnboundedSender<MaybeBatch<PendingRequest>>,
-    request: Option<MaybeBatch<PendingRequest>>,
-}
-
-impl BatchRequest<'_> {
-    /// Add `request` to the batch.
-    ///
-    /// Returns a future which becomes ready once this single request is satisfied. No not await on
-    /// the returned future before [`BatchRequest::send`] is called.
-    pub fn request<Req>(
-        &mut self,
-        request: Req,
-    ) -> impl Future<Output = Result<Req::Response, BatchedRequestError>> + Send + Sync + 'static
-    where
-        Req: Request,
-        PendingRequestTuple<Req, Req::Response>: Into<PendingRequest>,
-    {
-        let (resp_tx, resp_rx) = oneshot::channel();
-        MaybeBatch::push_opt(&mut self.request, (request, Some(resp_tx)).into());
-        async move {
-            resp_rx
-                .await
-                .map_err(|_| BatchedRequestError::Canceled)?
-                .map_err(BatchedRequestError::Response)
-        }
-    }
-
-    pub fn request_event<Req>(&mut self, request: Req)
-    where
-        Req: Request,
-        PendingRequestTuple<Req, Req::Response>: Into<PendingRequest>,
-    {
-        MaybeBatch::push_opt(&mut self.request, (request, None).into());
-    }
-
-    /// Send.
-    ///
-    /// Returns `false` if there is nothing to send.
-    pub fn send(self) -> Result<bool, TrySendRequestError> {
-        match self.request {
+    pub fn send_batch(&self, batch_req: AsyncBatchRequest) -> Result<bool, AsyncRequestSendError> {
+        match batch_req.into_inner() {
             Some(batch) => self.tx.unbounded_send(batch).map(|_| true),
             None => Ok(false),
         }
     }
 }
 
-#[derive(Debug)]
-pub enum RequestError {
-    SendFailed(TrySendRequestError),
-    Canceled,
-    Response(ResponseError),
+#[derive(Debug, Clone)]
+pub struct BlockingClient {
+    tx: BlockingRequestSender,
 }
 
-impl std::fmt::Display for RequestError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::SendFailed(e) => write!(f, "Failed to send request: {}", e),
-            Self::Canceled => write!(f, "Request was canceled before being satisfied."),
-            Self::Response(e) => write!(f, "Request satisfied with error: {}", e),
-        }
+impl From<BlockingRequestSender> for BlockingClient {
+    fn from(tx: BlockingRequestSender) -> Self {
+        Self { tx }
     }
 }
 
-impl std::error::Error for RequestError {}
+impl BlockingClient {
+    pub fn new<C>(
+        mut conn: C,
+    ) -> (
+        Self,
+        BlockingEventReceiver,
+        std::thread::JoinHandle<std::io::Result<()>>,
+        std::thread::JoinHandle<std::io::Result<()>>,
+    )
+    where
+        C: std::io::Read + std::io::Write + Clone + Send + 'static,
+    {
+        use std::sync::mpsc::*;
+        let (event_tx, event_recv) = channel::<Event>();
+        let (req_tx, req_recv) = channel::<MaybeBatch<BlockingPendingRequest>>();
+        let incoming_stream = crate::io::ReadStreamer::new(std::io::BufReader::new(conn.clone()));
+        let read_state = std::sync::Arc::new(std::sync::Mutex::new(
+            State::<BlockingPendingRequest>::new(0),
+        ));
+        let write_state = std::sync::Arc::clone(&read_state);
 
-#[derive(Debug)]
-pub enum BatchedRequestError {
-    Canceled,
-    Response(ResponseError),
-}
+        let read_join = std::thread::spawn(move || -> std::io::Result<()> {
+            for incoming_res in incoming_stream {
+                let event_opt = read_state
+                    .lock()
+                    .unwrap()
+                    .consume(incoming_res?)
+                    .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?;
+                if let Some(event) = event_opt {
+                    if let Err(_err) = event_tx.send(event) {
+                        break;
+                    }
+                }
+            }
+            Ok(())
+        });
+        let write_join = std::thread::spawn(move || -> std::io::Result<()> {
+            for req in req_recv {
+                let raw_req = write_state.lock().unwrap().add_request(req);
+                crate::io::blocking_write(&mut conn, raw_req)?;
+            }
+            Ok(())
+        });
+        (Self { tx: req_tx }, event_recv, read_join, write_join)
+    }
 
-impl std::fmt::Display for BatchedRequestError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Canceled => write!(f, "Request was canceled before being satisfied."),
-            Self::Response(e) => write!(f, "Request satisfied with error: {}", e),
+    pub fn send_request<Req>(&self, req: Req) -> Result<Req::Response, BlockingRequestError>
+    where
+        Req: Request,
+        BlockingPendingRequestTuple<Req, Req::Response>: Into<BlockingPendingRequest>,
+    {
+        let mut batch = BlockingBatchRequest::new();
+        let resp_rx = batch.request(req);
+        self.send_batch(batch)
+            .map_err(BlockingRequestError::Dispatch)?;
+        resp_rx
+            .recv()
+            .map_err(|_| BlockingRequestError::Canceled)?
+            .map_err(BlockingRequestError::Response)
+    }
+
+    pub fn send_event_request<Req>(&self, request: Req) -> Result<(), BlockingRequestSendError>
+    where
+        Req: Request,
+        BlockingPendingRequestTuple<Req, Req::Response>: Into<BlockingPendingRequest>,
+    {
+        let mut batch = BlockingBatchRequest::new();
+        batch.event_request(request);
+        self.send_batch(batch)?;
+        Ok(())
+    }
+
+    pub fn send_batch(
+        &self,
+        batch_req: BlockingBatchRequest,
+    ) -> Result<bool, BlockingRequestSendError> {
+        match batch_req.into_inner() {
+            Some(batch) => self.tx.send(batch).map(|_| true),
+            None => Ok(false),
         }
     }
 }
-
-impl std::error::Error for BatchedRequestError {}
