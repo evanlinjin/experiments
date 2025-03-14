@@ -3,7 +3,7 @@ use std::time::Duration;
 use async_std::{net::TcpStream, stream::StreamExt};
 use bdk_testenv::{anyhow, bitcoincore_rpc::RpcApi, TestEnv};
 use bitcoin::Amount;
-use electrum_c::{
+use electrum_streaming::{
     notification::Notification, pending_request::SatisfiedRequest, request, run, Event,
 };
 use futures::{

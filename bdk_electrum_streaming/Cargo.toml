@@ -1,18 +1,18 @@
 [package]
-name = "bdk_electrum_c"
-version = "0.7.2"
+name = "bdk_electrum_streaming"
+version = "0.1.0"
 description = "Experimental but sane BDK electrum client by @evanlinjin."
 license = "MIT OR Apache-2.0"
 edition = "2021"
 rust-version = "1.63"
 repository = "https://github.com/evanlinjin/experiments"
-documentation = "https://docs.rs/bdk_electrum_c"
+documentation = "https://docs.rs/bdk_electrum_streaming"
 readme = "README.md"
 
 [dependencies]
 futures = "0.3"
 futures-timer = "3.0.3"
 anyhow = "1.0"
-bdk_core = "0.3.0"
+bdk_core = "0.4.1"
 miniscript = { version = "12.0.0" }
-electrum_c = { path = "../electrum_c", version = "0.3.0" }
+electrum_streaming = { path = "../electrum_streaming", version = "0.1" }

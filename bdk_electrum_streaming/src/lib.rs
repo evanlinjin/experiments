@@ -1,12 +1,12 @@
 //! BDK Electrum goodness.
 
-use bdk_core::spk_client::FullScanResult;
+use bdk_core::spk_client::FullScanResponse;
 /// Re-export.
-pub use electrum_c;
-use electrum_c::client::RequestError;
-use electrum_c::notification::Notification;
-use electrum_c::pending_request::{ErroredRequest, PendingRequestTuple, SatisfiedRequest};
-use electrum_c::{request, Client, ElectrumScriptHash, Event, ResponseError};
+pub use electrum_streaming;
+use electrum_streaming::client::RequestError;
+use electrum_streaming::notification::Notification;
+use electrum_streaming::pending_request::{ErroredRequest, PendingRequestTuple, SatisfiedRequest};
+use electrum_streaming::{request, Client, ElectrumScriptHash, Event, ResponseError};
 use futures::channel::mpsc::{self, UnboundedReceiver};
 use futures::channel::oneshot;
 use futures::{select, AsyncRead, AsyncWrite, FutureExt, StreamExt};
@@ -22,7 +22,7 @@ use bdk_core::{collections::HashMap, CheckPoint};
 use bdk_core::{BlockId, ConfirmationBlockTime, TxUpdate};
 use miniscript::{Descriptor, DescriptorPublicKey};
 
-pub type Update<K> = FullScanResult<K, ConfirmationBlockTime>;
+pub type Update<K> = FullScanResponse<K, ConfirmationBlockTime>;
 pub type HeaderCache = HashMap<u32, (BlockHash, Header)>;
 
 /// Keeps track of spks.
@@ -529,7 +529,7 @@ pub struct Emitter<K: Clone + Ord + Send + Sync + 'static> {
     header_cache: Headers,
     tx_cache: Txs,
 
-    client: Arc<futures::lock::Mutex<Option<electrum_c::Client>>>,
+    client: Arc<futures::lock::Mutex<Option<electrum_streaming::Client>>>,
     cmd_rx: UnboundedReceiver<Cmd<K>>,
     update_tx: mpsc::UnboundedSender<Update<K>>,
     broadcast_queue: BroadcastQueue,
@@ -575,7 +575,7 @@ where
     where
         C: AsyncRead + AsyncWrite + Send,
     {
-        let (client, mut event_rx, run_fut) = electrum_c::run(conn);
+        let (client, mut event_rx, run_fut) = electrum_streaming::run(conn);
         self.client.lock().await.replace(client.clone());
 
         client.request_event(request::HeadersSubscribe)?;
@@ -657,7 +657,7 @@ pub enum Cmd<K> {
 #[derive(Debug, Clone)]
 pub struct CmdSender<K> {
     tx: mpsc::UnboundedSender<Cmd<K>>,
-    client: Arc<futures::lock::Mutex<Option<electrum_c::Client>>>,
+    client: Arc<futures::lock::Mutex<Option<electrum_streaming::Client>>>,
 }
 
 impl<K: Send + Sync + 'static> CmdSender<K> {
@@ -677,8 +677,9 @@ impl<K: Send + Sync + 'static> CmdSender<K> {
 
     pub async fn request<Req>(&self, request: Req) -> Result<Req::Response, RequestError>
     where
-        Req: electrum_c::Request,
-        PendingRequestTuple<Req, Req::Response>: Into<electrum_c::pending_request::PendingRequest>,
+        Req: electrum_streaming::Request,
+        PendingRequestTuple<Req, Req::Response>:
+            Into<electrum_streaming::pending_request::PendingRequest>,
     {
         match self.client.lock().await.as_ref().cloned() {
             Some(client) => client.request(request).await,

@@ -180,9 +180,9 @@ checksum = "8c3c1a368f70d6cf7302d78f8f7093da241fb8e8807c05cc9e51a125895a6d5b"
 
 [[package]]
 name = "bdk_chain"
-version = "0.20.0"
+version = "0.21.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3bee1fe68ec0015bce2e4c1754ebbf18d70750a1f0103e3785d34e8959fe8fd7"
+checksum = "4955734f97b2baed3f36d16ae7c203fdde31ae85391ac44ee3cbcaf0886db5ce"
 dependencies = [
  "bdk_core",
  "bitcoin",
@@ -191,20 +191,20 @@ dependencies = [
 
 [[package]]
 name = "bdk_core"
-version = "0.3.0"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "be5e187ee33d5f99f1997a700cc1dfa0524fd1de31e6414c612c9e89ccdaa133"
+checksum = "b545aea1efc090e4f71f1dd5468090d9f54c3de48002064c04895ef811fbe0b2"
 dependencies = [
  "bitcoin",
 ]
 
 [[package]]
-name = "bdk_electrum_c"
-version = "0.7.2"
+name = "bdk_electrum_streaming"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "bdk_core",
- "electrum_c",
+ "electrum_streaming",
  "futures",
  "futures-timer",
  "miniscript",
@@ -212,9 +212,9 @@ dependencies = [
 
 [[package]]
 name = "bdk_testenv"
-version = "0.10.0"
+version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a4bd299fe963d4a9b4f89719c4cc4e4c2a81b4d8dd1cd476abd2bcecaf6a6204"
+checksum = "29317cb8181a5ea2ba73c0276a3122d9af0c839a57102f95ba27bd472daed9b5"
 dependencies = [
  "bdk_chain",
  "electrsd",
@@ -520,8 +520,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "electrum_c"
-version = "0.3.1"
+name = "electrum_streaming"
+version = "0.1.0"
 dependencies = [
  "async-std",
  "bdk_testenv",
