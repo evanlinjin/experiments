@@ -290,7 +290,8 @@ impl Txs {
 
     pub fn insert_tx(&mut self, tx: impl Into<Arc<Transaction>>) {
         let tx: Arc<Transaction> = tx.into();
-        self.txs.insert(tx.compute_txid(), tx);
+        let txid = tx.compute_txid();
+        self.txs.insert(txid, tx);
     }
 
     pub async fn fetch_tx(
@@ -430,6 +431,8 @@ async fn script_hash_update(
     txs: &mut Txs,
     script_hash: ElectrumScriptHash,
 ) -> anyhow::Result<TxUpdate<ConfirmationBlockTime>> {
+    let start_epoch = std::time::UNIX_EPOCH.elapsed()?.as_secs();
+
     let electrum_txs = client
         .send_request(request::GetHistory { script_hash })
         .await?;
@@ -446,7 +449,7 @@ async fn script_hash_update(
 
     let mut tx_update = TxUpdate::<ConfirmationBlockTime>::default();
 
-    for tx in electrum_txs {
+    for (i, tx) in (0..electrum_txs.len() as u64).rev().zip(electrum_txs) {
         let txid = tx.txid();
         let full_tx = txs.fetch_tx(client, txid).await?;
 
@@ -477,6 +480,11 @@ async fn script_hash_update(
                 },
                 txid,
             ));
+        } else {
+            // We tweak the last_seen so that transctions are sorted in the order of
+            // `electrum_txs` for a single spk history.
+            let tweaked_last_seen = start_epoch.saturating_sub(i);
+            tx_update.seen_ats.insert((txid, tweaked_last_seen));
         }
     }
 
@@ -581,7 +589,6 @@ where
         use futures::AsyncReadExt;
         let (reader, writer) = conn.split();
         let (client, mut event_rx, run_fut) = AsyncClient::new(reader, writer);
-        // let (client, mut event_rx, run_fut) = electrum_streaming::run(conn);
         self.client.lock().await.replace(client.clone());
 
         client.send_event_request(request::HeadersSubscribe)?;
