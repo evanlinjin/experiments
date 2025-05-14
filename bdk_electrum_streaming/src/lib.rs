@@ -116,8 +116,8 @@ impl<K: Clone + Ord + Send + Sync + 'static> DerivedSpkTracker<K> {
         &mut self,
         script_hash: ElectrumScriptHash,
     ) -> Option<(K, u32, Vec<ElectrumScriptHash>)> {
-        let (k, mut next_index) = self.derived_spks_rev.get(&script_hash).cloned()?;
-        next_index += 1;
+        let (k, this_index) = self.derived_spks_rev.get(&script_hash).cloned()?;
+        let next_index = this_index + 1;
 
         let mut spk_hashes = Vec::new();
         for index in (next_index..=next_index + 1 + self.lookahead).rev() {
@@ -126,7 +126,7 @@ impl<K: Clone + Ord + Send + Sync + 'static> DerivedSpkTracker<K> {
                 None => break,
             }
         }
-        Some((k, next_index, spk_hashes))
+        Some((k, this_index, spk_hashes))
     }
 }
 
@@ -156,7 +156,6 @@ impl Headers {
         tip_hash: BlockHash,
     ) -> anyhow::Result<Option<CheckPoint>> {
         const CHAIN_SUFFIX_LENGTH: u32 = 8;
-        const CONSECUTIVE_THRESHOLD: usize = 3;
 
         // TODO: Get rid of `ASSUME_FINAL_DEPTH`. Instead, get headers one by one and stop when we
         // connect with a checkpoint.
@@ -178,7 +177,6 @@ impl Headers {
         }
 
         // Ensure local recent headers are still in the best chain.
-        let mut consecutive_matches = 0_usize;
         for cp in self.tip.iter() {
             let height = cp.height();
             let orig_hash = cp.hash();
@@ -194,12 +192,7 @@ impl Headers {
             let hash = header.block_hash();
             self.headers.insert(hash, header);
             if header.block_hash() == orig_hash {
-                consecutive_matches += 1;
-                if consecutive_matches > CONSECUTIVE_THRESHOLD {
-                    break;
-                }
-            } else {
-                consecutive_matches = 0;
+                break;
             }
         }
         for (height, header) in new_headers {
