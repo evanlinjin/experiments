@@ -2,11 +2,13 @@
 
 use bdk_core::spk_client::FullScanResponse;
 /// Re-export.
-pub use electrum_streaming;
-use electrum_streaming::client::RequestError;
-use electrum_streaming::notification::Notification;
-use electrum_streaming::pending_request::{ErroredRequest, PendingRequestTuple, SatisfiedRequest};
-use electrum_streaming::{request, Client, ElectrumScriptHash, Event, ResponseError};
+pub use electrum_streaming_client;
+use electrum_streaming_client::notification::Notification;
+use electrum_streaming_client::{
+    request, AsyncClient, AsyncPendingRequest, AsyncPendingRequestTuple, AsyncRequestError,
+    ElectrumScriptHash, Event, Request, ResponseError,
+};
+use electrum_streaming_client::{ErroredRequest, SatisfiedRequest};
 use futures::channel::mpsc::{self, UnboundedReceiver};
 use futures::channel::oneshot;
 use futures::{select, AsyncRead, AsyncWrite, FutureExt, StreamExt};
@@ -149,20 +151,20 @@ impl Headers {
 
     pub async fn update(
         &mut self,
-        client: &Client,
+        client: &AsyncClient,
         tip_height: u32,
         tip_hash: BlockHash,
     ) -> anyhow::Result<Option<CheckPoint>> {
-        const ASSUME_FINAL_DEPTH: u32 = 8;
+        const CHAIN_SUFFIX_LENGTH: u32 = 8;
         const CONSECUTIVE_THRESHOLD: usize = 3;
 
         // TODO: Get rid of `ASSUME_FINAL_DEPTH`. Instead, get headers one by one and stop when we
         // connect with a checkpoint.
-        let start_height = tip_height.saturating_sub(ASSUME_FINAL_DEPTH - 1);
+        let start_height = tip_height.saturating_sub(CHAIN_SUFFIX_LENGTH - 1);
         let headers_resp = client
-            .request(request::Headers {
+            .send_request(request::Headers {
                 start_height,
-                count: ASSUME_FINAL_DEPTH as _,
+                count: CHAIN_SUFFIX_LENGTH as _,
             })
             .await;
         let mut new_headers = (start_height..)
@@ -181,9 +183,12 @@ impl Headers {
             let height = cp.height();
             let orig_hash = cp.hash();
             let header = match new_headers.entry(height) {
-                btree_map::Entry::Vacant(e) => {
-                    *e.insert(client.request(request::Header { height }).await?.header)
-                }
+                btree_map::Entry::Vacant(e) => *e.insert(
+                    client
+                        .send_request(request::Header { height })
+                        .await?
+                        .header,
+                ),
                 btree_map::Entry::Occupied(e) => *e.get(),
             };
             let hash = header.block_hash();
@@ -206,7 +211,7 @@ impl Headers {
 
     pub async fn ensure_heights(
         &mut self,
-        client: &Client,
+        client: &AsyncClient,
         heights: BTreeSet<u32>,
     ) -> anyhow::Result<HeaderCache> {
         let mut header_cache = HeaderCache::new();
@@ -243,7 +248,7 @@ impl Headers {
             let header_req = request::Header { height };
             let header_opt = match cp_tail.entry(height) {
                 btree_map::Entry::Vacant(tail_e) => {
-                    let header = client.request(header_req).await?.header;
+                    let header = client.send_request(header_req).await?.header;
                     let hash = header.block_hash();
                     self.headers.insert(hash, header);
                     tail_e.insert(hash);
@@ -255,7 +260,7 @@ impl Headers {
                     match self.headers.entry(hash) {
                         hash_map::Entry::Occupied(header_e) => Some((hash, *header_e.get())),
                         hash_map::Entry::Vacant(header_e) => {
-                            let header = client.request(header_req).await?.header;
+                            let header = client.send_request(header_req).await?.header;
                             if header.block_hash() == hash {
                                 header_e.insert(header);
                                 Some((hash, header))
@@ -297,13 +302,13 @@ impl Txs {
 
     pub async fn fetch_tx(
         &mut self,
-        client: &Client,
+        client: &AsyncClient,
         txid: Txid,
     ) -> anyhow::Result<Arc<Transaction>> {
         match self.txs.entry(txid) {
             hash_map::Entry::Occupied(entry) => Ok(entry.get().clone()),
             hash_map::Entry::Vacant(entry) => {
-                let tx = client.request(request::GetTx(txid)).await?.tx;
+                let tx = client.send_request(request::GetTx { txid }).await?.tx;
                 let arc_tx = entry.insert(Arc::new(tx)).clone();
                 Ok(arc_tx)
             }
@@ -312,7 +317,7 @@ impl Txs {
 
     pub async fn fetch_txout(
         &mut self,
-        client: &Client,
+        client: &AsyncClient,
         outpoint: OutPoint,
     ) -> anyhow::Result<Option<TxOut>> {
         let tx = self.fetch_tx(client, outpoint.txid).await?;
@@ -321,15 +326,18 @@ impl Txs {
 }
 
 /// Initiate emitter by subscribing to headers and scripts.
-pub async fn init<K>(client: &Client, spk_tracker: &mut DerivedSpkTracker<K>) -> anyhow::Result<()>
+pub async fn init<K>(
+    client: &AsyncClient,
+    spk_tracker: &mut DerivedSpkTracker<K>,
+) -> anyhow::Result<()>
 where
     K: Clone + Ord + Send + Sync + 'static,
 {
-    client.request_event(request::HeadersSubscribe)?;
+    client.send_event_request(request::HeadersSubscribe)?;
 
     // Assume `spk_tracker` is initiated.
     for script_hash in spk_tracker.all_spk_hashes() {
-        client.request_event(request::ScriptHashSubscribe { script_hash })?;
+        client.send_event_request(request::ScriptHashSubscribe { script_hash })?;
     }
 
     Ok(())
@@ -337,7 +345,7 @@ where
 
 /// [`init`] should be called beforehand.
 pub async fn handle_event<K>(
-    client: &Client,
+    client: &AsyncClient,
     spk_tracker: &mut DerivedSpkTracker<K>,
     headers: &mut Headers,
     txs: &mut Txs,
@@ -376,7 +384,7 @@ where
             let (k, i) = match spk_tracker.handle_script_status(req.script_hash) {
                 Some((k, i, new_spk_hashes)) => {
                     for script_hash in new_spk_hashes {
-                        client.request_event(request::ScriptHashSubscribe { script_hash })?;
+                        client.send_event_request(request::ScriptHashSubscribe { script_hash })?;
                     }
                     (k, i)
                 }
@@ -395,7 +403,7 @@ where
             let (k, i) = match spk_tracker.handle_script_status(inner.script_hash()) {
                 Some((k, i, new_spk_hashes)) => {
                     for script_hash in new_spk_hashes {
-                        client.request_event(request::ScriptHashSubscribe { script_hash })?;
+                        client.send_event_request(request::ScriptHashSubscribe { script_hash })?;
                     }
                     (k, i)
                 }
@@ -424,12 +432,14 @@ where
 }
 
 async fn script_hash_update(
-    client: &Client,
+    client: &AsyncClient,
     headers: &mut Headers,
     txs: &mut Txs,
     script_hash: ElectrumScriptHash,
 ) -> anyhow::Result<TxUpdate<ConfirmationBlockTime>> {
-    let electrum_txs = client.request(request::GetHistory { script_hash }).await?;
+    let electrum_txs = client
+        .send_request(request::GetHistory { script_hash })
+        .await?;
 
     let header_cache = headers
         .ensure_heights(
@@ -458,7 +468,7 @@ async fn script_hash_update(
         if let Some(height) = tx.confirmation_height() {
             let height = height.to_consensus_u32();
             let merkle_res = client
-                .request(request::GetTxMerkle { txid, height })
+                .send_request(request::GetTxMerkle { txid, height })
                 .await?;
             let (hash, header) = match header_cache.get(&height) {
                 Some(&hash_and_header) => hash_and_header,
@@ -529,7 +539,7 @@ pub struct Emitter<K: Clone + Ord + Send + Sync + 'static> {
     header_cache: Headers,
     tx_cache: Txs,
 
-    client: Arc<futures::lock::Mutex<Option<electrum_streaming::Client>>>,
+    client: Arc<futures::lock::Mutex<Option<AsyncClient>>>,
     cmd_rx: UnboundedReceiver<Cmd<K>>,
     update_tx: mpsc::UnboundedSender<Update<K>>,
     broadcast_queue: BroadcastQueue,
@@ -575,15 +585,18 @@ where
     where
         C: AsyncRead + AsyncWrite + Send,
     {
-        let (client, mut event_rx, run_fut) = electrum_streaming::run(conn);
+        use futures::AsyncReadExt;
+        let (reader, writer) = conn.split();
+        let (client, mut event_rx, run_fut) = AsyncClient::new(reader, writer);
+        // let (client, mut event_rx, run_fut) = electrum_streaming::run(conn);
         self.client.lock().await.replace(client.clone());
 
-        client.request_event(request::HeadersSubscribe)?;
+        client.send_event_request(request::HeadersSubscribe)?;
         for script_hash in self.spk_tracker.all_spk_hashes() {
-            client.request_event(request::ScriptHashSubscribe { script_hash })?;
+            client.send_event_request(request::ScriptHashSubscribe { script_hash })?;
         }
         for tx in self.broadcast_queue.txs() {
-            client.request_event(request::BroadcastTx(tx))?;
+            client.send_event_request(request::BroadcastTx(tx))?;
         }
 
         let spk_tracker = &mut self.spk_tracker;
@@ -613,17 +626,17 @@ where
                     opt = cmd_rx.next() => match opt {
                         Some(Cmd::InsertDescriptor { keychain, descriptor, next_index }) => {
                             for script_hash in spk_tracker.insert_descriptor(keychain, descriptor, next_index) {
-                                client.request_event(request::ScriptHashSubscribe { script_hash })?;
+                                client.send_event_request(request::ScriptHashSubscribe { script_hash })?;
                             }
                         }
                         Some(Cmd::Broadcast { tx, resp_tx }) => {
                             broadcast_queue.add(tx.clone(), resp_tx);
-                            client.request_event(request::BroadcastTx(tx))?;
+                            client.send_event_request(request::BroadcastTx(tx))?;
                         }
                         Some(Cmd::Close) | None => break,
                     },
                     _ = Delay::new(ping_delay).fuse() => {
-                        client.request_event(request::Ping)?;
+                        client.send_event_request(request::Ping)?;
                     }
                 }
             }
@@ -657,7 +670,7 @@ pub enum Cmd<K> {
 #[derive(Debug, Clone)]
 pub struct CmdSender<K> {
     tx: mpsc::UnboundedSender<Cmd<K>>,
-    client: Arc<futures::lock::Mutex<Option<electrum_streaming::Client>>>,
+    client: Arc<futures::lock::Mutex<Option<AsyncClient>>>,
 }
 
 impl<K: Send + Sync + 'static> CmdSender<K> {
@@ -675,15 +688,14 @@ impl<K: Send + Sync + 'static> CmdSender<K> {
         Ok(())
     }
 
-    pub async fn request<Req>(&self, request: Req) -> Result<Req::Response, RequestError>
+    pub async fn request<Req>(&self, request: Req) -> Result<Req::Response, AsyncRequestError>
     where
-        Req: electrum_streaming::Request,
-        PendingRequestTuple<Req, Req::Response>:
-            Into<electrum_streaming::pending_request::PendingRequest>,
+        Req: Request,
+        AsyncPendingRequestTuple<Req, Req::Response>: Into<AsyncPendingRequest>,
     {
         match self.client.lock().await.as_ref().cloned() {
-            Some(client) => client.request(request).await,
-            None => Err(RequestError::Canceled),
+            Some(client) => client.send_request(request).await,
+            None => Err(AsyncRequestError::Canceled),
         }
     }
 
