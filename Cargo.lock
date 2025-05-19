@@ -164,9 +164,9 @@ checksum = "baf1de4339761588bc0619e3cbc0120ee582ebb74b53b4efbf79117bd2da40fd"
 
 [[package]]
 name = "electrum_streaming_client"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "521ab0a6c00e4aa0d5d3c126bfcf5dcb1f00d2ff23c510ea7a39877250afcafd"
+checksum = "09e6e936c9cc8fca4fd1f4532f268d8dd5eb028d668c2ec543d377ebf77a0aac"
 dependencies = [
  "bitcoin",
  "futures",
