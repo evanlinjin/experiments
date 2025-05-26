@@ -11,19 +11,25 @@ use electrum_streaming_client::{
 use electrum_streaming_client::{ErroredRequest, SatisfiedRequest};
 use futures::channel::mpsc::{self, UnboundedReceiver};
 use futures::channel::oneshot;
-use futures::stream::FuturesUnordered;
-use futures::{select, AsyncRead, AsyncWrite, FutureExt, StreamExt};
+use futures::future::Either;
+use futures::stream::{FuturesOrdered, FuturesUnordered};
+use futures::{select, AsyncRead, AsyncWrite, FutureExt, StreamExt, TryStreamExt};
 use futures_timer::Delay;
 
-use std::collections::{btree_map, hash_map, BTreeMap, BTreeSet, VecDeque};
+use std::collections::{btree_map, hash_map, BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bdk_core::bitcoin::block::Header;
-use bdk_core::bitcoin::{BlockHash, OutPoint, ScriptBuf, Transaction, TxOut, Txid};
+use bdk_core::bitcoin::{BlockHash, ScriptBuf, Transaction, Txid};
 use bdk_core::{collections::HashMap, CheckPoint};
 use bdk_core::{BlockId, ConfirmationBlockTime};
 use miniscript::{Descriptor, DescriptorPublicKey};
+mod state;
+pub use state::*;
+mod chain_job;
+mod req;
+mod spk_job;
 
 pub type Update<K> = FullScanResponse<K, ConfirmationBlockTime>;
 pub type HeaderCache = HashMap<u32, (BlockHash, Header)>;
@@ -37,14 +43,14 @@ pub type HeaderCache = HashMap<u32, (BlockHash, Header)>;
 /// * When we receive history for a spk, we wish to include a `last_active_index` update in case
 ///   `KeychainTxOutIndex` is not up-to-date.
 #[derive(Debug, Clone)]
-pub struct DerivedSpkTracker<K: Clone + Ord + Send + Sync + 'static> {
+pub struct DerivedSpkTracker<K> {
     lookahead: u32,
     descriptors: BTreeMap<K, Descriptor<DescriptorPublicKey>>,
     derived_spks: BTreeMap<(K, u32), ElectrumScriptHash>,
     derived_spks_rev: HashMap<ElectrumScriptHash, (K, u32)>,
 }
 
-impl<K: Clone + Ord + Send + Sync + 'static> DerivedSpkTracker<K> {
+impl<K: Ord + Clone> DerivedSpkTracker<K> {
     pub fn new(lookahead: u32) -> Self {
         Self {
             lookahead,
@@ -133,6 +139,11 @@ impl<K: Clone + Ord + Send + Sync + 'static> DerivedSpkTracker<K> {
     }
 }
 
+pub struct ScriptStatusResult<K> {
+    pub last_active: (K, u32),
+
+}
+
 /// This is a plceholder until we can put headers in checkpoints.
 #[derive(Debug)]
 pub struct Headers {
@@ -141,7 +152,7 @@ pub struct Headers {
 }
 
 impl Headers {
-    const CHAIN_SUFFIX_LENGTH: u32 = 8;
+    const CHAIN_SUFFIX_LENGTH: u32 = 21;
 
     pub fn new(tip: CheckPoint) -> Self {
         Self {
@@ -204,89 +215,6 @@ impl Headers {
         }
         Ok(Some(self.tip.clone()))
     }
-
-    // pub async fn ensure_heights(
-    //     &mut self,
-    //     client: &AsyncClient,
-    //     heights: BTreeSet<u32>,
-    // ) -> anyhow::Result<HeaderCache> {
-    //     let mut header_cache = HeaderCache::new();
-    //     let mut cp_tail = BTreeMap::<u32, BlockHash>::new();
-    //     let mut heights_to_fetch = Vec::<u32>::new();
-    //
-    //     // Anything above this height is ignored.
-    //     let tip_height = self.tip.height();
-    //
-    //     let mut heights_iter = heights.into_iter().filter(|&h| h <= tip_height).peekable();
-    //     let start_height = match heights_iter.peek() {
-    //         Some(&h) => h,
-    //         None => return Ok(header_cache),
-    //     };
-    //
-    //     // Figure out the local checkpoint to extend from and populate `cp_tail` with existing
-    //     // blocks in local. We populate `cp_tail` first as we do not want to replace existing
-    //     // blocks in the chain.
-    //     //
-    //     // The local chain will have `Headers::CHAIN_SUFFIX_LENGTH` number of
-    //     // consecutive blocks from the tip. As long as we assume that reorgs depths do not exceed
-    //     // this length, this logic would not leave the chain in an inconsistent state.
-    //     let start_cp = {
-    //         let mut start_cp = Option::<CheckPoint>::None;
-    //         for cp in self.tip.iter() {
-    //             let BlockId { height, hash } = cp.block_id();
-    //             if height < start_height {
-    //                 start_cp = Some(cp);
-    //                 break;
-    //             }
-    //             cp_tail.insert(height, hash);
-    //         }
-    //         match start_cp {
-    //             Some(cp) => cp,
-    //             // TODO: Is this the correct thing to do when we don't have a start cp?
-    //             None => return Ok(header_cache),
-    //         }
-    //     };
-    //
-    //     // Ensure `heights` are all in `cp_tail`.
-    //     for height in heights_iter {
-    //         let header_req = request::Header { height };
-    //         let header_opt = match cp_tail.entry(height) {
-    //             btree_map::Entry::Vacant(tail_e) => {
-    //                 let header = client.send_request(header_req).await?.header;
-    //                 let hash = header.block_hash();
-    //                 self.headers.insert(hash, header);
-    //                 tail_e.insert(hash);
-    //                 Some((hash, header))
-    //             }
-    //             btree_map::Entry::Occupied(tail_e) => {
-    //                 let hash = *tail_e.get();
-    //                 // Try ensure we also have the header.
-    //                 match self.headers.entry(hash) {
-    //                     hash_map::Entry::Occupied(header_e) => Some((hash, *header_e.get())),
-    //                     hash_map::Entry::Vacant(header_e) => {
-    //                         let header = client.send_request(header_req).await?.header;
-    //                         if header.block_hash() == hash {
-    //                             header_e.insert(header);
-    //                             Some((hash, header))
-    //                         } else {
-    //                             // TODO: What to do here?
-    //                             None
-    //                         }
-    //                     }
-    //                 }
-    //             }
-    //         };
-    //         if let Some(hash_and_header) = header_opt {
-    //             header_cache.insert(height, hash_and_header);
-    //         }
-    //     }
-    //
-    //     // Create new cp.
-    //     self.tip = start_cp
-    //         .extend(cp_tail.into_iter().map(Into::into))
-    //         .expect("must extend");
-    //     Ok(header_cache)
-    // }
 
     pub async fn ensure_heights(
         &mut self,
@@ -379,6 +307,7 @@ impl Headers {
 pub struct Txs {
     txs: HashMap<Txid, Arc<Transaction>>,
     spk_txs: HashMap<ElectrumScriptHash, BTreeSet<Txid>>,
+    anchors: HashMap<(Txid, BlockHash), ConfirmationBlockTime>,
 }
 
 impl Txs {
@@ -408,45 +337,100 @@ impl Txs {
     ) -> Vec<Txid> {
         match self.spk_txs.entry(spk) {
             hash_map::Entry::Occupied(mut e) => {
-                println!("[SCRIPT] {}", spk);
-                println!("\t* electrum_txs={:?}", spk_txids);
-                println!("\t* local_txs={:?}", e.get());
+                println!("[SCRIPT] {}, electrum_txs={:?}", spk, spk_txids);
                 let evicted_txids = e.get().difference(&spk_txids).copied().collect();
                 e.get_mut().extend(spk_txids);
                 evicted_txids
             }
             hash_map::Entry::Vacant(e) => {
-                println!("[SCRIPT] {}", spk);
-                println!("\t* electrum_txs={:?}", spk_txids);
-                println!("\t* local_txs=EMPTY",);
+                println!("[SCRIPT] {}, electrum_txs={:?}", spk, spk_txids);
                 e.insert(spk_txids);
                 Vec::new()
             }
         }
     }
 
-    pub async fn fetch_tx(
+    pub async fn fetch_txs(
         &mut self,
         client: &AsyncClient,
-        txid: Txid,
-    ) -> anyhow::Result<Arc<Transaction>> {
-        match self.txs.entry(txid) {
-            hash_map::Entry::Occupied(entry) => Ok(entry.get().clone()),
-            hash_map::Entry::Vacant(entry) => {
-                let tx = client.send_request(request::GetTx { txid }).await?.tx;
-                let arc_tx = entry.insert(Arc::new(tx)).clone();
-                Ok(arc_tx)
+        txids: impl IntoIterator<Item = Txid>,
+    ) -> anyhow::Result<Vec<Arc<Transaction>>> {
+        let mut futs = FuturesOrdered::new();
+        let mut needs_insert = Vec::<(usize, Txid)>::new();
+        let mut no_dup = HashSet::<Txid>::new();
+        for (i, txid) in txids.into_iter().enumerate() {
+            // So we don't fetch something twice.
+            if !no_dup.insert(txid) {
+                continue;
             }
+            futs.push_back(match self.txs.get(&txid).cloned() {
+                Some(tx) => Either::Left(futures::future::ok(tx)),
+                None => {
+                    needs_insert.push((i, txid));
+                    Either::Right(
+                        client.send_request(request::GetTx { txid }).map(move |r| {
+                            r.map(|resp| Arc::new(resp.tx)).map_err(anyhow::Error::new)
+                        }),
+                    )
+                }
+            });
         }
+        let txs = futs.try_collect::<Vec<_>>().await?;
+        for (i, txid) in needs_insert {
+            self.txs.insert(txid, txs[i].clone());
+        }
+        Ok(txs)
     }
 
-    pub async fn fetch_txout(
+    pub async fn fetch_anchors(
         &mut self,
         client: &AsyncClient,
-        outpoint: OutPoint,
-    ) -> anyhow::Result<Option<TxOut>> {
-        let tx = self.fetch_tx(client, outpoint.txid).await?;
-        Ok(tx.output.get(outpoint.vout as usize).cloned())
+        headers_cache: &HeaderCache,
+        txs: impl IntoIterator<Item = (Txid, u32)>,
+    ) -> anyhow::Result<impl Iterator<Item = (Txid, ConfirmationBlockTime)>> {
+        let mut futs = FuturesOrdered::new();
+        let mut needs_insert = Vec::<(usize, BlockHash)>::new();
+        let mut no_dup = HashSet::<Txid>::new();
+        for (i, (txid, conf_height)) in txs.into_iter().enumerate() {
+            if !no_dup.insert(txid) {
+                continue;
+            }
+            let (hash, header) = match headers_cache.get(&conf_height) {
+                Some((hash, header)) => (*hash, *header),
+                None => continue,
+            };
+            futs.push_back(match self.anchors.get(&(txid, hash)) {
+                Some(anchor) => Either::Left(futures::future::ok(Some((txid, *anchor)))),
+                None => {
+                    needs_insert.push((i, hash));
+                    let height = conf_height;
+                    Either::Right(
+                        client
+                            .send_request(request::GetTxMerkle { txid, height })
+                            .map(move |r| -> anyhow::Result<_> {
+                                let resp = r?;
+                                if header.merkle_root != resp.expected_merkle_root(txid) {
+                                    Ok(None)
+                                } else {
+                                    let confirmation_time = header.time as u64;
+                                    let anchor = ConfirmationBlockTime {
+                                        block_id: BlockId { height, hash },
+                                        confirmation_time,
+                                    };
+                                    Ok(Some((txid, anchor)))
+                                }
+                            }),
+                    )
+                }
+            });
+        }
+        let anchors = futs.try_collect::<Vec<_>>().await?;
+        for (i, hash) in needs_insert {
+            if let Some((txid, a)) = anchors[i] {
+                self.anchors.insert((txid, hash), a);
+            }
+        }
+        Ok(anchors.into_iter().flatten())
     }
 }
 
@@ -481,64 +465,46 @@ where
     K: Clone + Ord + Send + Sync + 'static,
 {
     match event {
-        Event::Response(SatisfiedRequest::Header { req, resp }) => Ok(headers
-            .update(client, req.height, resp.header.block_hash())
-            .await?
-            .map(|cp| Update {
-                chain_update: Some(cp),
-                ..Default::default()
-            })),
-        Event::Response(SatisfiedRequest::HeadersSubscribe { resp, .. }) => Ok(headers
-            .update(client, resp.height, resp.header.block_hash())
-            .await?
-            .map(|cp| Update {
-                chain_update: Some(cp),
-                ..Default::default()
-            })),
-        Event::Notification(Notification::Header(h)) => Ok(headers
-            .update(client, h.height(), h.header().block_hash())
-            .await?
-            .map(|cp| Update {
-                chain_update: Some(cp),
-                ..Default::default()
-            })),
+        Event::Response(SatisfiedRequest::Header { req, resp }) => {
+            println!("[RESPONSE] Header");
+            Ok(headers
+                .update(client, req.height, resp.header.block_hash())
+                .await?
+                .map(|cp| Update {
+                    chain_update: Some(cp),
+                    ..Default::default()
+                }))
+        }
+        Event::Response(SatisfiedRequest::HeadersSubscribe { resp, .. }) => {
+            println!("[RESPONSE] HeadersSubscribe");
+            Ok(headers
+                .update(client, resp.height, resp.header.block_hash())
+                .await?
+                .map(|cp| Update {
+                    chain_update: Some(cp),
+                    ..Default::default()
+                }))
+        }
+        Event::Notification(Notification::Header(h)) => {
+            println!("[NOTIFICATION] Header");
+            Ok(headers
+                .update(client, h.height(), h.header().block_hash())
+                .await?
+                .map(|cp| Update {
+                    chain_update: Some(cp),
+                    ..Default::default()
+                }))
+        }
         Event::Response(SatisfiedRequest::ScriptHashSubscribe { req, resp }) => {
+            println!("[RESPONSE] ScriptHashSubscribe");
             let update =
                 script_hash_update(client, headers, spk_tracker, txs, req.script_hash, resp)
                     .await?;
             // TODO: Return `None` if update is empty.
             Ok(Some(update))
-            // let mut update = Update::<K>::default();
-            // if resp.is_some() {
-            //     if let Some((k, i, new_spk_hashes)) =
-            //         spk_tracker.handle_script_status(req.script_hash)
-            //     {
-            //         for script_hash in new_spk_hashes {
-            //             client.send_event_request(request::ScriptHashSubscribe { script_hash })?;
-            //         }
-            //         update.last_active_indices.insert(k, i);
-            //         update.chain_update = Some(headers.tip());
-            //     }
-            // }
-            // let new_derivation = match spk_tracker.handle_script_status(req.script_hash) {
-            //     Some((k, i, new_spk_hashes)) if resp.is_some() => {
-            //         for script_hash in new_spk_hashes {
-            //             client.send_event_request(request::ScriptHashSubscribe { script_hash })?;
-            //         }
-            //         println!("LATEST DERIVATION: {i}");
-            //         Some((k, i))
-            //     }
-            //     _ => None,
-            // };
-            // let tx_update = script_hash_update(client, headers, txs, req.script_hash).await?;
-            // let chain_update = Some(headers.tip());
-            // Ok(Some(Update {
-            //     tx_update,
-            //     last_active_indices: new_derivation.into_iter().collect(),
-            //     chain_update,
-            // }))
         }
-        Event::Notification(Notification::ScriptHash(inner)) if inner.script_status().is_some() => {
+        Event::Notification(Notification::ScriptHash(inner)) => {
+            println!("[NOTIFICATION] ScriptHash");
             let update = script_hash_update(
                 client,
                 headers,
@@ -550,25 +516,9 @@ where
             .await?;
             // TODO: Return `None` if update is empty.
             Ok(Some(update))
-            // let new_derivation = match spk_tracker.handle_script_status(inner.script_hash()) {
-            //     Some((k, i, new_spk_hashes)) => {
-            //         for script_hash in new_spk_hashes {
-            //             client.send_event_request(request::ScriptHashSubscribe { script_hash })?;
-            //         }
-            //         println!("LATEST DERIVATION: {i}");
-            //         Some((k, i))
-            //     }
-            //     None => None,
-            // };
-            // let tx_update = script_hash_update(client, headers, txs, inner.script_hash()).await?;
-            // let chain_update = Some(headers.tip());
-            // Ok(Some(Update {
-            //     tx_update,
-            //     last_active_indices: new_derivation.into_iter().collect(),
-            //     chain_update,
-            // }))
         }
         Event::Response(SatisfiedRequest::BroadcastTx { resp, .. }) => {
+            println!("[RESPONSE] BroadcastTx");
             broadcast_queue.handle_resp_ok(resp);
             Ok(None)
         }
@@ -576,7 +526,10 @@ where
             broadcast_queue.handle_resp_err(req.0.compute_txid(), error);
             Ok(None)
         }
-        Event::ResponseError(err) => Err(err.into()),
+        Event::ResponseError(err) => {
+            println!("[ERROR] err={}", err);
+            Err(err.into())
+        }
         _ => Ok(None),
     }
 }
@@ -620,7 +573,7 @@ where
         .await?;
     println!(
         "[DONE] method=ensure_height, elapsed={}s",
-        start.elapsed().as_secs()
+        start.elapsed().as_secs_f64()
     );
     if has_cp_changes {
         update.chain_update = Some(headers.tip());
@@ -636,42 +589,42 @@ where
         update.tx_update.evicted_ats.insert((txid, start_epoch));
     }
 
-    for (i, tx) in (0..electrum_txs.len() as u64).rev().zip(electrum_txs) {
-        let txid = tx.txid();
-        let full_tx = txs.fetch_tx(client, txid).await?;
-
-        for txin in &full_tx.input {
-            let op = txin.previous_output;
-            if let Some(txout) = txs.fetch_txout(client, op).await? {
-                update.tx_update.txouts.insert(op, txout);
+    let fetched_txs = txs
+        .fetch_txs(client, electrum_txs.iter().map(|tx| tx.txid()))
+        .await?;
+    let prevouts = fetched_txs
+        .iter()
+        .flat_map(|tx| tx.input.iter().map(|input| input.previous_output));
+    txs.fetch_txs(client, prevouts.clone().map(|op| op.txid))
+        .await?;
+    for op in prevouts {
+        if let Some(tx) = txs.txs.get(&op.txid) {
+            if let Some(txout) = tx.output.get(op.vout as usize) {
+                update.tx_update.txouts.insert(op, txout.clone());
             }
         }
-        update.tx_update.txs.push(full_tx);
+    }
+    update.tx_update.txs = fetched_txs;
+
+    let anchors = txs
+        .fetch_anchors(
+            client,
+            &header_cache,
+            electrum_txs
+                .iter()
+                .filter_map(|tx| Some((tx.txid(), tx.confirmation_height()?.to_consensus_u32()))),
+        )
+        .await?
+        .map(|(txid, anchor)| (anchor, txid));
+    update.tx_update.anchors.extend(anchors);
+
+    for (i, tx) in (0..electrum_txs.len() as u64).rev().zip(electrum_txs) {
+        let txid = tx.txid();
 
         // We tweak the last_seen so that transctions are sorted in the order of
         // `electrum_txs` for a single spk history.
         let tweaked_last_seen = start_epoch.saturating_sub(i);
-
-        if let Some(height) = tx.confirmation_height() {
-            let height = height.to_consensus_u32();
-            let merkle_res = client
-                .send_request(request::GetTxMerkle { txid, height })
-                .await?;
-            let (hash, header) = match header_cache.get(&height) {
-                Some(&hash_and_header) => hash_and_header,
-                None => continue,
-            };
-            if header.merkle_root != merkle_res.expected_merkle_root(txid) {
-                continue;
-            }
-            update.tx_update.anchors.insert((
-                ConfirmationBlockTime {
-                    block_id: BlockId { height, hash },
-                    confirmation_time: header.time as _,
-                },
-                txid,
-            ));
-        } else {
+        if tx.confirmation_height().is_none() {
             update.tx_update.seen_ats.insert((txid, tweaked_last_seen));
         }
     }
