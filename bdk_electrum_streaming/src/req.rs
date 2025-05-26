@@ -69,7 +69,7 @@ impl From<request::ScriptHashSubscribe> for AnyRequest {
 /// Request coordinator.
 ///
 /// Associates responses to their requests and requests to their jobs.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ReqCoord {
     next_req_id: usize,
     /// Req id -> Req.
@@ -98,6 +98,7 @@ pub type ReqQueue = Vec<RawRequest>;
 
 /// Queues requests to broadcast so that once the response is received, we can determine it's
 /// response type and associated jobs.
+#[derive(Debug)]
 pub struct ReqQueuer<'q> {
     coord: &'q mut ReqCoord,
     queue: &'q mut ReqQueue,

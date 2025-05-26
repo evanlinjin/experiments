@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     sync::Arc,
 };
 
@@ -22,14 +22,8 @@ use crate::{
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum JobId {
-    Spk(u64),
+    Spk(ElectrumScriptHash),
     Chain,
-}
-
-impl Default for JobId {
-    fn default() -> Self {
-        Self::Spk(0)
-    }
 }
 
 /// We separate this out so that we can easily pass this into methods that advance jobs.
@@ -37,33 +31,24 @@ impl Default for JobId {
 pub(crate) struct StateInner<K> {
     pub(crate) cp: CheckPoint,
     pub(crate) cache: Cache,
-    pub(crate) coord: ReqCoord,
     pub(crate) spk_tracker: DerivedSpkTracker<K>,
 }
 
 #[derive(Debug)]
 pub struct State<K> {
     inner: StateInner<K>,
+    coord: ReqCoord,
 
-    next_spk_job_id: u64,
-    spk_jobs: BTreeMap<u64, SpkJob<K>>,
-
+    spk_jobs: BTreeMap<ElectrumScriptHash, SpkJob<K>>,
     chain_job: Option<ChainJob>,
 }
 
-impl<K> State<K> {
-    fn _next_spk_job_id(&mut self) -> JobId {
-        let id = self.next_spk_job_id;
-        self.next_spk_job_id += 1;
-        JobId::Spk(id)
-    }
-
+impl<K: Ord + Clone> State<K> {
     pub fn advance(
         &mut self,
-        update: &mut Update<K>,
         req_queue: &mut ReqQueue,
         raw: RawNotificationOrResponse,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Option<Update<K>>> {
         match raw {
             RawNotificationOrResponse::Notification(raw_notification) => {
                 let notification = Notification::new(&raw_notification)
@@ -72,27 +57,48 @@ impl<K> State<K> {
                     Notification::Header(header_notification) => {
                         // Always replace prev job since a new notification means a new tip.
                         self.chain_job = ChainJob::new(
-                            self.inner.coord.queuer(req_queue, JobId::Chain),
+                            self.coord.queuer(req_queue, JobId::Chain),
                             self.inner.cp.clone(),
                             *header_notification.header(),
                             header_notification.height(),
                         );
                         if let Some(job) = self.chain_job.take() {
                             match job.try_finish(&mut self.inner.cache, &mut self.inner.cp) {
-                                Ok(cp) => update.chain_update = Some(cp),
-                                Err(job) => self.chain_job = Some(job),
+                                Ok(cp) => Ok(Some(Update {
+                                    chain_update: Some(cp),
+                                    ..Default::default()
+                                })),
+                                Err(job) => {
+                                    self.chain_job = Some(job);
+                                    Ok(None)
+                                }
+                            }
+                        } else {
+                            Ok(None)
+                        }
+                    }
+                    Notification::ScriptHash(script_hash_notification) => {
+                        let spk_hash = script_hash_notification.script_hash();
+                        let spk_status = script_hash_notification.script_status();
+                        let mut queuer = self.coord.queuer(req_queue, JobId::Spk(spk_hash));
+                        let mut job =
+                            SpkJob::new(&mut queuer, &mut self.inner, spk_hash, spk_status);
+                        job = job.advance(&mut queuer, &self.inner);
+                        match job.try_finish(&self.inner) {
+                            Some(resp) => Ok(Some(resp)),
+                            None => {
+                                self.spk_jobs.insert(spk_hash, job);
+                                Ok(None)
                             }
                         }
-                        Ok(())
                     }
-                    Notification::ScriptHash(script_hash_notification) => todo!(),
-                    Notification::Unknown(_) => Ok(()),
+                    Notification::Unknown(_) => Ok(None),
                 }
             }
             RawNotificationOrResponse::Response(raw_response) => {
-                let orig_req = match self.inner.coord.pop(raw_response.id) {
+                let orig_req = match self.coord.pop(raw_response.id) {
                     Some(req) => req,
-                    None => return Ok(()),
+                    None => return Ok(None),
                 };
                 let raw = raw_response
                     .result
@@ -108,8 +114,16 @@ impl<K> State<K> {
                                 .process_headers((headers.start_height..).zip(resp.headers))
                                 .try_finish(&mut self.inner.cache, &mut self.inner.cp)
                             {
-                                Ok(cp) => update.chain_update = Some(cp),
-                                Err(job) => self.chain_job = Some(job),
+                                Ok(cp) => {
+                                    return Ok(Some(Update {
+                                        chain_update: Some(cp),
+                                        ..Default::default()
+                                    }))
+                                }
+                                Err(job) => {
+                                    self.chain_job = Some(job);
+                                    return Ok(None);
+                                }
                             }
                         }
                     }
@@ -118,7 +132,7 @@ impl<K> State<K> {
                     AnyRequest::GetTxMerkle(get_tx_merkle) => todo!(),
                     AnyRequest::ScriptHashSubscribe(script_hash_subscribe) => todo!(),
                 };
-                Ok(())
+                Ok(None)
             }
         }
     }
@@ -131,5 +145,6 @@ pub struct Cache {
     pub spk_txids: HashMap<ElectrumScriptHash, BTreeSet<Txid>>,
     pub txs: HashMap<Txid, Arc<Transaction>>,
     pub anchors: HashMap<(Txid, BlockHash), ConfirmationBlockTime>,
+    pub failed_anchors: HashSet<(Txid, BlockHash)>,
     pub headers: HashMap<BlockHash, bitcoin::block::Header>,
 }
