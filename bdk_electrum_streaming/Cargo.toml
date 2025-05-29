@@ -15,4 +15,10 @@ futures-timer = "3"
 anyhow = "1"
 bdk_core = "0.5"
 miniscript = { version = "12.0.0" }
-electrum_streaming_client = { version = "0.1" }
+electrum_streaming_client = { version = "0.2", path = "../../electrum_streaming_client/" }
+serde_json = "1"
+
+[dev-dependencies]
+bdk_testenv = "0.12.0"
+bdk_chain = "0.22.0"
+tokio = { version = "1", features = ["time", "net", "rt", "macros"]}
