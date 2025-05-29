@@ -1,5 +1,8 @@
-use crate::{req::ReqQueuer, Cache};
-use bdk_core::{bitcoin::block::Header, BlockId, CheckPoint};
+use crate::req::ReqQueuer;
+use bdk_core::{
+    bitcoin::{block::Header, BlockHash},
+    BlockId, CheckPoint,
+};
 use electrum_streaming_client::request;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -14,7 +17,7 @@ use std::collections::{BTreeMap, BTreeSet};
 #[derive(Debug, Clone)]
 pub struct ChainJob {
     missing_headers: BTreeSet<u32>,
-    headers: BTreeMap<u32, Header>,
+    cp_update: BTreeMap<u32, BlockHash>,
 }
 
 impl ChainJob {
@@ -22,7 +25,7 @@ impl ChainJob {
 
     pub fn new(
         mut queuer: ReqQueuer,
-        local_tip: CheckPoint,
+        local_tip: &CheckPoint,
         header: Header,
         height: u32,
     ) -> Option<Self> {
@@ -41,7 +44,7 @@ impl ChainJob {
                     if prev_height == prev_cp.height() && header.prev_blockhash == prev_cp.hash() {
                         return Some(Self {
                             missing_headers: BTreeSet::new(),
-                            headers: core::iter::once((height, header)).collect(),
+                            cp_update: core::iter::once((height, header.block_hash())).collect(),
                         });
                     }
                 }
@@ -56,59 +59,64 @@ impl ChainJob {
         // Overlap?
         if remote_start_height <= local_height {
             let start_height = Ord::min(local_start_height, remote_start_height);
-            let count = (remote_height - start_height) as usize;
+            let count = (remote_height + 1 - start_height) as usize;
             queuer.enqueue(request::Headers {
                 start_height,
                 count,
             });
             Some(Self {
                 missing_headers: (start_height..=remote_height).collect(),
-                headers: BTreeMap::new(),
+                cp_update: BTreeMap::new(),
             })
         } else {
             // Otherwise we have to do two separate requests.
             queuer.enqueue(request::Headers {
                 start_height: local_start_height,
-                count: (local_height - local_start_height) as usize,
+                count: (local_height + 1 - local_start_height) as usize,
             });
             queuer.enqueue(request::Headers {
                 start_height: remote_start_height,
-                count: (remote_height - remote_start_height) as usize,
+                count: (remote_height + 1 - remote_start_height) as usize,
             });
             Some(Self {
                 missing_headers: (local_start_height..=local_height)
                     .chain(remote_start_height..=remote_height)
                     .collect(),
-                headers: BTreeMap::new(),
+                cp_update: BTreeMap::new(),
             })
         }
     }
 
-    pub fn process_headers(mut self, headers: impl IntoIterator<Item = (u32, Header)>) -> Self {
-        for (height, header) in headers {
+    pub fn process_blocks(mut self, headers: impl IntoIterator<Item = (u32, BlockHash)>) -> Self {
+        let headers = headers.into_iter().collect::<Vec<_>>();
+        for (height, header) in headers.iter().cloned() {
             if self.missing_headers.remove(&height) {
-                self.headers.insert(height, header);
+                self.cp_update.insert(height, header);
             }
         }
+        println!(
+            " * process_blocks() missing={:?}, got={:?}",
+            self.missing_headers,
+            headers.iter().map(|(h, _)| h).collect::<Vec<_>>(),
+        );
         self
     }
 
-    pub fn try_finish(
-        self,
-        cache: &mut Cache,
-        local_tip: &mut CheckPoint,
-    ) -> Result<CheckPoint, Self> {
+    pub fn try_finish(self, local_tip: &mut CheckPoint) -> Result<CheckPoint, Self> {
         if !self.missing_headers.is_empty() {
+            println!(
+                "[JOB:CHAIN] Not finished: missing={:?}",
+                self.missing_headers
+            );
             return Err(self);
         }
 
         let mut cp = local_tip.clone();
-        for (height, header) in self.headers {
-            let hash = header.block_hash();
+        for (height, hash) in self.cp_update {
             cp = cp.insert(BlockId { height, hash });
-            cache.headers.insert(hash, header);
         }
         *local_tip = cp.clone();
+        println!("[JOB:CHAIN] Finished!");
         Ok(cp)
     }
 }

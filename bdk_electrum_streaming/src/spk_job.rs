@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use bdk_core::{
     bitcoin::{OutPoint, Txid},
@@ -6,10 +6,7 @@ use bdk_core::{
 };
 use electrum_streaming_client::{request, response, ElectrumScriptHash, ElectrumScriptStatus};
 
-use crate::{
-    req::{self, AnyRequest, ReqQueuer},
-    Cache, DerivedSpkTracker, StateInner, Update,
-};
+use crate::{req::ReqQueuer, Cache};
 
 #[derive(Debug)]
 pub enum SpkJobStage {
@@ -64,7 +61,7 @@ impl TxsJobStage {
 }
 
 #[derive(Debug)]
-pub struct SpkJob<K> {
+pub struct SpkJob {
     /// Time that we got this notification.
     pub start_epoch: u64,
     /// Script hash of this notification.
@@ -74,14 +71,11 @@ pub struct SpkJob<K> {
 
     /// Staged tx update.
     pub tx_update: TxUpdate<ConfirmationBlockTime>,
-    /// Staged last active indices update.
-    pub last_active_indices: BTreeMap<K, u32>,
 }
 
-impl<K: Ord + Clone> SpkJob<K> {
+impl SpkJob {
     pub fn new(
-        queuer: &mut ReqQueuer,
-        state: &mut StateInner<K>,
+        cache: &Cache,
         spk_hash: ElectrumScriptHash,
         spk_status: Option<ElectrumScriptStatus>,
     ) -> Self {
@@ -91,20 +85,10 @@ impl<K: Ord + Clone> SpkJob<K> {
             .as_secs();
         let mut tx_update = TxUpdate::default();
 
-        let mut last_active_indices = BTreeMap::new();
         let stage = match spk_status {
-            Some(status) => {
-                if let Some((k, i, new_subs)) = state.spk_tracker.handle_script_status(spk_hash) {
-                    last_active_indices.insert(k, i);
-                    for script_hash in new_subs {
-                        queuer.enqueue(request::ScriptHashSubscribe { script_hash });
-                    }
-                }
-
-                SpkJobStage::ProcessingHistory { status }
-            }
+            Some(status) => SpkJobStage::ProcessingHistory { status },
             None => {
-                if let Some(prev_txids) = state.cache.spk_txids.get(&spk_hash) {
+                if let Some(prev_txids) = cache.spk_txids.get(&spk_hash) {
                     tx_update
                         .evicted_ats
                         .extend(prev_txids.iter().map(|&txid| (txid, start_epoch)));
@@ -118,28 +102,27 @@ impl<K: Ord + Clone> SpkJob<K> {
             spk_hash,
             stage,
             tx_update,
-            last_active_indices,
         }
     }
 
     /// Try fullfill all that is missing.
-    pub fn advance(mut self, queuer: &mut ReqQueuer, state: &StateInner<K>) -> Self {
+    pub fn advance(mut self, queuer: &mut ReqQueuer, cache: &Cache, cp: &CheckPoint) -> Self {
         let mut made_progress = true;
         while made_progress {
-            (self, made_progress) = self.try_advance_once(queuer, &state.cache, state.cp.clone());
+            (self, made_progress) = self.try_advance_once(queuer, cache, cp.clone());
+            println!(
+                "[JOB:SPK] stage: {:?}, made_progress={}",
+                self.stage, made_progress
+            );
         }
         self
     }
 
-    pub fn try_finish(&self, state: &StateInner<K>) -> Option<Update<K>> {
+    pub fn try_finish(self) -> Result<(ElectrumScriptHash, TxUpdate<ConfirmationBlockTime>), Self> {
         if self.stage.is_done() {
-            Some(Update {
-                tx_update: self.tx_update.clone(),
-                last_active_indices: self.last_active_indices.clone(),
-                chain_update: Some(state.cp.clone()),
-            })
+            Ok((self.spk_hash, self.tx_update))
         } else {
-            None
+            Err(self)
         }
     }
 
@@ -210,6 +193,7 @@ impl<K: Ord + Clone> SpkJob<K> {
                                 self.tx_update
                                     .txs
                                     .iter()
+                                    .filter(|tx| !tx.is_coinbase())
                                     .flat_map(|tx| tx.input.iter())
                                     .map(|txin| txin.previous_output),
                             )
@@ -246,6 +230,7 @@ impl<K: Ord + Clone> SpkJob<K> {
                     None => None,
                 };
 
+                let anchors_start_count = anchors.len();
                 anchors.retain(|&(height, txid)| {
                     if height > tip.height() {
                         return false;
@@ -255,7 +240,6 @@ impl<K: Ord + Clone> SpkJob<K> {
                         Some(cp) => cp.hash(),
                         None => {
                             queuer.enqueue(request::Header { height });
-                            queuer.enqueue(request::GetTxMerkle { txid, height });
                             return true;
                         }
                     };
@@ -275,7 +259,7 @@ impl<K: Ord + Clone> SpkJob<K> {
                     queuer.enqueue(request::GetTxMerkle { txid, height });
                     true
                 });
-                if anchors.is_empty() {
+                if anchors.len() < anchors_start_count {
                     made_progress = true;
                 }
 

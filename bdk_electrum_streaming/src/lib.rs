@@ -28,8 +28,11 @@ use miniscript::{Descriptor, DescriptorPublicKey};
 mod state;
 pub use state::*;
 mod chain_job;
+pub use chain_job::*;
 mod req;
+pub use req::*;
 mod spk_job;
+pub use spk_job::*;
 
 pub type Update<K> = FullScanResponse<K, ConfirmationBlockTime>;
 pub type HeaderCache = HashMap<u32, (BlockHash, Header)>;
@@ -62,6 +65,10 @@ impl<K: Ord + Clone> DerivedSpkTracker<K> {
 
     pub fn all_spk_hashes(&self) -> impl Iterator<Item = ElectrumScriptHash> + '_ {
         self.derived_spks.values().copied()
+    }
+
+    pub fn index_of_spk_hash(&self, spk_hash: ElectrumScriptHash) -> Option<(K, u32)> {
+        self.derived_spks_rev.get(&spk_hash).cloned()
     }
 
     fn _add_derived_spk(&mut self, keychain: K, index: u32) -> Option<ElectrumScriptHash> {
@@ -141,7 +148,6 @@ impl<K: Ord + Clone> DerivedSpkTracker<K> {
 
 pub struct ScriptStatusResult<K> {
     pub last_active: (K, u32),
-
 }
 
 /// This is a plceholder until we can put headers in checkpoints.

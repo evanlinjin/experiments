@@ -1,4 +1,4 @@
-use std::collections::{hash_map, BTreeSet, HashMap};
+use std::collections::{hash_map, BTreeSet, HashMap, VecDeque};
 
 use electrum_streaming_client::{request, RawRequest, Request};
 
@@ -12,6 +12,7 @@ pub enum AnyRequest {
     GetTx(request::GetTx),
     GetTxMerkle(request::GetTxMerkle),
     ScriptHashSubscribe(request::ScriptHashSubscribe),
+    HeadersSubscribe(request::HeadersSubscribe),
 }
 
 impl AnyRequest {
@@ -24,6 +25,9 @@ impl AnyRequest {
             AnyRequest::GetTxMerkle(get_tx_merkle) => get_tx_merkle.to_method_and_params(),
             AnyRequest::ScriptHashSubscribe(script_hash_subscribe) => {
                 script_hash_subscribe.to_method_and_params()
+            }
+            AnyRequest::HeadersSubscribe(headers_subscribe) => {
+                headers_subscribe.to_method_and_params()
             }
         };
         RawRequest::new(req_id, method, params)
@@ -66,12 +70,19 @@ impl From<request::ScriptHashSubscribe> for AnyRequest {
     }
 }
 
+impl From<request::HeadersSubscribe> for AnyRequest {
+    fn from(value: request::HeadersSubscribe) -> Self {
+        Self::HeadersSubscribe(value)
+    }
+}
+
 /// Request coordinator.
 ///
 /// Associates responses to their requests and requests to their jobs.
 #[derive(Debug, Clone)]
 pub struct ReqCoord {
-    next_req_id: usize,
+    /// Next request id.
+    next_id: usize,
     /// Req id -> Req.
     awaiting_responses: HashMap<usize, AnyRequest>,
     /// So we won't have duplicate requests.
@@ -79,8 +90,18 @@ pub struct ReqCoord {
 }
 
 impl ReqCoord {
-    pub fn pop(&mut self, req_id: usize) -> Option<AnyRequest> {
-        self.awaiting_responses.remove(&req_id)
+    pub fn new(next_id: usize) -> Self {
+        Self {
+            next_id,
+            awaiting_responses: HashMap::new(),
+            req_to_job: HashMap::new(),
+        }
+    }
+
+    pub fn pop(&mut self, req_id: usize) -> Option<(AnyRequest, BTreeSet<JobId>)> {
+        let any_req = self.awaiting_responses.remove(&req_id)?;
+        let job_ids = self.req_to_job.remove(&any_req).unwrap_or_default();
+        Some((any_req, job_ids))
     }
 
     pub fn queuer<'q>(&'q mut self, queue: &'q mut ReqQueue, job_id: JobId) -> ReqQueuer<'q> {
@@ -94,7 +115,7 @@ impl ReqCoord {
 }
 
 /// Queue of raw requests.
-pub type ReqQueue = Vec<RawRequest>;
+pub type ReqQueue = VecDeque<RawRequest>;
 
 /// Queues requests to broadcast so that once the response is received, we can determine it's
 /// response type and associated jobs.
@@ -114,10 +135,10 @@ impl<'q> ReqQueuer<'q> {
             }
             hash_map::Entry::Vacant(e) => {
                 e.insert(BTreeSet::new()).insert(self.job_id);
-                let req_id = self.coord.next_req_id;
-                self.coord.next_req_id += 1;
+                let req_id = self.coord.next_id;
+                self.coord.next_id += 1;
                 self.coord.awaiting_responses.insert(req_id, req);
-                self.queue.push(req.into_raw(req_id));
+                self.queue.push_back(req.into_raw(req_id));
             }
         }
     }
