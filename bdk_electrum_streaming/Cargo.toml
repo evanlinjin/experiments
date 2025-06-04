@@ -4,7 +4,7 @@ version = "0.2.0"
 description = "Experimental but sane BDK electrum client by @evanlinjin."
 license = "MIT OR Apache-2.0"
 edition = "2021"
-rust-version = "1.63"
+rust-version = "1.70"
 repository = "https://github.com/evanlinjin/experiments"
 documentation = "https://docs.rs/bdk_electrum_streaming"
 readme = "README.md"
@@ -15,4 +15,13 @@ futures-timer = "3"
 anyhow = "1"
 bdk_core = "0.5"
 miniscript = { version = "12.0.0" }
-electrum_streaming_client = { version = "0.1" }
+electrum_streaming_client = { version = "0.3" }
+serde_json = "1"
+log = { version = "0.4", features = ["kv", "kv_std"] }
+
+[dev-dependencies]
+bdk_testenv = "0.12.0"
+bdk_chain = "0.22.0"
+tokio = { version = "1", features = ["time", "net", "rt", "macros"]}
+tokio-util = { version = "0.7.15", features = ["compat"] }
+env_logger = { version = "0.11", features = ["kv"] }
