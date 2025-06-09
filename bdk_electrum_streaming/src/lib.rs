@@ -17,5 +17,7 @@ mod async_client;
 pub use async_client::*;
 mod derived_spk_tracker;
 pub use derived_spk_tracker::*;
+mod blocking_client;
+pub use blocking_client::*;
 
 pub type Update<K> = FullScanResponse<K, ConfirmationBlockTime>;
