@@ -144,9 +144,9 @@ checksum = "89e25b6adfb930f02d1981565a6e5d9c547ac15a96606256d3b59040e5cd4ca3"
 
 [[package]]
 name = "bdk_chain"
-version = "0.22.0"
+version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "260ac6b2feb080a9af6e1df060e09ea78b2034955aeabef81b87309d6b7cfd47"
+checksum = "0e7e7c062f2229a767fe85062b8932352a7b8c1df586f91fae1017fd3dd281ef"
 dependencies = [
  "bdk_core",
  "bitcoin",
@@ -155,9 +155,9 @@ dependencies = [
 
 [[package]]
 name = "bdk_core"
-version = "0.5.0"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2cb2496e93fd104e32a36cd5dfb0638fc8376d83d80696b3b75f27abe39df343"
+checksum = "17698c25d2728afd6950d82069dce172147006f73960b9dc793a7e8dd7089016"
 dependencies = [
  "bitcoin",
 ]
@@ -183,9 +183,9 @@ dependencies = [
 
 [[package]]
 name = "bdk_testenv"
-version = "0.12.0"
+version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "37e1072a941505a0d854275de6cac996e790035578a1e1e443aba8623027ddf2"
+checksum = "77c629d1d8b20d31cc7550e0db540c411e377440120900eadddac3879b69ed8c"
 dependencies = [
  "bdk_chain",
  "electrsd",

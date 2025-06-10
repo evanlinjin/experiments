@@ -60,7 +60,7 @@ fn blocking_env() -> anyhow::Result<()> {
     let (internal, _internal_keys) = Descriptor::parse_descriptor(&secp, DESCRIPTORS[1])?;
 
     let mut graph = IndexedTxGraph::<ConfirmationBlockTime, _>::new({
-        let mut indexer = KeychainTxOutIndex::<&'static str>::new(LOOKAHEAD);
+        let mut indexer = KeychainTxOutIndex::<&'static str>::new(LOOKAHEAD, false);
         indexer.insert_descriptor(EXTERNAL, external.clone())?;
         indexer.insert_descriptor(INTERNAL, internal.clone())?;
         indexer
@@ -150,7 +150,7 @@ async fn env() -> anyhow::Result<()> {
     let (internal, _internal_keys) = Descriptor::parse_descriptor(&secp, DESCRIPTORS[1])?;
 
     let mut graph = IndexedTxGraph::<ConfirmationBlockTime, _>::new({
-        let mut indexer = KeychainTxOutIndex::<&'static str>::new(LOOKAHEAD);
+        let mut indexer = KeychainTxOutIndex::<&'static str>::new(LOOKAHEAD, false);
         indexer.insert_descriptor(EXTERNAL, external.clone())?;
         indexer.insert_descriptor(INTERNAL, internal.clone())?;
         indexer

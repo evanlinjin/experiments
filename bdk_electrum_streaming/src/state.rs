@@ -13,6 +13,7 @@ use electrum_streaming_client::{
     ElectrumScriptHash, ElectrumScriptStatus, MaybeBatch, PendingRequest,
     RawNotificationOrResponse, Request,
 };
+use miniscript::{Descriptor, DescriptorPublicKey};
 use serde_json::from_value;
 
 use crate::{
@@ -77,6 +78,11 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
         }
     }
 
+    /// Get a reference to the internal cache.
+    pub fn cache(&self) -> &Cache {
+        &self.cache
+    }
+
     /// Resets the state.
     ///
     /// Call this to reset the state before reconnecting.
@@ -87,6 +93,25 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
         self.user_state.clear();
         self.headers_subscribed = false;
         self.first_chain_job_completed = false;
+    }
+
+    /// Insert a descriptor and queue outgoing requests (if needed).
+    pub fn insert_descriptor(
+        &mut self,
+        req_queue: &mut ReqQueue,
+        keychain: K,
+        descriptor: Descriptor<DescriptorPublicKey>,
+        next_index: u32,
+    ) {
+        let new_script_hashes = self
+            .spk_tracker
+            .insert_descriptor(keychain, descriptor, next_index);
+        if self.first_chain_job_completed {
+            for script_hash in new_script_hashes {
+                let mut queuer = self.coord.queuer(req_queue, JobId::Spk(script_hash));
+                queuer.enqueue(request::ScriptHashSubscribe { script_hash });
+            }
+        }
     }
 
     /// Only start spk jobs after the first chain job completes.
