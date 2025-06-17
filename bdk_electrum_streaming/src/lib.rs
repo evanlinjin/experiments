@@ -6,6 +6,10 @@ pub use electrum_streaming_client;
 
 use bdk_core::ConfirmationBlockTime;
 mod state;
+use electrum_streaming_client::{
+    AsyncPendingRequest, BlockingPendingRequest, MaybeBatch, PendingRequest,
+};
+use miniscript::{Descriptor, DescriptorPublicKey};
 pub use state::*;
 mod chain_job;
 pub use chain_job::*;
@@ -21,3 +25,16 @@ mod blocking_client;
 pub use blocking_client::*;
 
 pub type Update<K> = FullScanResponse<K, ConfirmationBlockTime>;
+
+pub type BlockingClientAction<K> = ClientAction<K, Box<BlockingPendingRequest>>;
+pub type AsyncClientAction<K> = ClientAction<K, AsyncPendingRequest>;
+
+pub enum ClientAction<K, PReq: PendingRequest> {
+    Request(MaybeBatch<PReq>),
+    AddDescriptor {
+        keychain: K,
+        descriptor: Box<Descriptor<DescriptorPublicKey>>,
+        next_index: u32,
+    },
+    Stop,
+}

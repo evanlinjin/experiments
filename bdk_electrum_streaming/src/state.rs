@@ -87,6 +87,7 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
     ///
     /// Call this to reset the state before reconnecting.
     pub fn reset(&mut self) {
+        tracing::trace!("State: reset");
         self.coord.clear();
         self.spk_jobs.clear();
         self.chain_job = None;
@@ -328,7 +329,11 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
                         let cp = match self.cp.get(req.height) {
                             Some(cp) if cp.height() == req.height => cp,
                             _ => {
-                                log::warn!(req:?, resp:?; "Received a merkle proof before we got the header");
+                                tracing::warn!(
+                                    ?req,
+                                    ?resp,
+                                    "Received a merkle proof before we got the header"
+                                );
                                 self.cancel_jobs(job_ids);
                                 return Ok(None);
                             }
@@ -336,8 +341,9 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
                         let header = match self.cache.headers.get(&cp.hash()) {
                             Some(header) => header,
                             None => {
-                                log::warn!(
-                                    req:?, blockhash = cp.hash().to_string();
+                                tracing::warn!(
+                                    ?req,
+                                    blockhash = cp.hash().to_string(),
                                     "Missing associated header. Reorg?",
                                 );
                                 self.cancel_jobs(job_ids);
@@ -346,10 +352,10 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
                         };
                         let exp_root = resp.expected_merkle_root(req.txid);
                         if header.merkle_root == exp_root {
-                            log::debug!(
+                            tracing::debug!(
                                 txid = req.txid.to_string(),
                                 block_height = req.height,
-                                block_hash = header.block_hash().to_string();
+                                block_hash = header.block_hash().to_string(),
                                 "Inserting anchor.",
                             );
                             self.cache.anchors.insert(
@@ -360,13 +366,13 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
                                 },
                             );
                         } else {
-                            log::warn!(
+                            tracing::warn!(
                                 txid = req.txid.to_string(),
                                 block_height = req.height,
                                 block_hash = header.block_hash().to_string(),
                                 header_root = header.merkle_root.to_string(),
-                                expected_root = exp_root.to_string();
-                               "Failed to verify anchor."
+                                expected_root = exp_root.to_string(),
+                                "Failed to verify anchor."
                             );
                             self.cache
                                 .failed_anchors

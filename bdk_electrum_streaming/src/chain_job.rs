@@ -94,8 +94,9 @@ impl ChainJob {
                 self.cp_update.insert(height, header);
             }
         }
-        log::info!(
-            processed = headers.len(), remaining = self.missing_headers.len();
+        tracing::info!(
+            processed = headers.len(),
+            remaining = self.missing_headers.len(),
             "Chain Job: Processed blocks.",
         );
         self
@@ -103,7 +104,10 @@ impl ChainJob {
 
     pub fn try_finish(self, local_tip: &mut CheckPoint) -> Result<CheckPoint, Self> {
         if !self.missing_headers.is_empty() {
-            log::trace!(missing = self.missing_headers.len(); "Chain Job: Not finished.");
+            tracing::trace!(
+                missing = self.missing_headers.len(),
+                "Chain Job: Not finished."
+            );
             return Err(self);
         }
 
@@ -112,7 +116,7 @@ impl ChainJob {
             cp = cp.insert(BlockId { height, hash });
         }
         *local_tip = cp.clone();
-        log::info!("Chain Job: Finished.");
+        tracing::info!("Chain Job: Finished.");
         Ok(cp)
     }
 }

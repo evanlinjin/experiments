@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{sync::atomic::AtomicBool, time::Duration};
 
 use bdk_chain::{
     keychain_txout::KeychainTxOutIndex, local_chain::LocalChain, CanonicalizationParams,
@@ -9,12 +9,10 @@ use bdk_core::{
     ConfirmationBlockTime,
 };
 use bdk_electrum_streaming::{
-    run_async, run_blocking, AsyncState, BlockingState, Cache, DerivedSpkTracker, ReqCoord, Update,
+    run_async, run_blocking, AsyncClient, AsyncState, BlockingClient, BlockingState, Cache,
+    DerivedSpkTracker, ReqCoord, Update,
 };
 use bdk_testenv::{utils::DESCRIPTORS, TestEnv};
-use electrum_streaming_client::{
-    AsyncClient, AsyncPendingRequest, BlockingClient, BlockingPendingRequest, MaybeBatch,
-};
 use futures::{channel::mpsc, pin_mut, FutureExt, StreamExt};
 use miniscript::Descriptor;
 use tokio::net::TcpStream;
@@ -25,10 +23,7 @@ const INTERNAL: &str = "internal";
 const LOOKAHEAD: u32 = 6;
 
 fn init() {
-    let _ = env_logger::builder()
-        .is_test(true)
-        .filter_module("bdk_electrum_streaming", log::LevelFilter::max())
-        .try_init();
+    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
 }
 
 fn apply_update(
@@ -79,16 +74,16 @@ fn blocking_env() -> anyhow::Result<()> {
     );
 
     let (mut update_tx, update_rx) = std::sync::mpsc::channel::<Update<&'static str>>();
-    let (client_tx, mut client_rx) =
-        std::sync::mpsc::channel::<MaybeBatch<BlockingPendingRequest>>();
-
-    let client = BlockingClient::from(client_tx);
+    let (client, mut client_rx) = BlockingClient::new();
 
     let conn = std::net::TcpStream::connect(&electrum_url)?;
+    // This is important otherwise the read thread will block forever.
+    conn.set_read_timeout(Some(Duration::from_secs(1)))?;
     let run_conn = conn.try_clone()?;
     let run_handle = std::thread::spawn(move || {
         let res = run_blocking(
             &mut state,
+            &mut AtomicBool::new(false),
             &mut update_tx,
             &mut client_rx,
             &mut &run_conn,
@@ -130,10 +125,10 @@ fn blocking_env() -> anyhow::Result<()> {
     println!("BALANCE: {}", balance);
 
     // TODO: Figure out a way to stop the thread without having to close the connection.
-    drop(client);
-    drop(update_rx);
-    conn.shutdown(std::net::Shutdown::Both)?;
-
+    // drop(client);
+    // drop(update_rx);
+    // conn.shutdown(std::net::Shutdown::Both)?;
+    client.stop()?;
     run_handle.join().expect("must join")?;
     Ok(())
 }
@@ -169,9 +164,7 @@ async fn env() -> anyhow::Result<()> {
     );
 
     let (mut update_tx, mut update_rx) = mpsc::unbounded::<Update<&'static str>>();
-    let (client_tx, mut client_rx) = mpsc::unbounded::<MaybeBatch<AsyncPendingRequest>>();
-
-    let client = AsyncClient::from(client_tx);
+    let (client, mut client_rx) = AsyncClient::new();
 
     let run_handle = tokio::spawn(async move {
         let mut conn = TcpStream::connect(&electrum_url).await?;
@@ -228,7 +221,7 @@ async fn env() -> anyhow::Result<()> {
     }
     println!("BALANCE: {}", balance);
 
-    client.close();
+    client.stop().await?;
     run_handle.await??;
 
     Ok(())
