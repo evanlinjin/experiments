@@ -124,17 +124,17 @@ impl SpkJob {
                     )
                 }
             };
-            log::debug!(stage = stage_str; "Spk Job: Made progress.");
+            tracing::debug!(stage = stage_str, "Spk Job: Made progress.");
         }
         self
     }
 
     pub fn try_finish(&mut self) -> Option<(ElectrumScriptHash, TxUpdate<ConfirmationBlockTime>)> {
         if self.stage.is_done() {
-            log::trace!("Spk Job: Not finished yet.");
+            tracing::trace!("Spk Job: Not finished yet.");
             Some((self.spk_hash, core::mem::take(&mut self.tx_update)))
         } else {
-            log::info!("Spk Job: Finished.");
+            tracing::info!("Spk Job: Finished.");
             None
         }
     }

@@ -92,22 +92,18 @@ impl<K: Ord + Clone> DerivedSpkTracker<K> {
             .collect()
     }
 
-    pub fn handle_script_status(
-        &mut self,
-        script_hash: ElectrumScriptHash,
-    ) -> Option<(K, u32, Vec<ElectrumScriptHash>)> {
-        let (k, this_index) = self.derived_spks_rev.get(&script_hash).cloned()?;
-        let next_index = this_index + 1;
+    pub fn mark_script_hash_used(&mut self, keychain: &K, index: u32) -> Vec<ElectrumScriptHash> {
+        let next_index = index + 1;
 
         let mut spk_hashes = Vec::new();
         // We iterate the derivation indices backwards so that we return script hashes that starts
         // with the latest spk, since we want to send request for later spks first.
         for index in (next_index..=next_index + 1 + self.lookahead).rev() {
-            match self._add_derived_spk(k.clone(), index) {
+            match self._add_derived_spk(keychain.clone(), index) {
                 Some(spk_hash) => spk_hashes.push(spk_hash),
                 None => break,
             }
         }
-        Some((k, this_index, spk_hashes))
+        spk_hashes
     }
 }

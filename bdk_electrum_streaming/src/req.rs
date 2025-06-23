@@ -23,7 +23,7 @@ pub enum UserRequest {
 }
 
 impl JobRequest {
-    pub fn into_raw(self, req_id: usize) -> RawRequest {
+    pub fn into_raw(self, req_id: u32) -> RawRequest {
         let (method, params) = match self {
             JobRequest::GetHeader(header) => header.to_method_and_params(),
             JobRequest::GetHeaders(headers) => headers.to_method_and_params(),
@@ -89,26 +89,26 @@ impl From<request::HeadersSubscribe> for JobRequest {
 #[derive(Debug, Clone, Default)]
 pub struct ReqCoord {
     /// Next request id.
-    next_id: usize,
+    next_id: u32,
     /// Req id -> Req.
-    awaiting_responses: HashMap<usize, JobRequest>,
+    awaiting_responses: HashMap<u32, JobRequest>,
     /// So we won't have duplicate requests.
     req_to_job: HashMap<JobRequest, BTreeSet<JobId>>,
 }
 
 impl ReqCoord {
-    pub fn new(next_id: usize) -> Self {
+    pub fn new(next_id: u32) -> Self {
         Self {
             next_id,
             ..Default::default()
         }
     }
 
-    pub fn next_id_mut(&mut self) -> &mut usize {
+    pub fn next_id_mut(&mut self) -> &mut u32 {
         &mut self.next_id
     }
 
-    pub fn pop(&mut self, req_id: usize) -> Option<(JobRequest, BTreeSet<JobId>)> {
+    pub fn pop(&mut self, req_id: u32) -> Option<(JobRequest, BTreeSet<JobId>)> {
         let any_req = self.awaiting_responses.remove(&req_id)?;
         let job_ids = self.req_to_job.remove(&any_req).unwrap_or_default();
         Some((any_req, job_ids))
