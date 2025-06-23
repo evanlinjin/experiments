@@ -17,13 +17,17 @@ use futures::{channel::mpsc, pin_mut, FutureExt, StreamExt};
 use miniscript::Descriptor;
 use tokio::net::TcpStream;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+use tracing::Level;
 
 const EXTERNAL: &str = "external";
 const INTERNAL: &str = "internal";
 const LOOKAHEAD: u32 = 6;
 
 fn init() {
-    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+    let _ = tracing_subscriber::fmt()
+        .with_test_writer()
+        .with_max_level(Level::TRACE)
+        .try_init();
 }
 
 fn apply_update(
@@ -77,8 +81,6 @@ fn blocking_env() -> anyhow::Result<()> {
     let (client, mut client_rx) = BlockingClient::new();
 
     let conn = std::net::TcpStream::connect(&electrum_url)?;
-    // This is important otherwise the read thread will block forever.
-    conn.set_read_timeout(Some(Duration::from_secs(1)))?;
     let run_conn = conn.try_clone()?;
     let run_handle = std::thread::spawn(move || {
         let res = run_blocking(
@@ -125,10 +127,9 @@ fn blocking_env() -> anyhow::Result<()> {
     println!("BALANCE: {}", balance);
 
     // TODO: Figure out a way to stop the thread without having to close the connection.
-    // drop(client);
-    // drop(update_rx);
-    // conn.shutdown(std::net::Shutdown::Both)?;
+    conn.shutdown(std::net::Shutdown::Both)?;
     client.stop()?;
+
     run_handle.join().expect("must join")?;
     Ok(())
 }
