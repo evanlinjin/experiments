@@ -198,33 +198,35 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
                     Notification::ScriptHash(script_hash_notification) => {
                         let spk_hash = script_hash_notification.script_hash();
                         let spk_status = script_hash_notification.script_status();
+
+                        let (k, i) =
+                            self.spk_tracker
+                                .index_of_spk_hash(spk_hash)
+                                .ok_or(anyhow::anyhow!(
+                                    "unexpected script hash notification: {}",
+                                    spk_hash
+                                ))?;
+
+                        let mut last_active_indices = BTreeMap::new();
+
                         if spk_status.is_some() || self.cache.spk_txids.contains_key(&spk_hash) {
-                            if let Some((_, _, new_subs)) =
-                                self.spk_tracker.handle_script_status(spk_hash)
-                            {
-                                for script_hash in new_subs {
-                                    self.coord
-                                        .queuer(req_queue, JobId::Spk(script_hash))
-                                        .enqueue(request::ScriptHashSubscribe { script_hash });
-                                }
+                            for script_hash in self.spk_tracker.mark_script_hash_used(&k, i) {
+                                self.coord
+                                    .queuer(req_queue, JobId::Spk(script_hash))
+                                    .enqueue(request::ScriptHashSubscribe { script_hash });
                             }
+                            last_active_indices.insert(k, i);
                         }
 
-                        let mut job = SpkJob::new(&self.cache, spk_hash, spk_status)
-                            // Too
-                            .advance(
-                                &mut self.coord.queuer(req_queue, JobId::Spk(spk_hash)),
-                                &self.cache,
-                                &self.cp,
-                            );
+                        let mut job = SpkJob::new(&self.cache, spk_hash, spk_status).advance(
+                            &mut self.coord.queuer(req_queue, JobId::Spk(spk_hash)),
+                            &self.cache,
+                            &self.cp,
+                        );
                         match job.try_finish() {
-                            Some((spk_hash, tx_update)) => Ok(Some(Update {
+                            Some((_, tx_update)) => Ok(Some(Update {
                                 tx_update,
-                                last_active_indices: self
-                                    .spk_tracker
-                                    .index_of_spk_hash(spk_hash)
-                                    .into_iter()
-                                    .collect(),
+                                last_active_indices,
                                 chain_update: Some(self.cp.clone()),
                             })),
                             None => {
@@ -383,16 +385,24 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
                     JobRequest::ScriptHashSubscribe(req) => {
                         let spk_hash = req.script_hash;
                         let spk_status = from_raw(&req, raw)?;
+
+                        let (k, i) =
+                            self.spk_tracker
+                                .index_of_spk_hash(spk_hash)
+                                .ok_or(anyhow::anyhow!(
+                            "response's request spk was never registered in the spk tracker: {}",
+                            spk_hash
+                        ))?;
+
+                        let mut last_active_indices = BTreeMap::new();
+
                         if spk_status.is_some() || self.cache.spk_txids.contains_key(&spk_hash) {
-                            if let Some((_, _, new_subs)) =
-                                self.spk_tracker.handle_script_status(spk_hash)
-                            {
-                                for script_hash in new_subs {
-                                    self.coord
-                                        .queuer(req_queue, JobId::Spk(script_hash))
-                                        .enqueue(request::ScriptHashSubscribe { script_hash });
-                                }
+                            for script_hash in self.spk_tracker.mark_script_hash_used(&k, i) {
+                                self.coord
+                                    .queuer(req_queue, JobId::Spk(script_hash))
+                                    .enqueue(request::ScriptHashSubscribe { script_hash });
                             }
+                            last_active_indices.insert(k, i);
                         }
 
                         let mut job = SpkJob::new(&self.cache, spk_hash, spk_status).advance(
@@ -400,14 +410,11 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
                             &self.cache,
                             &self.cp,
                         );
+
                         match job.try_finish() {
-                            Some((spk_hash, tx_update)) => Ok(Some(Update {
+                            Some((_, tx_update)) => Ok(Some(Update {
                                 tx_update,
-                                last_active_indices: self
-                                    .spk_tracker
-                                    .index_of_spk_hash(spk_hash)
-                                    .into_iter()
-                                    .collect(),
+                                last_active_indices,
                                 chain_update: Some(self.cp.clone()),
                             })),
                             None => {

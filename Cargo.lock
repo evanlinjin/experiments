@@ -410,7 +410,9 @@ dependencies = [
 
 [[package]]
 name = "electrum_streaming_client"
-version = "0.3.0"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e9440da430ac2adb702a4175623dc018c5dfecfb88e5657ea4be46c5270855c1"
 dependencies = [
  "bitcoin",
  "futures",
