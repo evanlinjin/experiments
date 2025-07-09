@@ -6,7 +6,7 @@ use electrum_streaming_client::{
     RawRequest,
 };
 use futures::{channel::mpsc, SinkExt, StreamExt};
-use futures::{pin_mut, select, AsyncWriteExt, FutureExt, TryFutureExt};
+use futures::{pin_mut, select, FutureExt, TryFutureExt};
 use miniscript::{Descriptor, DescriptorPublicKey};
 
 use crate::{AsyncClientAction, AsyncState, ReqQueue, Update};
