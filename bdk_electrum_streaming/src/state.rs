@@ -52,8 +52,10 @@ pub struct State<PReq: PendingRequest, K = &'static str> {
     chain_job: Option<ChainJob>,
     user_state: electrum_streaming_client::State<PReq>,
 
-    /// Whether we have subscribed to headers.
-    headers_subscribed: bool,
+    /// Whether we have sent initial requests.
+    ///
+    /// This includes subscribing to headers, and existing pending requests.
+    init_reqs_sent: bool,
     /// Whether at least one chain job has completed.
     first_chain_job_completed: bool,
 }
@@ -73,7 +75,7 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
             spk_jobs: BTreeMap::new(),
             chain_job: None,
             user_state: electrum_streaming_client::State::new(),
-            headers_subscribed: false,
+            init_reqs_sent: false,
             first_chain_job_completed: false,
         }
     }
@@ -83,16 +85,14 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
         &self.cache
     }
 
-    /// Resets the state.
+    /// Reset the state to be not initialized.
     ///
-    /// Call this to reset the state before reconnecting.
+    /// Call this after disconnection otherwise pending requests will not be resent and no
+    /// subscriptions to the chain or spks will be made.
     pub fn reset(&mut self) {
-        tracing::trace!("State: reset");
-        self.coord.clear();
-        self.spk_jobs.clear();
+        tracing::trace!("Reseting state");
         self.chain_job = None;
-        self.user_state.clear();
-        self.headers_subscribed = false;
+        self.init_reqs_sent = false;
         self.first_chain_job_completed = false;
     }
 
@@ -125,16 +125,24 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
             return;
         }
         self.first_chain_job_completed = true;
-
         for script_hash in self.spk_tracker.all_spk_hashes() {
+            tracing::info!(
+                script_hash = script_hash.to_string(),
+                "Queue script subscribe"
+            );
             let mut queuer = self.coord.queuer(req_queue, JobId::Spk(script_hash));
             queuer.enqueue(request::ScriptHashSubscribe { script_hash });
         }
     }
 
     pub fn init(&mut self, req_queue: &mut ReqQueue) {
-        if !self.headers_subscribed {
-            self.headers_subscribed = true;
+        if !self.init_reqs_sent {
+            self.init_reqs_sent = true;
+            // Resend pending requests.
+            req_queue.extend(self.user_state.pending_requests());
+            req_queue.extend(self.coord.pending_requests());
+
+            tracing::info!("Queue headers subscribe");
             self.coord
                 .queuer(req_queue, JobId::Chain)
                 .enqueue(request::HeadersSubscribe);
@@ -192,6 +200,7 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
                                 }
                             }
                         } else {
+                            self.first_chain_job_completed_callback(req_queue);
                             Ok(None)
                         }
                     }
@@ -243,6 +252,7 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
                     Some(req) => req,
                     None => return Ok(None),
                 };
+                tracing::debug!(?raw_response, ?orig_req, ?job_ids, "Got raw response");
 
                 let raw = match raw_response.result {
                     Ok(raw) => raw,
@@ -447,6 +457,7 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
                                 }
                             }
                         } else {
+                            self.first_chain_job_completed_callback(req_queue);
                             Ok(None)
                         }
                     }

@@ -6,7 +6,7 @@ use electrum_streaming_client::{
     RawRequest,
 };
 use futures::{channel::mpsc, SinkExt, StreamExt};
-use futures::{pin_mut, select, FutureExt, TryFutureExt};
+use futures::{pin_mut, select, AsyncWriteExt, FutureExt, TryFutureExt};
 use miniscript::{Descriptor, DescriptorPublicKey};
 
 use crate::{AsyncClientAction, AsyncState, ReqQueue, Update};
@@ -86,6 +86,24 @@ pub async fn run_async<K, R, W>(
     update_tx: &mut mpsc::UnboundedSender<Update<K>>,
     client_rx: &mut AsyncReceiver<K>,
     read: R,
+    write: W,
+) -> anyhow::Result<()>
+where
+    K: Ord + Clone,
+    R: futures::io::AsyncRead + Unpin,
+    W: futures::io::AsyncWrite + Unpin,
+{
+    let res = _run_async(state, update_tx, client_rx, read, write).await;
+    // Ensure we reset state after disconnection.
+    state.reset();
+    res
+}
+
+async fn _run_async<K, R, W>(
+    state: &mut AsyncState<K>,
+    update_tx: &mut mpsc::UnboundedSender<Update<K>>,
+    client_rx: &mut AsyncReceiver<K>,
+    read: R,
     mut write: W,
 ) -> anyhow::Result<()>
 where
@@ -93,8 +111,6 @@ where
     R: futures::io::AsyncRead + Unpin,
     W: futures::io::AsyncWrite + Unpin,
 {
-    state.reset();
-
     let (mut write_tx, mut write_rx) = mpsc::unbounded::<RawRequest>();
 
     let mut read_stream =
@@ -120,14 +136,14 @@ where
                             tracing::trace!(
                                 method = &*raw_notification.method,
                                 params = raw_notification.params.to_string(),
-                                "read_fut: got notification",
+                                "Read raw notification",
                             );
                         },
                         RawNotificationOrResponse::Response(raw_response) => {
                             tracing::trace!(
                                 id = raw_response.id,
                                 is_ok = raw_response.result.is_ok(),
-                                "read_fut: got response"
+                                "Read raw response"
                             );
                         },
                     };
@@ -148,7 +164,7 @@ where
                             state.insert_descriptor(&mut req_queue, keychain, *descriptor, next_index);
                         },
                         crate::ClientAction::Stop => {
-                            tracing::info!("Client sent stop signal.");                           
+                            tracing::info!("Client sent stop signal");                           
                             break;
                         },
                     }
@@ -156,23 +172,28 @@ where
             };
         }
 
-        tracing::debug!("read_fut: Finish");
+        tracing::debug!("Finished read future");
         write_tx.close_channel();
         anyhow::Ok(())
     }
-    .inspect_err(|e| tracing::error!(err = e.to_string(), "read_fut: finished with error"))
-    .inspect_ok(|_| tracing::debug!("read_fut finished cleanly"));
+    .inspect_err(|e| tracing::error!(err = e.to_string(), "Finished read future with error"))
+    .inspect_ok(|_| tracing::debug!("Finished read future cleanly"));
 
     let write_fut = async move {
         while let Some(req) = write_rx.next().await {
-            tracing::trace!(method = &*req.method, id = req.id, "write_fut: writing");
+            tracing::debug!(
+                method = &*req.method,
+                id = req.id,
+                params = ?req.params,
+                "Writing"
+            );
             electrum_streaming_client::io::async_write(&mut write, req).await?;
         }
-        println!("write_fut: Finish");
+        println!("Finished write future");
         anyhow::Ok(())
     }
-    .inspect_err(|e| tracing::error!(err = e.to_string(), "write_fut: finished with error"))
-    .inspect_ok(|_| tracing::debug!("write_fut: finished cleanly"));
+    .inspect_err(|e| tracing::error!(err = e.to_string(), "Finished write future with error"))
+    .inspect_ok(|_| tracing::debug!("Finished write future cleanly"));
 
     pin_mut!(read_fut);
     pin_mut!(write_fut);
@@ -181,6 +202,5 @@ where
         result = read_fut => result?,
         result = write_fut => result?,
     }
-
     Ok(())
 }

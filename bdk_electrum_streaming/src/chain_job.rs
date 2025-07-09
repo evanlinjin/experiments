@@ -23,6 +23,9 @@ pub struct ChainJob {
 impl ChainJob {
     const CHAIN_SUFFIX_LENGTH: u32 = 21;
 
+    /// Construct [`ChainJob`].
+    ///
+    /// Returns `None` if no job is required. I.e. `local_tip` is already at `height` and `header`.
     pub fn new(
         mut queuer: ReqQueuer,
         local_tip: &CheckPoint,

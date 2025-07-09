@@ -39,6 +39,10 @@ impl JobRequest {
         };
         RawRequest::new(req_id, method, params)
     }
+
+    pub fn to_raw(&self, req_id: u32) -> RawRequest {
+        self.clone().into_raw(req_id)
+    }
 }
 
 impl From<request::Header> for JobRequest {
@@ -127,6 +131,12 @@ impl ReqCoord {
             queue,
             job_id,
         }
+    }
+
+    pub fn pending_requests(&self) -> impl ExactSizeIterator<Item = RawRequest> + '_ {
+        self.awaiting_responses
+            .iter()
+            .map(|(&req_id, req)| req.to_raw(req_id))
     }
 }
 
