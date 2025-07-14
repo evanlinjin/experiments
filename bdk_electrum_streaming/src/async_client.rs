@@ -73,14 +73,14 @@ impl<K: Sync + Send + 'static> AsyncClient<K> {
     }
 }
 
-/// Run [`State`] with the provided transport, update channel and client channel.
+/// Run [`State`](crate::State) with the provided transport, update channel and client channel.
 ///
 /// # Parameters
 ///
 /// * The transport is provided with the `read` and `write` halfs separately.
 /// * `update_tx` is the sending end of the update channel. Wallet updates will be sent through here.
 /// * `client_rx` is the receiving end of the client channel. The sending end can be transformed
-///   into a [`Client`] for requests.
+///   into a [`AsyncClient`] for requests.
 pub async fn run_async<K, R, W>(
     state: &mut AsyncState<K>,
     update_tx: &mut mpsc::UnboundedSender<Update<K>>,
@@ -94,8 +94,6 @@ where
     W: futures::io::AsyncWrite + Unpin,
 {
     let res = _run_async(state, update_tx, client_rx, read, write).await;
-    // Ensure we reset state after disconnection.
-    state.reset();
     res
 }
 
@@ -116,6 +114,7 @@ where
     let mut read_stream =
         electrum_streaming_client::io::ReadStreamer::new(futures::io::BufReader::new(read));
     let mut req_queue = ReqQueue::new();
+    state.reset();
     state.init(&mut req_queue);
 
     let read_fut = async move {

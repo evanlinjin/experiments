@@ -8,12 +8,12 @@ use std::collections::{BTreeMap, BTreeSet};
 
 /// A job that tries to update the [`State`]'s internal [`CheckPoint`] to the latest tip.
 ///
-/// The job can be completed with [`try_finish()`] given that we have all the headers required to
-/// complete the job. Otherwise, headers can be introduced to the job with [`process_headers()`].
+/// The job can be completed with [`try_finish()`] given that we have all the blocks required to
+/// complete the job. Otherwise, blocks can be introduced to the job with [`process_blocks()`].
 ///
 /// [`State`]: crate::State
 /// [`try_finish()`]: ChainJob::try_finish
-/// [`process_headers()`]: ChainJob::process_headers
+/// [`process_blocks()`]: ChainJob::process_blocks
 #[derive(Debug, Clone)]
 pub struct ChainJob {
     missing_headers: BTreeSet<u32>,
@@ -97,10 +97,10 @@ impl ChainJob {
                 self.cp_update.insert(height, header);
             }
         }
-        tracing::info!(
+        tracing::trace!(
             processed = headers.len(),
             remaining = self.missing_headers.len(),
-            "Chain Job: Processed blocks.",
+            "Processed blocks for chain job",
         );
         self
     }
@@ -109,7 +109,7 @@ impl ChainJob {
         if !self.missing_headers.is_empty() {
             tracing::trace!(
                 missing = self.missing_headers.len(),
-                "Chain Job: Not finished."
+                "Chain job not finished"
             );
             return Err(self);
         }
@@ -119,7 +119,11 @@ impl ChainJob {
             cp = cp.insert(BlockId { height, hash });
         }
         *local_tip = cp.clone();
-        tracing::info!("Chain Job: Finished.");
+        tracing::info!(
+            tip_height = cp.height(),
+            tip_hash = cp.hash().to_string(),
+            "Chain job finished"
+        );
         Ok(cp)
     }
 }

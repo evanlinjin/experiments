@@ -252,7 +252,7 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
                     Some(req) => req,
                     None => return Ok(None),
                 };
-                tracing::debug!(?raw_response, ?orig_req, ?job_ids, "Got raw response");
+                tracing::trace!(?raw_response, ?orig_req, ?job_ids, "Got raw response");
 
                 let raw = match raw_response.result {
                     Ok(raw) => raw,
