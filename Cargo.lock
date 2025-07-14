@@ -105,7 +105,7 @@ dependencies = [
 
 [[package]]
 name = "bdk_electrum_streaming"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "anyhow",
  "bdk_chain",
