@@ -1,7 +1,7 @@
 use crate::req::ReqQueuer;
 use bdk_core::{
     bitcoin::{block::Header, BlockHash},
-    BlockId, CheckPoint,
+    CheckPoint,
 };
 use electrum_streaming_client::request;
 use std::collections::{BTreeMap, BTreeSet};
@@ -116,7 +116,7 @@ impl ChainJob {
 
         let mut cp = local_tip.clone();
         for (height, hash) in self.cp_update {
-            cp = cp.insert(BlockId { height, hash });
+            cp = cp.insert(height, hash);
         }
         *local_tip = cp.clone();
         tracing::info!(

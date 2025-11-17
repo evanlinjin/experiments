@@ -6,7 +6,7 @@ use std::{
 use anyhow::Context;
 use bdk_core::{
     bitcoin::{self, BlockHash, Transaction, Txid},
-    BlockId, CheckPoint, ConfirmationBlockTime,
+    CheckPoint, ConfirmationBlockTime,
 };
 use electrum_streaming_client::{
     notification::Notification, request, response, AsyncPendingRequest, BlockingPendingRequest,
@@ -309,10 +309,7 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
                         {
                             return Ok(None);
                         }
-                        self.cp = self
-                            .cp
-                            .clone()
-                            .insert(BlockId::from((req.height, resp.header.block_hash())));
+                        self.cp = self.cp.clone().insert(req.height, resp.header.block_hash());
                         Ok(self.advance_spk_jobs(req_queue, job_ids))
                     }
                     JobRequest::GetHistory(req) => {

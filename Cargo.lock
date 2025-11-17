@@ -89,7 +89,7 @@ version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0e7e7c062f2229a767fe85062b8932352a7b8c1df586f91fae1017fd3dd281ef"
 dependencies = [
- "bdk_core",
+ "bdk_core 0.6.0",
  "bitcoin",
  "miniscript",
 ]
@@ -104,12 +104,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "bdk_core"
+version = "0.6.2"
+source = "git+https://github.com/bitcoindevkit/bdk?rev=d2271ea9#d2271ea91fbfee733612147856920d5758da47db"
+dependencies = [
+ "bitcoin",
+]
+
+[[package]]
 name = "bdk_electrum_streaming"
 version = "0.5.2"
 dependencies = [
  "anyhow",
  "bdk_chain",
- "bdk_core",
+ "bdk_core 0.6.2",
  "bdk_testenv",
  "electrum_streaming_client",
  "futures",
