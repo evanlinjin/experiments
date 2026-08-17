@@ -6,7 +6,6 @@ use crate::JobId;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum JobRequest {
-    GetHeader(request::Header),
     GetHeaders(request::Headers),
     GetHistory(request::GetHistory),
     GetTx(request::GetTx),
@@ -25,7 +24,6 @@ pub enum UserRequest {
 impl JobRequest {
     pub fn into_raw(self, req_id: u32) -> RawRequest {
         let (method, params) = match self {
-            JobRequest::GetHeader(header) => header.to_method_and_params(),
             JobRequest::GetHeaders(headers) => headers.to_method_and_params(),
             JobRequest::GetHistory(get_history) => get_history.to_method_and_params(),
             JobRequest::GetTx(get_tx) => get_tx.to_method_and_params(),
@@ -42,12 +40,6 @@ impl JobRequest {
 
     pub fn to_raw(&self, req_id: u32) -> RawRequest {
         self.clone().into_raw(req_id)
-    }
-}
-
-impl From<request::Header> for JobRequest {
-    fn from(value: request::Header) -> Self {
-        Self::GetHeader(value)
     }
 }
 

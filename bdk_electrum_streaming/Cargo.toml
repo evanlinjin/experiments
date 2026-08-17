@@ -4,7 +4,7 @@ version = "0.5.3"
 description = "Experimental but sane BDK electrum client by @evanlinjin."
 license = "MIT OR Apache-2.0"
 edition = "2021"
-rust-version = "1.70"
+rust-version = "1.85"
 repository = "https://github.com/evanlinjin/experiments"
 documentation = "https://docs.rs/bdk_electrum_streaming"
 readme = "README.md"
@@ -13,15 +13,15 @@ readme = "README.md"
 futures = "0.3"
 futures-timer = "3"
 anyhow = "1"
-bdk_core = "0.6"
-miniscript = { version = "12.0.0" }
+bdk_core = { git = "https://github.com/bitcoindevkit/bdk.git", branch = "master" }
+bdk_chain = { git = "https://github.com/bitcoindevkit/bdk.git", branch = "master" }
+miniscript = { version = "13.0.0" }
 electrum_streaming_client = { version = "0.4" }
 serde_json = "1"
 tracing = "0.1"
 
 [dev-dependencies]
-bdk_testenv = "0.13.0"
-bdk_chain = "0.23.0"
+bdk_testenv = { git = "https://github.com/bitcoindevkit/bdk.git", branch = "master" }
 tokio = { version = "1", features = ["time", "net", "rt", "macros"]}
 tokio-util = { version = "0.7.15", features = ["compat"] }
 tracing-subscriber = "0.3"

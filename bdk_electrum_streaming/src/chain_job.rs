@@ -1,129 +1,130 @@
-use crate::req::ReqQueuer;
-use bdk_core::{
-    bitcoin::{block::Header, BlockHash},
-    BlockId, CheckPoint,
-};
+use crate::{req::ReqQueuer, HeaderChain};
+use anyhow::ensure;
+use bdk_core::bitcoin::block::Header;
 use electrum_streaming_client::request;
-use std::collections::{BTreeMap, BTreeSet};
 
-/// A job that tries to update the [`State`]'s internal [`CheckPoint`] to the latest tip.
+/// A job that fetches a contiguous range of headers for the [`HeaderChain`].
 ///
-/// The job can be completed with [`try_finish()`] given that we have all the blocks required to
-/// complete the job. Otherwise, blocks can be introduced to the job with [`process_blocks()`].
-///
-/// [`State`]: crate::State
-/// [`try_finish()`]: ChainJob::try_finish
-/// [`process_blocks()`]: ChainJob::process_blocks
+/// Electrum servers cap how many headers they return per request, so the job keeps asking for the
+/// remainder until the whole range has arrived. The range is applied to the chain in one go — a
+/// partial run cannot be verified against what we already have.
 #[derive(Debug, Clone)]
-pub struct ChainJob {
-    missing_headers: BTreeSet<u32>,
-    cp_update: BTreeMap<u32, BlockHash>,
+pub struct HeaderJob {
+    start: u32,
+    end: u32,
+    // ponytail: the whole range is buffered before it is verified; ~80 bytes per header, so a
+    // 100k-block initial sync peaks at ~8MB. Chunk it downwards from the tip if that ever bites.
+    headers: Vec<Header>,
 }
 
-impl ChainJob {
-    const CHAIN_SUFFIX_LENGTH: u32 = 21;
+impl HeaderJob {
+    /// How far below the tip we re-download to notice a reorg.
+    // ponytail: a reorg deeper than this errors the connection instead of walking further back.
+    const REORG_WINDOW: u32 = 20;
 
-    /// Construct [`ChainJob`].
+    fn new(queuer: &mut ReqQueuer, start: u32, end: u32) -> Self {
+        let job = Self {
+            start,
+            end,
+            headers: Vec::new(),
+        };
+        job.request(queuer);
+        job
+    }
+
+    /// A job that brings `chain` up to the tip the server just announced.
     ///
-    /// Returns `None` if no job is required. I.e. `local_tip` is already at `height` and `header`.
-    pub fn new(
-        mut queuer: ReqQueuer,
-        local_tip: &CheckPoint,
-        header: Header,
+    /// Returns `None` if no requests are needed: we are already at that tip, or the announcement
+    /// simply extends it and was applied on the spot.
+    pub fn to_tip(
+        queuer: &mut ReqQueuer,
+        chain: &mut HeaderChain,
         height: u32,
-    ) -> Option<Self> {
-        let cp = local_tip
-            .iter()
-            .find(|cp| cp.height() <= height)
-            .expect("Local checkpoint must at least have genesis");
-
-        // Try to short-circuit if possible.
-        if cp.height() == height {
-            if cp.hash() == header.block_hash() {
-                return None;
-            }
-            if let Some(prev_cp) = cp.prev() {
-                if let Some(prev_height) = height.checked_sub(1) {
-                    if prev_height == prev_cp.height() && header.prev_blockhash == prev_cp.hash() {
-                        return Some(Self {
-                            missing_headers: BTreeSet::new(),
-                            cp_update: core::iter::once((height, header.block_hash())).collect(),
-                        });
-                    }
-                }
-            }
+        header: Header,
+    ) -> anyhow::Result<Option<Self>> {
+        ensure!(
+            height >= chain.base_height(),
+            "server tip {height} is below our trusted starting height {}",
+            chain.base_height(),
+        );
+        let hash = header.block_hash();
+        if chain.tip_height() == Some(height) && chain.block_hash(height) == Some(hash) {
+            return Ok(None);
         }
-
-        let local_start_height = cp.height().saturating_sub(Self::CHAIN_SUFFIX_LENGTH - 1);
-        let local_height = cp.height();
-        let remote_start_height = height.saturating_sub(Self::CHAIN_SUFFIX_LENGTH - 1);
-        let remote_height = height;
-
-        // Overlap?
-        if remote_start_height <= local_height {
-            let start_height = Ord::min(local_start_height, remote_start_height);
-            let count = (remote_height + 1 - start_height) as usize;
-            queuer.enqueue(request::Headers {
-                start_height,
-                count,
-            });
-            Some(Self {
-                missing_headers: (start_height..=remote_height).collect(),
-                cp_update: BTreeMap::new(),
-            })
-        } else {
-            // Otherwise we have to do two separate requests.
-            queuer.enqueue(request::Headers {
-                start_height: local_start_height,
-                count: (local_height + 1 - local_start_height) as usize,
-            });
-            queuer.enqueue(request::Headers {
-                start_height: remote_start_height,
-                count: (remote_height + 1 - remote_start_height) as usize,
-            });
-            Some(Self {
-                missing_headers: (local_start_height..=local_height)
-                    .chain(remote_start_height..=remote_height)
-                    .collect(),
-                cp_update: BTreeMap::new(),
-            })
+        if chain.tip_height() == Some(height - 1)
+            && chain.block_hash(height - 1) == Some(header.prev_blockhash)
+        {
+            chain.apply(height, vec![header])?;
+            return Ok(None);
         }
+        let start = match chain.tip_height() {
+            Some(tip) => tip
+                .min(height)
+                .saturating_sub(Self::REORG_WINDOW)
+                .max(chain.base_height()),
+            None => chain.base_height(),
+        };
+        Ok(Some(Self::new(queuer, start, height)))
     }
 
-    pub fn process_blocks(mut self, headers: impl IntoIterator<Item = (u32, BlockHash)>) -> Self {
-        let headers = headers.into_iter().collect::<Vec<_>>();
-        for (height, header) in headers.iter().cloned() {
-            if self.missing_headers.remove(&height) {
-                self.cp_update.insert(height, header);
-            }
+    /// A job that extends `chain` downwards until it covers `height`.
+    ///
+    /// Fetching starts just above the highest trusted block at or below `height` — that block is
+    /// what makes the run verifiable — and stops where the chain already begins.
+    ///
+    /// Returns `None` if `height` is already covered.
+    pub fn backfill(queuer: &mut ReqQueuer, chain: &HeaderChain, height: u32) -> Option<Self> {
+        if chain.header(height).is_some() {
+            return None;
         }
+        let start = chain
+            .trusted_at_or_below(height)
+            .expect("genesis is always trusted")
+            + 1;
+        Some(Self::new(queuer, start, chain.base_height() - 1))
+    }
+
+    fn next_height(&self) -> u32 {
+        self.start + self.headers.len() as u32
+    }
+
+    fn request(&self, queuer: &mut ReqQueuer) {
+        let start_height = self.next_height();
+        queuer.enqueue(request::Headers {
+            start_height,
+            count: (self.end + 1 - start_height) as usize,
+        });
+    }
+
+    /// Absorb a batch of `headers` that starts at `start`.
+    ///
+    /// Returns the whole run once the last of it has arrived.
+    pub fn process(
+        &mut self,
+        queuer: &mut ReqQueuer,
+        start: u32,
+        headers: Vec<Header>,
+    ) -> anyhow::Result<Option<(u32, Vec<Header>)>> {
+        if start != self.next_height() {
+            // A batch for a superseded job.
+            return Ok(None);
+        }
+        ensure!(
+            !headers.is_empty(),
+            "server returned no headers from height {start}",
+        );
+        self.headers.extend(headers);
+        self.headers.truncate((self.end + 1 - self.start) as usize);
         tracing::trace!(
-            processed = headers.len(),
-            remaining = self.missing_headers.len(),
-            "Processed blocks for chain job",
+            start = self.start,
+            end = self.end,
+            have = self.headers.len(),
+            "Header job progress",
         );
-        self
-    }
-
-    pub fn try_finish(self, local_tip: &mut CheckPoint) -> Result<CheckPoint, Self> {
-        if !self.missing_headers.is_empty() {
-            tracing::trace!(
-                missing = self.missing_headers.len(),
-                "Chain job not finished"
-            );
-            return Err(self);
+        if self.next_height() <= self.end {
+            self.request(queuer);
+            return Ok(None);
         }
-
-        let mut cp = local_tip.clone();
-        for (height, hash) in self.cp_update {
-            cp = cp.insert(BlockId { height, hash });
-        }
-        *local_tip = cp.clone();
-        tracing::info!(
-            tip_height = cp.height(),
-            tip_hash = cp.hash().to_string(),
-            "Chain job finished"
-        );
-        Ok(cp)
+        Ok(Some((self.start, core::mem::take(&mut self.headers))))
     }
 }
