@@ -5,11 +5,11 @@ use std::{
 
 use bdk_core::{
     bitcoin::{OutPoint, Txid},
-    CheckPoint, ConfirmationBlockTime, TxUpdate,
+    TxUpdate,
 };
 use electrum_streaming_client::{request, response, ElectrumScriptHash, ElectrumScriptStatus};
 
-use crate::{req::ReqQueuer, Cache};
+use crate::{req::ReqQueuer, Cache, HeaderChain, ProvenAnchor};
 
 #[derive(Debug)]
 pub enum SpkJobStage {
@@ -73,7 +73,7 @@ pub struct SpkJob {
     pub stage: SpkJobStage,
 
     /// Staged tx update.
-    pub tx_update: TxUpdate<ConfirmationBlockTime>,
+    pub tx_update: TxUpdate<ProvenAnchor>,
 }
 
 impl SpkJob {
@@ -112,11 +112,21 @@ impl SpkJob {
         format!("{seconds}s {subsec}ms")
     }
 
+    /// The lowest block height this job still needs a verified header for.
+    pub fn lowest_required_height(&self) -> Option<u32> {
+        match &self.stage {
+            SpkJobStage::ProcessingTxsAndAnchors { anchors, .. } => {
+                anchors.first().map(|&(height, _)| height)
+            }
+            SpkJobStage::ProcessingHistory { .. } => None,
+        }
+    }
+
     /// Try fullfill all that is missing.
-    pub fn advance(mut self, queuer: &mut ReqQueuer, cache: &Cache, cp: &CheckPoint) -> Self {
+    pub fn advance(mut self, queuer: &mut ReqQueuer, cache: &Cache, chain: &HeaderChain) -> Self {
         let mut made_progress = true;
         while made_progress {
-            (self, made_progress) = self.try_advance_once(queuer, cache, cp.clone());
+            (self, made_progress) = self.try_advance_once(queuer, cache, chain);
             let stage_str = match &self.stage {
                 SpkJobStage::ProcessingHistory { status } => format!("ProcessingHistory({status})"),
                 SpkJobStage::ProcessingTxsAndAnchors { txs, anchors } => {
@@ -141,19 +151,19 @@ impl SpkJob {
         self
     }
 
-    pub fn try_finish(&mut self) -> Option<(ElectrumScriptHash, TxUpdate<ConfirmationBlockTime>)> {
+    pub fn try_finish(&mut self) -> Option<(ElectrumScriptHash, TxUpdate<ProvenAnchor>)> {
         if self.stage.is_done() {
-            tracing::trace!(
-                elapsed_seconds = self.elapsed_seconds(),
-                spk_hash = self.spk_hash.to_string(),
-                "Spk job not finished"
-            );
-            Some((self.spk_hash, core::mem::take(&mut self.tx_update)))
-        } else {
             tracing::info!(
                 elapsed_seconds = self.elapsed_seconds(),
                 spk_hash = self.spk_hash.to_string(),
                 "Spk job finished"
+            );
+            Some((self.spk_hash, core::mem::take(&mut self.tx_update)))
+        } else {
+            tracing::trace!(
+                elapsed_seconds = self.elapsed_seconds(),
+                spk_hash = self.spk_hash.to_string(),
+                "Spk job not finished"
             );
             None
         }
@@ -166,7 +176,7 @@ impl SpkJob {
         mut self,
         queuer: &mut ReqQueuer,
         cache: &Cache,
-        tip: CheckPoint,
+        chain: &HeaderChain,
     ) -> (Self, bool) {
         match self.stage {
             SpkJobStage::ProcessingHistory { status } => match cache.spk_histories.get(&status) {
@@ -267,30 +277,21 @@ impl SpkJob {
 
                 let anchors_start_count = anchors.len();
                 anchors.retain(|&(height, txid)| {
-                    if height > tip.height() {
+                    if Some(height) > chain.tip_height() {
                         return false;
                     }
-
-                    let blockhash = match tip.get(height) {
-                        Some(cp) if cp.height() == height => cp.hash(),
-                        _ => {
-                            queuer.enqueue(request::Header { height });
-                            return true;
-                        }
+                    // Below the chain base the header is not verified yet. `State` starts a
+                    // backfill job for it; keep waiting.
+                    let Some(blockhash) = chain.block_hash(height) else {
+                        return true;
                     };
-
-                    if !cache.headers.contains_key(&blockhash) {
-                        queuer.enqueue(request::Header { height });
-                    }
-
                     if let Some(anchor) = cache.anchors.get(&(txid, blockhash)) {
-                        self.tx_update.anchors.insert((*anchor, txid));
+                        self.tx_update.anchors.insert((anchor.clone(), txid));
                         return false;
                     };
                     if cache.failed_anchors.contains(&(txid, blockhash)) {
                         return false;
                     }
-
                     queuer.enqueue(request::GetTxMerkle { txid, height });
                     true
                 });
