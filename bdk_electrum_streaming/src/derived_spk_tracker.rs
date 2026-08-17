@@ -72,6 +72,12 @@ impl<K: Ord + Clone> DerivedSpkTracker<K> {
         }
     }
 
+    /// Track `descriptor` under `keychain` and return the newly derived script hashes.
+    ///
+    /// The derivation window is a per-keychain high-water mark: re-inserting the same descriptor
+    /// with a larger `next_index` widens the window and returns only the script hashes derived by
+    /// the widening, while an equal or smaller `next_index` is a no-op. Inserting a different
+    /// descriptor discards the keychain's tracked spks and rebuilds the window from scratch.
     pub fn insert_descriptor(
         &mut self,
         keychain: K,
@@ -82,10 +88,9 @@ impl<K: Ord + Clone> DerivedSpkTracker<K> {
             .descriptors
             .insert(keychain.clone(), descriptor.clone())
         {
-            if old_descriptor == descriptor {
-                return vec![];
+            if old_descriptor != descriptor {
+                self._clear_tracked_spks_of_keychain(keychain.clone());
             }
-            self._clear_tracked_spks_of_keychain(keychain.clone());
         }
         (0_u32..=next_index + self.lookahead + 1)
             .filter_map(|index| self._add_derived_spk(keychain.clone(), index))
@@ -105,5 +110,110 @@ impl<K: Ord + Clone> DerivedSpkTracker<K> {
             }
         }
         spk_hashes
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use std::str::FromStr;
+
+    const LOOKAHEAD: u32 = 5;
+    const XPUB: &str = "xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8";
+
+    fn descriptor(derivation_path: &str) -> Descriptor<DescriptorPublicKey> {
+        Descriptor::from_str(&format!("wpkh({}/{}/*)", XPUB, derivation_path))
+            .expect("must parse descriptor")
+    }
+
+    fn spk_hashes(
+        descriptor: &Descriptor<DescriptorPublicKey>,
+        range: impl IntoIterator<Item = u32>,
+    ) -> Vec<ElectrumScriptHash> {
+        range
+            .into_iter()
+            .map(|index| {
+                ElectrumScriptHash::new(
+                    descriptor
+                        .at_derivation_index(index)
+                        .expect("must derive")
+                        .script_pubkey(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn reinsert_with_larger_next_index_widens_window() {
+        let desc = descriptor("0");
+        let mut tracker = DerivedSpkTracker::<&str>::new(LOOKAHEAD);
+
+        let initial = tracker.insert_descriptor("keychain", desc.clone(), 0);
+        assert_eq!(initial, spk_hashes(&desc, 0..=LOOKAHEAD + 1));
+
+        let widened = tracker.insert_descriptor("keychain", desc.clone(), 10);
+        assert_eq!(
+            widened,
+            spk_hashes(&desc, LOOKAHEAD + 2..=10 + LOOKAHEAD + 1)
+        );
+
+        let top_hash = *widened.last().expect("must have widened");
+        assert_eq!(
+            tracker.index_of_spk_hash(top_hash),
+            Some(("keychain", 10 + LOOKAHEAD + 1)),
+        );
+    }
+
+    #[test]
+    fn reinsert_with_equal_or_smaller_next_index_is_noop() {
+        let desc = descriptor("0");
+        let mut tracker = DerivedSpkTracker::<&str>::new(LOOKAHEAD);
+
+        tracker.insert_descriptor("keychain", desc.clone(), 10);
+        let window_before = tracker.all_spk_hashes().collect::<Vec<_>>();
+
+        assert!(tracker
+            .insert_descriptor("keychain", desc.clone(), 10)
+            .is_empty());
+        assert!(tracker
+            .insert_descriptor("keychain", desc.clone(), 3)
+            .is_empty());
+        assert_eq!(tracker.all_spk_hashes().collect::<Vec<_>>(), window_before);
+    }
+
+    #[test]
+    fn changed_descriptor_clears_and_rebuilds() {
+        let old_desc = descriptor("0");
+        let new_desc = descriptor("1");
+        let mut tracker = DerivedSpkTracker::<&str>::new(LOOKAHEAD);
+
+        let old_hashes = tracker.insert_descriptor("keychain", old_desc, 3);
+        let new_hashes = tracker.insert_descriptor("keychain", new_desc.clone(), 0);
+
+        assert_eq!(new_hashes, spk_hashes(&new_desc, 0..=LOOKAHEAD + 1));
+        for old_hash in old_hashes {
+            assert_eq!(tracker.index_of_spk_hash(old_hash), None);
+        }
+        assert_eq!(tracker.all_spk_hashes().collect::<Vec<_>>(), new_hashes);
+    }
+
+    #[test]
+    fn widen_past_window_extended_by_activity() {
+        let desc = descriptor("0");
+        let mut tracker = DerivedSpkTracker::<&str>::new(LOOKAHEAD);
+
+        tracker.insert_descriptor("keychain", desc.clone(), 0);
+        let from_activity = tracker.mark_script_hash_used(&"keychain", LOOKAHEAD + 1);
+        let activity_top = LOOKAHEAD + 2 + 1 + LOOKAHEAD;
+        assert_eq!(
+            from_activity,
+            spk_hashes(&desc, (LOOKAHEAD + 2..=activity_top).rev()),
+        );
+
+        let widened = tracker.insert_descriptor("keychain", desc.clone(), activity_top);
+        assert_eq!(
+            widened,
+            spk_hashes(&desc, activity_top + 1..=activity_top + LOOKAHEAD + 1),
+        );
     }
 }
