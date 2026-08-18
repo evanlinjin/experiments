@@ -115,26 +115,6 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
         }
     }
 
-    /// Only start spk jobs after the first chain job completes.
-    ///
-    /// This ensures we are at the latest tip while running spk jobs since spk jobs cannot extend
-    /// the local chain. If we allow an spk job to complete without the latest tip, we would end
-    /// up missing checkpoints until the next chain update.
-    fn first_chain_job_completed_callback(&mut self, req_queue: &mut ReqQueue) {
-        if self.first_chain_job_completed {
-            return;
-        }
-        self.first_chain_job_completed = true;
-        for script_hash in self.spk_tracker.all_spk_hashes() {
-            tracing::info!(
-                script_hash = script_hash.to_string(),
-                "Queue script subscribe"
-            );
-            let mut queuer = self.coord.queuer(req_queue, JobId::Spk(script_hash));
-            queuer.enqueue(request::ScriptHashSubscribe { script_hash });
-        }
-    }
-
     pub fn init(&mut self, req_queue: &mut ReqQueue) {
         if !self.init_reqs_sent {
             self.init_reqs_sent = true;
@@ -146,6 +126,15 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
             self.coord
                 .queuer(req_queue, JobId::Chain)
                 .enqueue(request::HeadersSubscribe);
+
+            for script_hash in self.spk_tracker.all_spk_hashes() {
+                tracing::info!(
+                    script_hash = script_hash.to_string(),
+                    "Queue script subscribe"
+                );
+                let mut queuer = self.coord.queuer(req_queue, JobId::Spk(script_hash));
+                queuer.enqueue(request::ScriptHashSubscribe { script_hash });
+            }
         }
     }
 
@@ -187,20 +176,13 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
                         );
                         if let Some(job) = self.chain_job.take() {
                             match job.try_finish(&mut self.cp) {
-                                Ok(cp) => {
-                                    self.first_chain_job_completed_callback(req_queue);
-                                    Ok(Some(Update {
-                                        chain_update: Some(cp),
-                                        ..Default::default()
-                                    }))
-                                }
+                                Ok(cp) => Ok(Some(self.on_chain_job_completed(req_queue, cp))),
                                 Err(job) => {
                                     self.chain_job = Some(job);
                                     Ok(None)
                                 }
                             }
                         } else {
-                            self.first_chain_job_completed_callback(req_queue);
                             Ok(None)
                         }
                     }
@@ -233,11 +215,14 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
                             &self.cp,
                         );
                         match job.try_finish() {
-                            Some((_, tx_update)) => Ok(Some(Update {
-                                tx_update,
-                                last_active_indices,
-                                chain_update: Some(self.cp.clone()),
-                            })),
+                            Some((_, tx_update)) => {
+                                self.spk_jobs.remove(&spk_hash);
+                                Ok(Some(Update {
+                                    tx_update,
+                                    last_active_indices,
+                                    chain_update: Some(self.cp.clone()),
+                                }))
+                            }
                             None => {
                                 self.spk_jobs.insert(spk_hash, job);
                                 Ok(None)
@@ -274,13 +259,7 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
                             let new_blocks = (req.start_height..)
                                 .zip(resp.headers.into_iter().map(|h| h.block_hash()));
                             match job.process_blocks(new_blocks).try_finish(&mut self.cp) {
-                                Ok(cp) => {
-                                    self.first_chain_job_completed_callback(req_queue);
-                                    Ok(Some(Update {
-                                        chain_update: Some(cp),
-                                        ..Default::default()
-                                    }))
-                                }
+                                Ok(cp) => Ok(Some(self.on_chain_job_completed(req_queue, cp))),
                                 Err(job) => {
                                     self.chain_job = Some(job);
                                     Ok(None)
@@ -435,6 +414,7 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
                     }
                     JobRequest::HeadersSubscribe(req) => {
                         let resp = from_raw(&req, raw)?;
+
                         // Always replace prev job since a new notification means a new tip.
                         self.chain_job = ChainJob::new(
                             self.coord.queuer(req_queue, JobId::Chain),
@@ -444,26 +424,35 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
                         );
                         if let Some(job) = self.chain_job.take() {
                             match job.try_finish(&mut self.cp) {
-                                Ok(cp) => {
-                                    self.first_chain_job_completed_callback(req_queue);
-                                    Ok(Some(Update {
-                                        chain_update: Some(cp),
-                                        ..Default::default()
-                                    }))
-                                }
+                                Ok(cp) => Ok(Some(self.on_chain_job_completed(req_queue, cp))),
                                 Err(job) => {
                                     self.chain_job = Some(job);
                                     Ok(None)
                                 }
                             }
                         } else {
-                            self.first_chain_job_completed_callback(req_queue);
                             Ok(None)
                         }
                     }
                 }
             }
         }
+    }
+
+    /// Spk jobs cannot extend the local chain, so a job whose anchor is above the local tip
+    /// waits with no request in flight. Advancing the tip is what makes such an anchor
+    /// resolvable, so every completed chain job must re-advance the stashed spk jobs.
+    fn on_chain_job_completed(&mut self, req_queue: &mut ReqQueue, cp: CheckPoint) -> Update<K> {
+        let stashed_jobs = self
+            .spk_jobs
+            .keys()
+            .map(|&spk_hash| JobId::Spk(spk_hash))
+            .collect::<Vec<_>>();
+        let mut update = self
+            .advance_spk_jobs(req_queue, stashed_jobs)
+            .unwrap_or_default();
+        update.chain_update = Some(cp);
+        update
     }
 
     fn advance_spk_jobs(

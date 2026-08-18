@@ -63,6 +63,7 @@ impl TxsJobStage {
     }
 }
 
+/// The job to perform once we receive a script status notification.
 #[derive(Debug)]
 pub struct SpkJob {
     /// Time that we got this notification.
@@ -268,7 +269,9 @@ impl SpkJob {
                 let anchors_start_count = anchors.len();
                 anchors.retain(|&(height, txid)| {
                     if height > tip.height() {
-                        return false;
+                        // Nothing to request for a block we don't know exists yet. The job is
+                        // re-advanced once a chain job advances the tip.
+                        return true;
                     }
 
                     let blockhash = match tip.get(height) {
