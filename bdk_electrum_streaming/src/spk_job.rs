@@ -63,6 +63,7 @@ impl TxsJobStage {
     }
 }
 
+/// The job to perform once we receive a script status notification.
 #[derive(Debug)]
 pub struct SpkJob {
     /// Time that we got this notification.

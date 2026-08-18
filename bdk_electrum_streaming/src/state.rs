@@ -227,11 +227,14 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
                             &self.cp,
                         );
                         match job.try_finish() {
-                            Some((_, tx_update)) => Ok(Some(Update {
-                                tx_update,
-                                last_active_indices,
-                                chain_update: Some(self.cp.clone()),
-                            })),
+                            Some((_, tx_update)) => {
+                                self.spk_jobs.remove(&spk_hash);
+                                Ok(Some(Update {
+                                    tx_update,
+                                    last_active_indices,
+                                    chain_update: Some(self.cp.clone()),
+                                }))
+                            }
                             None => {
                                 self.spk_jobs.insert(spk_hash, job);
                                 Ok(None)
