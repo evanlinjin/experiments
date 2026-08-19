@@ -83,16 +83,14 @@ fn blocking_env() -> anyhow::Result<()> {
     let conn = std::net::TcpStream::connect(&electrum_url)?;
     let run_conn = conn.try_clone()?;
     let run_handle = std::thread::spawn(move || {
-        let res = run_blocking(
+        run_blocking(
             &mut state,
             &AtomicBool::new(false),
             &mut update_tx,
             &mut client_rx,
             &run_conn,
             &run_conn,
-        );
-        state.reset();
-        res
+        )
     });
 
     // First block update (genesis).

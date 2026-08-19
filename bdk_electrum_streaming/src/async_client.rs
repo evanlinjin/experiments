@@ -114,8 +114,7 @@ where
     let mut read_stream =
         electrum_streaming_client::io::ReadStreamer::new(futures::io::BufReader::new(read));
     let mut req_queue = ReqQueue::new();
-    state.reset();
-    state.init(&mut req_queue);
+    state.start(&mut req_queue);
 
     let read_fut = async move {
         loop {
