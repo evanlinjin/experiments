@@ -91,7 +91,6 @@ fn blocking_env() -> anyhow::Result<()> {
             &mut &run_conn,
             &mut &run_conn,
         );
-        state.reset();
         res
     });
 
