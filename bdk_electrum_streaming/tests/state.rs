@@ -200,3 +200,37 @@ fn anchor_above_local_tip_is_deferred_until_tip_catches_up() -> anyhow::Result<(
     );
     Ok(())
 }
+
+/// A descriptor inserted while the connection is live must be subscribed to immediately.
+/// Only [`State::init`] subscribes to the tracker's existing spks, so a subscription missed here
+/// is missed until the next reconnection.
+#[test]
+fn descriptor_inserted_mid_connection_is_subscribed() -> anyhow::Result<()> {
+    let descriptor = Descriptor::<DescriptorPublicKey>::from_str(&format!("wpkh({XPUB}/0/*)"))?;
+    let spk_hash = ElectrumScriptHash::new(&descriptor.at_derivation_index(0)?.script_pubkey());
+
+    let genesis = constants::genesis_block(Network::Regtest).header;
+    let mut state = BlockingState::new(
+        ReqCoord::default(),
+        Cache::default(),
+        DerivedSpkTracker::new(0),
+        CheckPoint::new(BlockId {
+            height: 0,
+            hash: genesis.block_hash(),
+        }),
+    );
+
+    let mut queue = ReqQueue::new();
+    state.init(&mut queue);
+    queue.clear();
+
+    state.insert_descriptor(&mut queue, "external", descriptor, 0);
+    assert!(
+        queue
+            .iter()
+            .any(|req| &*req.method == "blockchain.scripthash.subscribe"
+                && req.params[0] == json!(spk_hash.to_string())),
+        "inserting a descriptor must queue a subscribe for its first spk, got: {queue:?}"
+    );
+    Ok(())
+}
