@@ -56,8 +56,6 @@ pub struct State<PReq: PendingRequest, K = &'static str> {
     ///
     /// This includes subscribing to headers, and existing pending requests.
     init_reqs_sent: bool,
-    /// Whether at least one chain job has completed.
-    first_chain_job_completed: bool,
 }
 
 impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
@@ -76,7 +74,6 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
             chain_job: None,
             user_state: electrum_streaming_client::State::new(),
             init_reqs_sent: false,
-            first_chain_job_completed: false,
         }
     }
 
@@ -93,7 +90,6 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
         tracing::trace!("Reseting state");
         self.chain_job = None;
         self.init_reqs_sent = false;
-        self.first_chain_job_completed = false;
     }
 
     /// Insert a descriptor and queue outgoing requests (if needed).
@@ -107,11 +103,9 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
         let new_script_hashes = self
             .spk_tracker
             .insert_descriptor(keychain, descriptor, next_index);
-        if self.first_chain_job_completed {
-            for script_hash in new_script_hashes {
-                let mut queuer = self.coord.queuer(req_queue, JobId::Spk(script_hash));
-                queuer.enqueue(request::ScriptHashSubscribe { script_hash });
-            }
+        for script_hash in new_script_hashes {
+            let mut queuer = self.coord.queuer(req_queue, JobId::Spk(script_hash));
+            queuer.enqueue(request::ScriptHashSubscribe { script_hash });
         }
     }
 
