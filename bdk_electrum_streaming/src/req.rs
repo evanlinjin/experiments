@@ -118,12 +118,6 @@ impl ReqCoord {
         Some((any_req, job_ids))
     }
 
-    /// To be called when the network resets.
-    pub fn clear(&mut self) {
-        self.awaiting_responses.clear();
-        self.req_to_job.clear();
-    }
-
     pub fn queuer<'q>(&'q mut self, queue: &'q mut ReqQueue, job_id: JobId) -> ReqQueuer<'q> {
         let coord = self;
         ReqQueuer {

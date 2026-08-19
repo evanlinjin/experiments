@@ -148,7 +148,7 @@ fn anchor_above_local_tip_is_deferred_until_tip_catches_up() -> anyhow::Result<(
         tx,
     };
 
-    state.init(&mut queue);
+    state.start(&mut queue);
     let updates = drain_requests(&mut state, &mut queue, &server);
     assert!(
         updates
@@ -202,7 +202,7 @@ fn anchor_above_local_tip_is_deferred_until_tip_catches_up() -> anyhow::Result<(
 }
 
 /// A descriptor inserted while the connection is live must be subscribed to immediately.
-/// Only [`State::init`] subscribes to the tracker's existing spks, so a subscription missed here
+/// Only [`State::start`] subscribes to the tracker's existing spks, so a subscription missed here
 /// is missed until the next reconnection.
 #[test]
 fn descriptor_inserted_mid_connection_is_subscribed() -> anyhow::Result<()> {
@@ -221,7 +221,7 @@ fn descriptor_inserted_mid_connection_is_subscribed() -> anyhow::Result<()> {
     );
 
     let mut queue = ReqQueue::new();
-    state.init(&mut queue);
+    state.start(&mut queue);
     queue.clear();
 
     state.insert_descriptor(&mut queue, "external", descriptor, 0);
