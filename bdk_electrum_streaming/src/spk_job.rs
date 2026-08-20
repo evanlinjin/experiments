@@ -5,11 +5,11 @@ use std::{
 
 use bdk_core::{
     bitcoin::{OutPoint, Txid},
-    CheckPoint, ConfirmationBlockTime, TxUpdate,
+    BlockId, ConfirmationBlockTime, TxUpdate,
 };
 use electrum_streaming_client::{request, response, ElectrumScriptHash, ElectrumScriptStatus};
 
-use crate::{req::ReqQueuer, Cache};
+use crate::{req::ReqQueuer, Cache, Observed};
 
 #[derive(Debug)]
 pub enum SpkJobStage {
@@ -114,10 +114,10 @@ impl SpkJob {
     }
 
     /// Try fullfill all that is missing.
-    pub fn advance(mut self, queuer: &mut ReqQueuer, cache: &Cache, cp: &CheckPoint) -> Self {
+    pub fn advance(mut self, queuer: &mut ReqQueuer, cache: &mut Cache) -> Self {
         let mut made_progress = true;
         while made_progress {
-            (self, made_progress) = self.try_advance_once(queuer, cache, cp.clone());
+            (self, made_progress) = self.try_advance_once(queuer, cache);
             let stage_str = match &self.stage {
                 SpkJobStage::ProcessingHistory { status } => format!("ProcessingHistory({status})"),
                 SpkJobStage::ProcessingTxsAndAnchors { txs, anchors } => {
@@ -163,12 +163,7 @@ impl SpkJob {
     /// Try fullfill all that is missing.
     ///
     /// Returns self + bool representing whether we did advance.
-    fn try_advance_once(
-        mut self,
-        queuer: &mut ReqQueuer,
-        cache: &Cache,
-        tip: CheckPoint,
-    ) -> (Self, bool) {
+    fn try_advance_once(mut self, queuer: &mut ReqQueuer, cache: &mut Cache) -> (Self, bool) {
         match self.stage {
             SpkJobStage::ProcessingHistory { status } => match cache.spk_histories.get(&status) {
                 Some(history) => {
@@ -268,34 +263,14 @@ impl SpkJob {
 
                 let anchors_start_count = anchors.len();
                 anchors.retain(|&(height, txid)| {
-                    if height > tip.height() {
-                        // Nothing to request for a block we don't know exists yet. The job is
-                        // re-advanced once a chain job advances the tip.
-                        return true;
-                    }
-
-                    let blockhash = match tip.get(height) {
-                        Some(cp) if cp.height() == height => cp.hash(),
-                        _ => {
-                            queuer.enqueue(request::Header { height });
-                            return true;
+                    match resolve_anchor(queuer, cache, height, txid) {
+                        AnchorStep::Pending => true,
+                        AnchorStep::Resolved(anchor) => {
+                            self.tx_update.anchors.insert((anchor, txid));
+                            false
                         }
-                    };
-
-                    if !cache.headers.contains_key(&blockhash) {
-                        queuer.enqueue(request::Header { height });
+                        AnchorStep::Abandoned => false,
                     }
-
-                    if let Some(anchor) = cache.anchors.get(&(txid, blockhash)) {
-                        self.tx_update.anchors.insert((*anchor, txid));
-                        return false;
-                    };
-                    if cache.failed_anchors.contains(&(txid, blockhash)) {
-                        return false;
-                    }
-
-                    queuer.enqueue(request::GetTxMerkle { txid, height });
-                    true
                 });
                 if anchors.len() < anchors_start_count {
                     made_progress = true;
@@ -306,4 +281,102 @@ impl SpkJob {
             }
         }
     }
+}
+
+/// How far one pending anchor got in a single pass.
+#[derive(Debug)]
+pub enum AnchorStep {
+    /// A request went out; this anchor needs another pass.
+    Pending,
+    /// Verified against the header fetched for its height.
+    Resolved(ConfirmationBlockTime),
+    /// Nothing usable this round. Whatever next re-asks for this anchor starts it afresh;
+    /// retrying in place would spin, because the server is free to keep answering the same way.
+    Abandoned,
+}
+
+/// Take one step towards "txid is in the block at `height`".
+///
+/// The chain is not consulted at all. A proof carries no block hash, so it means nothing except
+/// against a specific header — that header is fetched first and this returns [`AnchorStep::Pending`],
+/// because asking for both at once is a race the proof can win, leaving nothing to check it
+/// against.
+pub fn resolve_anchor(
+    queuer: &mut ReqQueuer,
+    cache: &mut Cache,
+    height: u32,
+    txid: Txid,
+) -> AnchorStep {
+    let epoch = cache.eviction_epoch;
+    let header = match cache.headers_at.get(&height) {
+        Some(&Observed::Seen(header)) => header,
+        Some(Observed::Absent) => {
+            // The server had no header there. Consumed rather than kept: it is a JSON-RPC error,
+            // which says nothing durable, and a later re-ask must be free to try again.
+            cache.headers_at.remove(&height);
+            return AnchorStep::Abandoned;
+        }
+        // Enqueued even when a request is already outstanding: `ReqCoord` merges the two, and
+        // that merge is how this job registers as a second consumer of the one response. The
+        // stamp is left as it was, because it records when the request went out — refreshing it
+        // would let a reorg that landed since pass for one that has not happened yet.
+        Some(Observed::Awaiting(_)) | None => {
+            cache
+                .headers_at
+                .entry(height)
+                .or_insert(Observed::Awaiting(epoch));
+            queuer.enqueue(request::Header { height });
+            return AnchorStep::Pending;
+        }
+    };
+    let hash = header.block_hash();
+
+    if let Some(anchor) = cache.anchors.get(&(txid, hash)).copied() {
+        return AnchorStep::Resolved(anchor);
+    }
+
+    let expected = match cache.proofs.get(&(txid, height)) {
+        Some(Observed::Seen(proof)) => proof.expected_merkle_root(txid),
+        Some(Observed::Absent) => {
+            cache.proofs.remove(&(txid, height));
+            return AnchorStep::Abandoned;
+        }
+        Some(Observed::Awaiting(_)) | None => {
+            cache
+                .proofs
+                .entry((txid, height))
+                .or_insert(Observed::Awaiting(epoch));
+            queuer.enqueue(request::GetTxMerkle { txid, height });
+            return AnchorStep::Pending;
+        }
+    };
+
+    if header.merkle_root == expected {
+        // "txid is in this block" — true once, true forever, and keyed by the block's hash
+        // rather than a height that can come to mean another block.
+        let anchor = ConfirmationBlockTime {
+            block_id: BlockId { height, hash },
+            confirmation_time: header.time as u64,
+        };
+        cache.anchors.insert((txid, hash), anchor);
+        cache.anchored_at.entry(height).or_default().insert(txid);
+        // The fact supersedes the evidence: `anchors` is consulted before `proofs` and is keyed by
+        // a block hash rather than a height, so nothing reads this proof again.
+        cache.proofs.remove(&(txid, height));
+        return AnchorStep::Resolved(anchor);
+    }
+
+    // A non-match is ambiguous and so is never recorded as a verdict: it cannot tell "the tx is
+    // not in that block" from "the header we hold for this height is one the server has since
+    // left". Discard both observations so a later attempt fetches them afresh, and give up on
+    // this anchor for now rather than holding the whole job open waiting on it.
+    tracing::debug!(
+        txid = txid.to_string(),
+        height,
+        block_hash = hash.to_string(),
+        "Proof does not match the header held for this height"
+    );
+    cache.headers_at.remove(&height);
+    cache.proofs.remove(&(txid, height));
+    AnchorStep::Abandoned
 }

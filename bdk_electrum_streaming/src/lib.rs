@@ -1,4 +1,25 @@
 //! BDK Electrum goodness.
+//!
+//! # Anchors and the chain
+//!
+//! An anchor is a fact — "this txid is in this block" — established by checking a merkle proof
+//! against the header fetched for the height it claims. It is keyed by block hash, so it never
+//! becomes false; a reorg only makes it inert, because bdk scans every anchor a tx has and takes
+//! whichever one is in the chain.
+//!
+//! Anchoring necessarily puts a checkpoint at every confirmation height it establishes.
+//! [`LocalChain::is_block_in_chain`] answers *unknown* — not false — for a height the chain does
+//! not hold, and a tx whose anchor cannot be checked reads as unconfirmed, so those checkpoints
+//! are what keep confirmed transactions confirmed.
+//!
+//! **Those checkpoints are single unverified server answers, and nothing revisits them.** The
+//! chain pass fetches a fixed window near the tip, so a checkpoint filled in below that window is
+//! never checked again, and a reorg deeper than the window is never noticed at all — leaving an
+//! anchor pointing at a block that is no longer in the best chain while the tx still reads
+//! confirmed. Anchoring cannot compensate for that; how deep a reorg can be and still be seen is
+//! decided by the chain pass alone.
+//!
+//! [`LocalChain::is_block_in_chain`]: https://docs.rs/bdk_chain/latest/bdk_chain/local_chain/struct.LocalChain.html
 
 use bdk_core::spk_client::FullScanResponse;
 /// Re-export.
