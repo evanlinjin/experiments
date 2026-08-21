@@ -19,7 +19,14 @@ pub enum SpkJobStage {
     },
     ProcessingTxsAndAnchors {
         txs: Option<TxsJobStage>,
+        /// The `(height, txid)` pairs to anchor.
+        ///
+        /// Held whole for the life of the job: every pass resolves all of them afresh
+        /// against the chain as it is right then, so a reorg landing mid-job cannot leave the
+        /// job emitting anchors from two different chains.
         anchors: BTreeSet<(u32, Txid)>,
+        /// Whether every anchor resolved on the last pass.
+        anchors_resolved: bool,
     },
 }
 
@@ -28,12 +35,13 @@ impl SpkJobStage {
         Self::ProcessingTxsAndAnchors {
             txs: None,
             anchors: BTreeSet::new(),
+            anchors_resolved: true,
         }
     }
 
     /// Whether it's done.
     pub fn is_done(&self) -> bool {
-        matches!(self, SpkJobStage::ProcessingTxsAndAnchors { txs, anchors } if txs.is_none() && anchors.is_empty())
+        matches!(self, SpkJobStage::ProcessingTxsAndAnchors { txs, anchors_resolved, .. } if txs.is_none() && *anchors_resolved)
     }
 }
 
@@ -117,18 +125,23 @@ impl SpkJob {
     pub fn advance(mut self, queuer: &mut ReqQueuer, cache: &Cache, cp: &CheckPoint) -> Self {
         let mut made_progress = true;
         while made_progress {
-            (self, made_progress) = self.try_advance_once(queuer, cache, cp.clone());
+            (self, made_progress) = self.try_advance_once(queuer, cache, cp);
             let stage_str = match &self.stage {
                 SpkJobStage::ProcessingHistory { status } => format!("ProcessingHistory({status})"),
-                SpkJobStage::ProcessingTxsAndAnchors { txs, anchors } => {
+                SpkJobStage::ProcessingTxsAndAnchors {
+                    txs,
+                    anchors,
+                    anchors_resolved,
+                } => {
                     let inner_str = match txs {
                         Some(TxsJobStage::Txs(txids)) => format!("txs = {}", txids.len()),
                         Some(TxsJobStage::Prevouts(ops)) => format!("prevouts = {}", ops.len()),
                         None => "tx_done".to_string(),
                     };
                     format!(
-                        "ProcessingTxsAndAnchors({inner_str}, anchors = {})",
-                        anchors.len()
+                        "ProcessingTxsAndAnchors({inner_str}, anchors = {}, resolved = {})",
+                        anchors.len(),
+                        anchors_resolved,
                     )
                 }
             };
@@ -167,7 +180,7 @@ impl SpkJob {
         mut self,
         queuer: &mut ReqQueuer,
         cache: &Cache,
-        tip: CheckPoint,
+        tip: &CheckPoint,
     ) -> (Self, bool) {
         match self.stage {
             SpkJobStage::ProcessingHistory { status } => match cache.spk_histories.get(&status) {
@@ -196,7 +209,11 @@ impl SpkJob {
                             Some((height, tx.txid()))
                         })
                         .collect();
-                    self.stage = SpkJobStage::ProcessingTxsAndAnchors { txs, anchors };
+                    self.stage = SpkJobStage::ProcessingTxsAndAnchors {
+                        txs,
+                        anchors,
+                        anchors_resolved: false,
+                    };
                     (self, true)
                 }
                 None => {
@@ -206,8 +223,7 @@ impl SpkJob {
                 }
             },
             SpkJobStage::ProcessingTxsAndAnchors {
-                mut txs,
-                mut anchors,
+                mut txs, anchors, ..
             } => {
                 let mut made_progress = false;
                 txs = match txs {
@@ -266,44 +282,72 @@ impl SpkJob {
                     None => None,
                 };
 
-                let anchors_start_count = anchors.len();
-                anchors.retain(|&(height, txid)| {
-                    if height > tip.height() {
-                        // Nothing to request for a block we don't know exists yet. The job is
-                        // re-advanced once a chain job advances the tip.
-                        return true;
-                    }
+                // Anchors are resolved from scratch each pass, so this never leaves a
+                // partially resolved set staged in the update.
+                let resolved = advance_anchors(queuer, cache, tip, &anchors);
+                let anchors_resolved = resolved.is_some();
+                self.tx_update.anchors = resolved.unwrap_or_default();
 
-                    let blockhash = match tip.get(height) {
-                        Some(cp) if cp.height() == height => cp.hash(),
-                        _ => {
-                            queuer.enqueue(request::Header { height });
-                            return true;
-                        }
-                    };
-
-                    if !cache.headers.contains_key(&blockhash) {
-                        queuer.enqueue(request::Header { height });
-                    }
-
-                    if let Some(anchor) = cache.anchors.get(&(txid, blockhash)) {
-                        self.tx_update.anchors.insert((*anchor, txid));
-                        return false;
-                    };
-                    if cache.failed_anchors.contains(&(txid, blockhash)) {
-                        return false;
-                    }
-
-                    queuer.enqueue(request::GetTxMerkle { txid, height });
-                    true
-                });
-                if anchors.len() < anchors_start_count {
-                    made_progress = true;
-                }
-
-                self.stage = SpkJobStage::ProcessingTxsAndAnchors { txs, anchors };
+                self.stage = SpkJobStage::ProcessingTxsAndAnchors {
+                    txs,
+                    anchors,
+                    anchors_resolved,
+                };
                 (self, made_progress)
             }
         }
     }
+}
+
+/// Resolve `anchors` against `cache`, queueing whatever is missing.
+///
+/// Returns the resolved anchors, but only once every one of them resolved — nothing is held on to
+/// between calls. Anchors are therefore always resolved as a set against a single chain: a reorg
+/// landing midway through simply has the next call resolve all of them against the chain we moved
+/// to, instead of leaving a job to emit anchors from the chain it started on next to anchors from
+/// the chain it ended on.
+///
+/// This is also why anchors are tracked as `(height, txid)` pairs rather than by block hash: each
+/// call resolves them against whichever block `tip` currently has at that height.
+fn advance_anchors(
+    queuer: &mut ReqQueuer,
+    cache: &Cache,
+    tip: &CheckPoint,
+    anchors: &BTreeSet<(u32, Txid)>,
+) -> Option<BTreeSet<(ConfirmationBlockTime, Txid)>> {
+    let mut resolved = BTreeSet::new();
+    let mut all_resolved = true;
+
+    for &(height, txid) in anchors {
+        if height > tip.height() {
+            // Nothing to request for a block we don't know exists yet. The job is
+            // re-advanced once a chain job advances the tip.
+            all_resolved = false;
+            continue;
+        }
+
+        let blockhash = match tip.get(height) {
+            Some(cp) => cp.hash(),
+            None => {
+                queuer.enqueue(request::Header { height });
+                all_resolved = false;
+                continue;
+            }
+        };
+
+        if let Some(anchor) = cache.anchors.get(&(txid, blockhash)) {
+            resolved.insert((*anchor, txid));
+            continue;
+        }
+        if cache.failed_anchors.contains(&(txid, blockhash)) {
+            continue;
+        }
+        if !cache.headers.contains_key(&blockhash) {
+            queuer.enqueue(request::Header { height });
+        }
+
+        queuer.enqueue(request::GetTxMerkle { txid, height });
+        all_resolved = false;
+    }
+    all_resolved.then_some(resolved)
 }

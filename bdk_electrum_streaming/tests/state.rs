@@ -359,3 +359,87 @@ fn descriptor_inserted_mid_connection_is_subscribed() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// A reorg can land while a job is midway through fetching anchors. Anchors are staged as they
+/// resolve, so the job must give up the ones it staged against the chain it started on — otherwise
+/// it goes on to emit them in a single update alongside the ones it resolved against the chain it
+/// ended on.
+#[test]
+fn anchors_staged_before_a_reorg_are_not_emitted_after_it() -> anyhow::Result<()> {
+    let (descriptor, spk_hash, spk) = tracked_descriptor()?;
+    let (tx_a, tx_b) = (tx_paying(&spk, 50_000), tx_paying(&spk, 60_000));
+    let (txid_a, txid_b) = (tx_a.compute_txid(), tx_b.compute_txid());
+    let (genesis, header_1) = base_headers();
+    let header_2 = block_with_tx(&header_1, txid_a, 200, 0);
+    let header_3 = block_with_tx(&header_2, txid_b, 300, 0);
+    // The reorg keeps both txs at their heights — hence the unchanged script status — but in
+    // different blocks, and extends the chain by one.
+    let header_2b = block_with_tx(&header_1, txid_a, 222, 1);
+    let header_3b = block_with_tx(&header_2b, txid_b, 333, 1);
+    let header_4b = block_with_root(&header_3b, TxMerkleNode::all_zeros(), 400, 0);
+
+    let mut state = new_state(Cache::default(), descriptor, genesis);
+    let mut queue = ReqQueue::new();
+    let mut server = Server {
+        headers: vec![genesis, header_1, header_2, header_3],
+        spk_hash,
+        txs: vec![(tx_a, 2), (tx_b, 3)],
+        merkle_proof: (Vec::new(), 0),
+    };
+
+    // Sync, but hold back tx_b's proof so that the job has staged tx_a's anchor and is still
+    // waiting on tx_b's when the reorg lands.
+    state.init(&mut queue);
+    let mut in_flight = Vec::new();
+    while let Some(req) = queue.pop_front() {
+        if req.method.as_ref() == "blockchain.transaction.get_merkle"
+            && req.params[0] == json!(txid_b.to_string())
+        {
+            in_flight.push(req);
+            continue;
+        }
+        state.advance(&mut queue, response(&req, &server))?;
+    }
+    let held_req = match in_flight.as_slice() {
+        [req] => req.clone(),
+        reqs => panic!("expected one held merkle request, got {}", reqs.len()),
+    };
+    let held_resp = response(&held_req, &server);
+
+    server.headers = vec![genesis, header_1, header_2b, header_3b, header_4b];
+    state.advance(
+        &mut queue,
+        raw_msg(json!({
+            "jsonrpc": "2.0",
+            "method": "blockchain.headers.subscribe",
+            "params": [{ "hex": serialize_hex(&header_4b), "height": 4 }],
+        })),
+    )?;
+    let mut updates = drain_requests(&mut state, &mut queue, &server);
+    updates.extend(state.advance(&mut queue, held_resp)?);
+    updates.extend(drain_requests(&mut state, &mut queue, &server));
+
+    let anchors = updates
+        .iter()
+        .flat_map(|u| u.tx_update.anchors.iter().copied())
+        .collect::<Vec<_>>();
+    for evicted in [
+        (anchor_of(&header_2, 2), txid_a),
+        (anchor_of(&header_3, 3), txid_b),
+    ] {
+        assert!(
+            !anchors.contains(&evicted),
+            "an anchor to an evicted block must not be emitted after the reorg: {evicted:?}"
+        );
+    }
+    for expected in [
+        (anchor_of(&header_2b, 2), txid_a),
+        (anchor_of(&header_3b, 3), txid_b),
+    ] {
+        assert!(
+            anchors.contains(&expected),
+            "both anchors must be refetched against the new chain: {expected:?}"
+        );
+    }
+    Ok(())
+}
