@@ -18,7 +18,7 @@ use serde_json::from_value;
 
 use crate::{
     chain_job::ChainJob,
-    req::{JobRequest, ReqCoord, ReqQueue},
+    req::{JobRequest, PoppedRequest, ReqCoord, ReqQueue},
     spk_job::SpkJob,
     DerivedSpkTracker, Update,
 };
@@ -228,7 +228,11 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
                 }
             }
             RawNotificationOrResponse::Response(raw_response) => {
-                let (orig_req, job_ids) = match self.coord.pop(raw_response.id) {
+                let PoppedRequest {
+                    request: orig_req,
+                    job_ids,
+                    reorged_since_sent,
+                } = match self.coord.pop(raw_response.id) {
                     Some(req) => req,
                     None => return Ok(None),
                 };
@@ -249,6 +253,12 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
                                 ?err,
                                 "Server gave no merkle proof at this height. Reorg?",
                             );
+                            // An error about the chain we have since left says nothing about
+                            // the block we now have at this height. Discard it and let the
+                            // jobs ask again.
+                            if reorged_since_sent {
+                                return Ok(self.advance_spk_jobs(req_queue, job_ids));
+                            }
                             // An error proves nothing — it is equally a rate limit, an index
                             // still catching up or a daemon hiccup — so nothing durable is
                             // recorded, and there is nowhere to record it: a proof
@@ -302,7 +312,7 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
                         // header a job is waiting on can never arrive. Asking again would loop
                         // for as long as the connection is up, so drop the jobs instead and
                         // let the next notification rebuild them.
-                        if ours.is_some_and(|ours| ours != hash) {
+                        if ours.is_some_and(|ours| ours != hash) && !reorged_since_sent {
                             tracing::warn!(
                                 height = req.height,
                                 ours = ours.expect("just matched").to_string(),
@@ -318,10 +328,11 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
                         // will wake it. So only the insert below is conditional; the jobs are
                         // advanced either way.
                         //
-                        // The insert is skipped when it would extend the checkpoints, and
-                        // when we already have this block.
+                        // The insert is skipped when the block at this height may have been
+                        // replaced since we asked (`reorged_since_sent`), when it would extend
+                        // the checkpoints, and when we already have this block.
                         let extends = req.height > self.cp.height();
-                        if !extends && ours.is_none() {
+                        if !reorged_since_sent && !extends && ours.is_none() {
                             self.cp = self.cp.clone().insert(BlockId::from((req.height, hash)));
                         }
                         Ok(self.advance_spk_jobs(req_queue, job_ids))
@@ -361,6 +372,14 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
                     }
                     JobRequest::GetTxMerkle(req) => {
                         let resp = from_raw(&req, raw)?;
+
+                        // The proof was built against the server's chain at the time we asked,
+                        // which may not be the block we now have at this height. Checking it
+                        // against that block would read a disagreement between two chains as a
+                        // verdict on this one, so discard it and let the job ask again.
+                        if reorged_since_sent {
+                            return Ok(self.advance_spk_jobs(req_queue, job_ids));
+                        }
 
                         let cp = match self.cp.get(req.height) {
                             Some(cp) if cp.height() == req.height => cp,
@@ -535,6 +554,10 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
                 heights = ?evicted,
                 "Blocks evicted from the local chain. Refetching anchors."
             );
+            // Responses to requests which are still in flight describe the chain we just left
+            // behind.
+            self.coord.bump_chain_generation();
+
             let affected = evicted
                 .iter()
                 .flat_map(|height| self.cache.spk_hashes_by_height.get(height))

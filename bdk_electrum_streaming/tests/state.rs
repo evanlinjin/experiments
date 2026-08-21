@@ -464,6 +464,83 @@ fn anchor_is_refetched_when_tx_moves_to_another_block_of_same_height() -> anyhow
     Ok(())
 }
 
+/// A reorg can land while an anchor fetch is in flight. The merkle proof we get back was built
+/// against the chain the server had when it received the request, so it may not prove inclusion
+/// in the block we now have at that height. Verifying it against that block would record a
+/// permanent "not in this block" verdict for an anchor which is in fact valid.
+#[test]
+fn merkle_proof_predating_a_reorg_is_not_taken_as_a_failed_anchor() -> anyhow::Result<()> {
+    let (descriptor, spk_hash, spk) = tracked_descriptor()?;
+    let tx = tx_paying(&spk, 50_000);
+    let txid = tx.compute_txid();
+    let (genesis, header_1) = base_headers();
+    let header_2 = block_with_tx(&header_1, txid, 200, 0);
+    // The block which replaces height 2 contains the tx alongside another one, so the tx keeps
+    // its height — and with it its script status — but needs a different merkle proof.
+    let proof_2b = response::TxMerkle {
+        block_height: absolute::Height::from_consensus(2)?,
+        merkle: vec![sha256d::Hash::hash(b"the other tx")],
+        pos: 1,
+    };
+    let header_2b = block_with_root(&header_1, proof_2b.expected_merkle_root(txid), 222, 1);
+    let header_3b = block_with_root(&header_2b, TxMerkleNode::all_zeros(), 300, 0);
+
+    let mut state = new_state(Cache::default(), descriptor, genesis);
+    let mut queue = ReqQueue::new();
+    let mut server = Server {
+        headers: vec![genesis, header_1, header_2],
+        spk_hash,
+        txs: vec![(tx, 2)],
+        merkle_proof: (Vec::new(), 0),
+    };
+
+    // Sync, but hold back the merkle proof so the anchor fetch is still in flight.
+    state.init(&mut queue);
+    let mut in_flight = Vec::new();
+    while let Some(req) = queue.pop_front() {
+        if req.method.as_ref() == "blockchain.transaction.get_merkle" {
+            in_flight.push(req);
+            continue;
+        }
+        state.advance(&mut queue, response(&req, &server))?;
+    }
+    let stale_req = match in_flight.as_slice() {
+        [req] => req.clone(),
+        reqs => panic!(
+            "expected exactly one merkle request in flight, got {}",
+            reqs.len()
+        ),
+    };
+    let stale_resp = response(&stale_req, &server);
+
+    // The reorg lands before the server answers.
+    server.headers = vec![genesis, header_1, header_2b, header_3b];
+    server.merkle_proof = (proof_2b.merkle.clone(), proof_2b.pos);
+    state.advance(
+        &mut queue,
+        raw_msg(json!({
+            "jsonrpc": "2.0",
+            "method": "blockchain.headers.subscribe",
+            "params": [{ "hex": serialize_hex(&header_3b), "height": 3 }],
+        })),
+    )?;
+    drain_requests(&mut state, &mut queue, &server);
+
+    // The held answer proves inclusion in the block which was evicted, not in the one which
+    // replaced it.
+    state.advance(&mut queue, stale_resp)?;
+    let updates = drain_requests(&mut state, &mut queue, &server);
+
+    assert!(
+        updates.iter().any(|u| u
+            .tx_update
+            .anchors
+            .contains(&(anchor_of(&header_2b, 2), txid))),
+        "the anchor must be refetched rather than written off from a proof of the evicted block"
+    );
+    Ok(())
+}
+
 /// A reorg can land while a job is midway through fetching anchors. Anchors are staged as they
 /// resolve, so the job must give up the ones it staged against the chain it started on — otherwise
 /// it goes on to emit them in a single update alongside the ones it resolved against the chain it
@@ -599,6 +676,84 @@ fn a_tx_unconfirmed_by_a_reorg_does_not_error_the_connection() -> anyhow::Result
             .advance(&mut queue, response(&req, &server))
             .map_err(|e| anyhow::anyhow!("{e:#}"))?;
     }
+    Ok(())
+}
+
+/// The other half of `merkle_proof_predating_a_reorg_is_not_taken_as_a_failed_anchor`: a server
+/// answers a proof request from the chain it had when it *received* it, so if the tx was out of
+/// its block at that moment it answers with an error — an error about the chain we have since
+/// left. Blaming that on whichever block the reorg put at the height would write off an anchor
+/// which is in fact valid.
+#[test]
+fn merkle_error_predating_a_reorg_is_not_taken_as_a_failed_anchor() -> anyhow::Result<()> {
+    let (descriptor, spk_hash, spk) = tracked_descriptor()?;
+    let tx = tx_paying(&spk, 50_000);
+    let txid = tx.compute_txid();
+    let (genesis, header_1) = base_headers();
+    let header_2 = block_with_tx(&header_1, txid, 200, 0);
+    // Height 2 is replaced by a block which contains the tx too, so the anchor is still valid.
+    let header_2b = block_with_tx(&header_1, txid, 222, 1);
+    let header_3b = block_with_root(&header_2b, TxMerkleNode::all_zeros(), 300, 0);
+
+    let mut state = new_state(Cache::default(), descriptor, genesis);
+    let mut queue = ReqQueue::new();
+    let mut server = Server {
+        headers: vec![genesis, header_1, header_2],
+        spk_hash,
+        txs: vec![(tx, 2)],
+        merkle_proof: (Vec::new(), 0),
+    };
+
+    // Sync, but hold back the merkle request so the anchor fetch is still in flight.
+    state.init(&mut queue);
+    let mut in_flight = Vec::new();
+    while let Some(req) = queue.pop_front() {
+        if req.method.as_ref() == "blockchain.transaction.get_merkle" {
+            in_flight.push(req);
+            continue;
+        }
+        state.advance(&mut queue, response(&req, &server))?;
+    }
+    let stale_req = match in_flight.as_slice() {
+        [req] => req.clone(),
+        reqs => panic!(
+            "expected exactly one merkle request in flight, got {}",
+            reqs.len()
+        ),
+    };
+
+    // The reorg lands before the server answers.
+    server.headers = vec![genesis, header_1, header_2b, header_3b];
+    state.advance(
+        &mut queue,
+        raw_msg(json!({
+            "jsonrpc": "2.0",
+            "method": "blockchain.headers.subscribe",
+            "params": [{ "hex": serialize_hex(&header_3b), "height": 3 }],
+        })),
+    )?;
+    drain_requests(&mut state, &mut queue, &server);
+
+    // The held request was received while the tx was out of its block, so it is answered with
+    // an error — the wording is the one romanz/electrs really sends, a bare JSON string which
+    // conflates a genuine fault with the everyday reorg.
+    state.advance(
+        &mut queue,
+        raw_msg(json!({
+            "jsonrpc": "2.0",
+            "id": stale_req.id,
+            "error": "tx not found or is unconfirmed",
+        })),
+    )?;
+    let updates = drain_requests(&mut state, &mut queue, &server);
+
+    assert!(
+        updates.iter().any(|u| u
+            .tx_update
+            .anchors
+            .contains(&(anchor_of(&header_2b, 2), txid))),
+        "the anchor must be refetched rather than written off from an error about the evicted block"
+    );
     Ok(())
 }
 
@@ -839,6 +994,117 @@ fn anchor_resolves_when_the_chain_is_restored_without_its_headers() -> anyhow::R
             .anchors
             .contains(&(anchor_of(&header_2, 2), txid))),
         "the anchor must resolve even when the proof overtakes the header it is verified against"
+    );
+    Ok(())
+}
+
+/// A header fetched before a reorg describes the chain we have since left behind, and inserting
+/// it would splice a purged block into the checkpoint chain.
+///
+/// `extends`/`replaces` do not catch this on their own: they only decline a height the chain
+/// already has. The gap they leave open is a *sparse* chain — a restored one, or one whose
+/// missing heights sit below the 21-block suffix `ChainJob` rewrites — reorged deeper than that
+/// suffix, so the refetch never learns the low block changed too.
+#[test]
+fn header_fetched_before_a_reorg_is_not_spliced_into_the_chain() -> anyhow::Result<()> {
+    let (descriptor, spk_hash, spk) = tracked_descriptor()?;
+    let tx = tx_paying(&spk, 50_000);
+    let txid = tx.compute_txid();
+    let (genesis, header_1) = base_headers();
+
+    // Two chains which differ at height 2 as well as near the tip. Both contain the tx at
+    // height 2, so the anchor stays valid throughout — only the block it belongs to changes.
+    let build = |second: block::Header, tip: u32, nonce: u32| {
+        let mut chain = vec![genesis, header_1, second];
+        for height in 3..=tip {
+            let prev = *chain.last().expect("non-empty");
+            chain.push(block_with_root(
+                &prev,
+                TxMerkleNode::all_zeros(),
+                1000 + height,
+                nonce,
+            ));
+        }
+        chain
+    };
+    let chain_a = build(block_with_tx(&header_1, txid, 200, 0), 30, 0);
+    let chain_b = build(block_with_tx(&header_1, txid, 222, 1), 31, 1);
+    let (a2, b2) = (chain_a[2], chain_b[2]);
+    assert_ne!(a2.block_hash(), b2.block_hash());
+
+    // A restored chain sparse enough that height 2 is a gap — so the anchor has to fetch that
+    // header, and `replaces` will not decline it when it comes back.
+    let cp = CheckPoint::new(BlockId {
+        height: 0,
+        hash: genesis.block_hash(),
+    })
+    .insert(BlockId {
+        height: 30,
+        hash: chain_a[30].block_hash(),
+    });
+    let mut state = new_state_with_cp(Cache::default(), descriptor, cp);
+    let mut queue = ReqQueue::new();
+    let mut server = Server {
+        headers: chain_a.clone(),
+        spk_hash,
+        txs: vec![(tx, 2)],
+        merkle_proof: (Vec::new(), 0),
+    };
+
+    // Sync, but hold back the height-2 header so the fetch is still in flight.
+    state.init(&mut queue);
+    let mut in_flight = Vec::new();
+    while let Some(req) = queue.pop_front() {
+        if req.method.as_ref() == "blockchain.block.header" && req.params[0] == json!(2) {
+            in_flight.push(req);
+            continue;
+        }
+        state.advance(&mut queue, response(&req, &server))?;
+    }
+    let stale_req = match in_flight.as_slice() {
+        [req] => req.clone(),
+        reqs => panic!("expected one held header request, got {}", reqs.len()),
+    };
+    let stale_resp = response(&stale_req, &server);
+
+    // The reorg lands. It runs deeper than `ChainJob`'s suffix, so the refetch rewrites the
+    // top 21 blocks and never learns that height 2 changed too.
+    server.headers = chain_b.clone();
+    state.advance(
+        &mut queue,
+        raw_msg(json!({
+            "jsonrpc": "2.0",
+            "method": "blockchain.headers.subscribe",
+            "params": [{ "hex": serialize_hex(&chain_b[31]), "height": 31 }],
+        })),
+    )?;
+    drain_requests(&mut state, &mut queue, &server);
+
+    // The held answer describes the chain we have left behind.
+    let mut updates = Vec::from_iter(state.advance(&mut queue, stale_resp)?);
+    updates.extend(drain_requests(&mut state, &mut queue, &server));
+
+    let tip = updates
+        .iter()
+        .rev()
+        .find_map(|u| u.chain_update.clone())
+        .expect("must get a chain update");
+    let at_2 = tip.iter().find(|cp| cp.height() == 2);
+    assert_ne!(
+        at_2.as_ref().map(|cp| cp.hash()),
+        Some(a2.block_hash()),
+        "a header from the chain we left must not be spliced into the checkpoint chain"
+    );
+    assert_eq!(
+        at_2.map(|cp| cp.hash()),
+        Some(b2.block_hash()),
+        "the height must be refetched against the chain we are actually on"
+    );
+    assert!(
+        updates
+            .iter()
+            .any(|u| u.tx_update.anchors.contains(&(anchor_of(&b2, 2), txid))),
+        "and the anchor must resolve against that block"
     );
     Ok(())
 }
