@@ -339,9 +339,6 @@ fn advance_anchors(
             resolved.insert((*anchor, txid));
             continue;
         }
-        if cache.failed_anchors.contains(&(txid, blockhash)) {
-            continue;
-        }
         // A proof is verified against this block's merkle root, so asking for the proof before
         // the header is cached would make the outcome depend on the server answering in request
         // order — which the protocol's request ids exist precisely because it does not promise.

@@ -548,6 +548,136 @@ fn anchors_staged_before_a_reorg_are_not_emitted_after_it() -> anyhow::Result<()
     Ok(())
 }
 
+/// The everyday reorg: one which takes a transaction out of its block and back to the mempool.
+/// The refetch is speculative — we ask for a proof of inclusion at a height the transaction was
+/// *last seen* at — so the server answering "not in that block" is expected, and must not take
+/// the connection down with it.
+#[test]
+fn a_tx_unconfirmed_by_a_reorg_does_not_error_the_connection() -> anyhow::Result<()> {
+    let (descriptor, spk_hash, spk) = tracked_descriptor()?;
+    let tx = tx_paying(&spk, 50_000);
+    let txid = tx.compute_txid();
+    let (genesis, header_1) = base_headers();
+    let header_2 = block_with_tx(&header_1, txid, 200, 0);
+    // Height 2 is replaced by a block without the tx, and the chain grows by one.
+    let header_2b = block_with_root(&header_1, TxMerkleNode::all_zeros(), 222, 1);
+    let header_3b = block_with_root(&header_2b, TxMerkleNode::all_zeros(), 333, 0);
+
+    let mut state = new_state(Cache::default(), descriptor, genesis);
+    let mut queue = ReqQueue::new();
+    let mut server = Server {
+        headers: vec![genesis, header_1, header_2],
+        spk_hash,
+        txs: vec![(tx, 2)],
+        merkle_proof: (Vec::new(), 0),
+    };
+
+    state.init(&mut queue);
+    let updates = drain_requests(&mut state, &mut queue, &server);
+    assert!(
+        updates.iter().any(|u| u
+            .tx_update
+            .anchors
+            .contains(&(anchor_of(&header_2, 2), txid))),
+        "tx must first be anchored"
+    );
+
+    // The reorg leaves the tx in the mempool, so the server no longer has it in any block.
+    server.headers = vec![genesis, header_1, header_2b, header_3b];
+    server.txs = Vec::new();
+    state.advance(
+        &mut queue,
+        raw_msg(json!({
+            "jsonrpc": "2.0",
+            "method": "blockchain.headers.subscribe",
+            "params": [{ "hex": serialize_hex(&header_3b), "height": 3 }],
+        })),
+    )?;
+
+    while let Some(req) = queue.pop_front() {
+        state
+            .advance(&mut queue, response(&req, &server))
+            .map_err(|e| anyhow::anyhow!("{e:#}"))?;
+    }
+    Ok(())
+}
+
+/// A server error is not a disproof — it is equally a rate limit, an index still catching up or
+/// a daemon hiccup — so it must not be recorded as one. The transaction stays in the record of
+/// what was seen at that height, so the next reorg of that height asks again; and the job it
+/// blocked must still finish rather than re-ask in a loop.
+#[test]
+fn a_merkle_error_is_not_recorded_as_a_failed_anchor() -> anyhow::Result<()> {
+    let (descriptor, spk_hash, spk) = tracked_descriptor()?;
+    let tx = tx_paying(&spk, 50_000);
+    let txid = tx.compute_txid();
+    let (genesis, header_1) = base_headers();
+    let header_2 = block_with_tx(&header_1, txid, 200, 0);
+    // Height 2 is replaced by a block containing the tx, and the chain grows by one.
+    let header_2b = block_with_tx(&header_1, txid, 222, 1);
+    let header_3b = block_with_root(&header_2b, TxMerkleNode::all_zeros(), 300, 0);
+
+    let mut state = new_state(Cache::default(), descriptor, genesis);
+    let mut queue = ReqQueue::new();
+    let mut server = Server {
+        headers: vec![genesis, header_1, header_2],
+        spk_hash,
+        txs: vec![(tx.clone(), 2)],
+        merkle_proof: (Vec::new(), 0),
+    };
+
+    // Sync, but fail every merkle request the way a busy server would.
+    state.init(&mut queue);
+    let mut merkle_requests = 0;
+    while let Some(req) = queue.pop_front() {
+        let resp = if req.method.as_ref() == "blockchain.transaction.get_merkle" {
+            merkle_requests += 1;
+            assert!(
+                merkle_requests < 10,
+                "a server error must not put the job in a re-ask loop"
+            );
+            raw_msg(json!({
+                "jsonrpc": "2.0",
+                "id": req.id,
+                "error": { "code": 1, "message": "server busy" },
+            }))
+        } else {
+            response(&req, &server)
+        };
+        state.advance(&mut queue, resp)?;
+    }
+    assert_eq!(
+        merkle_requests, 1,
+        "the job must give up on the pair rather than re-ask"
+    );
+    assert!(
+        state.cache().anchors.is_empty(),
+        "an error proves nothing, so no anchor may be recorded from it"
+    );
+
+    // The reorg replaces the block, so the anchor is asked for again — which it could not be
+    // had the error dropped this script from `spk_hashes_by_height`.
+    server.headers = vec![genesis, header_1, header_2b, header_3b];
+    state.advance(
+        &mut queue,
+        raw_msg(json!({
+            "jsonrpc": "2.0",
+            "method": "blockchain.headers.subscribe",
+            "params": [{ "hex": serialize_hex(&header_3b), "height": 3 }],
+        })),
+    )?;
+    let updates = drain_requests(&mut state, &mut queue, &server);
+
+    assert!(
+        updates.iter().any(|u| u
+            .tx_update
+            .anchors
+            .contains(&(anchor_of(&header_2b, 2), txid))),
+        "the tx must still be asked about at this height after a server error"
+    );
+    Ok(())
+}
+
 /// Issue #12's literal case: a reorg to a block of the *same* height, with no growth at all.
 /// `ChainJob` applies this by short-circuit straight from the header notification, so it is the
 /// one reorg shape which never fetches anything — and every other reorg test here also grows the
@@ -946,6 +1076,100 @@ fn a_script_whose_history_goes_away_is_not_replayed() -> anyhow::Result<()> {
             .iter()
             .any(|m| m == "blockchain.transaction.get_merkle"),
         "no proof may be asked for a transaction the script no longer has, got: {asked:?}"
+    );
+    Ok(())
+}
+
+/// A server proves inclusion in whichever block *it* has at a height, so a proof whose root does
+/// not match ours says the two chains disagree there — not that the transaction is absent from
+/// our block. Remembering that against our block would be a verdict the proof cannot support, and
+/// a chain that came back to that block would consult it and skip the anchor for good.
+#[test]
+fn a_proof_for_another_block_is_not_a_verdict_on_ours() -> anyhow::Result<()> {
+    let (descriptor, spk_hash, spk) = tracked_descriptor()?;
+    let tx = tx_paying(&spk, 50_000);
+    let txid = tx.compute_txid();
+    let (genesis, header_1) = base_headers();
+    let ours = block_with_tx(&header_1, txid, 200, 0);
+    // Their block holds the tx alongside another, so it needs a different proof — the root the
+    // server's proof expands to cannot match the root of our block.
+    let proof_theirs = response::TxMerkle {
+        block_height: absolute::Height::from_consensus(2)?,
+        merkle: vec![sha256d::Hash::hash(b"the other tx")],
+        pos: 1,
+    };
+    let theirs = block_with_root(&header_1, proof_theirs.expected_merkle_root(txid), 222, 1);
+    assert_ne!(ours.merkle_root, theirs.merkle_root);
+
+    let mut chain = vec![genesis, header_1, theirs];
+    for height in 3..=30u32 {
+        let prev = *chain.last().expect("non-empty");
+        chain.push(block_with_root(
+            &prev,
+            TxMerkleNode::all_zeros(),
+            1000 + height,
+            0,
+        ));
+    }
+
+    // A persisted chain holding our block at height 2, and its header already cached — otherwise
+    // `GetHeader` catches the disagreement before any proof is asked for. The tip agrees, so no
+    // chain job runs and nothing rewrites height 2: the disagreement is below the window.
+    let mut cache = Cache::default();
+    cache.headers.insert(ours.block_hash(), ours);
+    let cp = CheckPoint::new(BlockId {
+        height: 0,
+        hash: genesis.block_hash(),
+    })
+    .insert(BlockId {
+        height: 2,
+        hash: ours.block_hash(),
+    })
+    .insert(BlockId {
+        height: 30,
+        hash: chain[30].block_hash(),
+    });
+    let mut state = new_state_with_cp(cache, descriptor, cp);
+    let mut queue = ReqQueue::new();
+    let mut server = Server {
+        headers: chain,
+        spk_hash,
+        txs: vec![(tx, 2)],
+        merkle_proof: (proof_theirs.merkle.clone(), proof_theirs.pos),
+    };
+
+    state.init(&mut queue);
+    let mut served = 0;
+    while let Some(req) = queue.pop_front() {
+        served += 1;
+        assert!(served < 200, "a mismatch must not become a request loop");
+        state.advance(&mut queue, response(&req, &server))?;
+    }
+    assert!(
+        state.cache().anchors.is_empty(),
+        "a proof for a block we do not have must not anchor anything"
+    );
+
+    // The server comes back to our block at that height. Nothing durable was written against it,
+    // so the job a notification rebuilds must be able to anchor there.
+    server.headers[2] = ours;
+    server.merkle_proof = (Vec::new(), 0);
+    let status = ElectrumScriptStatus::from_history(&server.history(&json!(spk_hash.to_string())))
+        .expect("history must be non-empty");
+    state.advance(
+        &mut queue,
+        raw_msg(json!({
+            "jsonrpc": "2.0",
+            "method": "blockchain.scripthash.subscribe",
+            "params": [spk_hash.to_string(), status.to_string()],
+        })),
+    )?;
+    let updates = drain_requests(&mut state, &mut queue, &server);
+    assert!(
+        updates
+            .iter()
+            .any(|u| u.tx_update.anchors.contains(&(anchor_of(&ours, 2), txid))),
+        "the anchor must still be reachable once the chains agree again"
     );
     Ok(())
 }

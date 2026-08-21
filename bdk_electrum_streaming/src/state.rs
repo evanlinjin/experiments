@@ -1,5 +1,5 @@
 use std::{
-    collections::{btree_map, BTreeMap, BTreeSet, HashMap, HashSet},
+    collections::{btree_map, BTreeMap, BTreeSet, HashMap},
     sync::Arc,
 };
 
@@ -237,6 +237,32 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
                 let raw = match raw_response.result {
                     Ok(raw) => raw,
                     Err(err) => {
+                        // An anchor fetch is speculative: it asks for a proof of inclusion at
+                        // the height a transaction was last reported at, and a reorg may have
+                        // taken the transaction out of that block, or out of the chain
+                        // altogether. A server answers that with an error, which is an answer,
+                        // not a reason to bring the connection down.
+                        if let JobRequest::GetTxMerkle(req) = &orig_req {
+                            tracing::warn!(
+                                txid = req.txid.to_string(),
+                                block_height = req.height,
+                                ?err,
+                                "Server gave no merkle proof at this height. Reorg?",
+                            );
+                            // An error proves nothing — it is equally a rate limit, an index
+                            // still catching up or a daemon hiccup — so nothing durable is
+                            // recorded, and there is nowhere to record it: a proof
+                            // request that comes back with nothing leaves no trace.
+                            //
+                            // The job is left stashed rather than cancelled. Returning without
+                            // advancing it is what stops the re-ask loop; keeping it is what
+                            // makes the recovery automatic, since the next chain update advances
+                            // it again and the answer may be different once our chain has caught
+                            // up with the server's. Cancelling would need a notification to
+                            // revive it, and the same-height reorg this all exists for is
+                            // precisely the case that sends none.
+                            return Ok(None);
+                        }
                         // Cancel jobs that resulted in error.
                         self.cancel_jobs(job_ids);
                         return Err(anyhow::anyhow!(err).context("Server responded with error"));
@@ -349,7 +375,7 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
                             }
                         };
                         let header = match self.cache.headers.get(&cp.hash()) {
-                            Some(header) => header,
+                            Some(header) => *header,
                             None => {
                                 tracing::warn!(
                                     ?req,
@@ -382,11 +408,16 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
                                 block_hash = header.block_hash().to_string(),
                                 header_root = header.merkle_root.to_string(),
                                 expected_root = exp_root.to_string(),
-                                "Failed to verify anchor."
+                                "Proof does not match the block we have at this height",
                             );
-                            self.cache
-                                .failed_anchors
-                                .insert((req.txid, header.block_hash()));
+                            // The server proves inclusion in whichever block *it* has at this
+                            // height, so a mismatch says our chain and the server's disagree
+                            // there — not that the transaction is absent from our block. That is
+                            // the conclusion `GetHeader` draws from the same kind of evidence,
+                            // so it gets the same treatment: drop the jobs and let the next
+                            // notification rebuild them.
+                            self.cancel_jobs(job_ids);
+                            return Ok(None);
                         }
                         Ok(self.advance_spk_jobs(req_queue, job_ids))
                     }
@@ -623,7 +654,6 @@ pub struct Cache {
     pub spk_txids: HashMap<ElectrumScriptHash, BTreeSet<Txid>>,
     pub txs: HashMap<Txid, Arc<Transaction>>,
     pub anchors: HashMap<(Txid, BlockHash), ConfirmationBlockTime>,
-    pub failed_anchors: HashSet<(Txid, BlockHash)>,
     pub headers: HashMap<BlockHash, bitcoin::block::Header>,
     /// The last status the server reported for each script hash.
     ///

@@ -563,3 +563,38 @@ async fn reorg_to_same_height_block_refetches_anchor_live() -> anyhow::Result<()
 
     w.stop().await
 }
+
+/// The everyday reorg: one which takes a tx out of its block and back to the mempool. The anchor
+/// refetch then asks for a proof the server cannot give, and that error must not take the
+/// connection down with it.
+#[tokio::test]
+async fn reorg_unconfirming_a_tx_keeps_the_connection_alive() -> anyhow::Result<()> {
+    let mut w = LiveWallet::new().await?;
+    let (txid, _) = w.confirm_tracked_tx().await?;
+    let confirm_height = w.env.rpc_client().get_block_count()? as u32;
+
+    // Invalidate the confirming block and replace it with empty ones, so the tx cannot be
+    // re-mined and the server has no proof to give at that height.
+    w.env.invalidate_blocks(1)?;
+    w.env.mine_empty_block()?;
+    w.env.mine_empty_block()?;
+    let tip_height = w.env.rpc_client().get_block_count()? as u32;
+    assert_eq!(tip_height, confirm_height + 1);
+    assert!(
+        w.env.rpc_client().get_raw_mempool()?.contains(&txid),
+        "the tx must be back in the mempool, so the server really has no proof for it"
+    );
+
+    // The connection has to keep serving: `wait_until` fails if the client stops.
+    w.wait_until("the chain tip after the reorg", |chain, _| {
+        chain.tip().height() >= tip_height
+    })
+    .await?;
+
+    assert!(
+        canonical_anchor(&w.chain, &w.graph, txid).is_none(),
+        "the tx must no longer be canonically confirmed"
+    );
+
+    w.stop().await
+}
