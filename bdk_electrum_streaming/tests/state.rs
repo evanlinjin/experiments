@@ -360,6 +360,75 @@ fn descriptor_inserted_mid_connection_is_subscribed() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A reorg can move a transaction into a different block at the *same* height. An Electrum
+/// script status is a hash over txid-height pairs, so it does not change and the server has no
+/// reason to send a script hash notification. The anchor we already delivered now points at a
+/// block that is no longer in the chain, so it must be refetched off the tip update alone.
+#[test]
+fn anchor_is_refetched_when_tx_moves_to_another_block_of_same_height() -> anyhow::Result<()> {
+    let (descriptor, spk_hash, spk) = tracked_descriptor()?;
+    let tx = tx_paying(&spk, 50_000);
+    let txid = tx.compute_txid();
+    let (genesis, header_1) = base_headers();
+    let header_2 = block_with_tx(&header_1, txid, 200, 0);
+    // The block that replaces height 2 contains the tx too, hence the identical script status.
+    let header_2b = block_with_tx(&header_1, txid, 222, 1);
+    let header_3b = block::Header {
+        prev_blockhash: header_2b.block_hash(),
+        time: 300,
+        ..header_1
+    };
+    assert_ne!(header_2.block_hash(), header_2b.block_hash());
+
+    let mut state = new_state(Cache::default(), descriptor, genesis);
+    let mut queue = ReqQueue::new();
+    let mut server = Server {
+        headers: vec![genesis, header_1, header_2],
+        spk_hash,
+        txs: vec![(tx, 2)],
+        merkle_proof: (Vec::new(), 0),
+    };
+
+    state.init(&mut queue);
+    let updates = drain_requests(&mut state, &mut queue, &server);
+    assert!(
+        updates.iter().any(|u| u
+            .tx_update
+            .anchors
+            .contains(&(anchor_of(&header_2, 2), txid))),
+        "tx must first be anchored to the original block"
+    );
+
+    // Reorg. Only a header notification is sent: the script status is unchanged, so a server
+    // has no reason to notify the script hash.
+    server.headers = vec![genesis, header_1, header_2b, header_3b];
+    state.advance(
+        &mut queue,
+        raw_msg(json!({
+            "jsonrpc": "2.0",
+            "method": "blockchain.headers.subscribe",
+            "params": [{ "hex": serialize_hex(&header_3b), "height": 3 }],
+        })),
+    )?;
+    let updates = drain_requests(&mut state, &mut queue, &server);
+
+    assert!(
+        updates.iter().any(|u| u
+            .chain_update
+            .as_ref()
+            .is_some_and(|cp| cp.block_id() == anchor_of(&header_3b, 3).block_id)),
+        "chain update must follow the reorg"
+    );
+    assert!(
+        updates.iter().any(|u| u
+            .tx_update
+            .anchors
+            .contains(&(anchor_of(&header_2b, 2), txid))),
+        "anchor must be refetched for the block that replaced the evicted one"
+    );
+    Ok(())
+}
+
 /// A reorg can land while a job is midway through fetching anchors. Anchors are staged as they
 /// resolve, so the job must give up the ones it staged against the chain it started on — otherwise
 /// it goes on to emit them in a single update alongside the ones it resolved against the chain it
@@ -441,5 +510,233 @@ fn anchors_staged_before_a_reorg_are_not_emitted_after_it() -> anyhow::Result<()
             "both anchors must be refetched against the new chain: {expected:?}"
         );
     }
+    Ok(())
+}
+
+/// Issue #12's literal case: a reorg to a block of the *same* height, with no growth at all.
+/// `ChainJob` applies this by short-circuit straight from the header notification, so it is the
+/// one reorg shape which never fetches anything — and every other reorg test here also grows the
+/// chain, which takes a different path.
+#[test]
+fn anchor_is_refetched_after_a_same_height_reorg() -> anyhow::Result<()> {
+    let (descriptor, spk_hash, spk) = tracked_descriptor()?;
+    let tx = tx_paying(&spk, 50_000);
+    let txid = tx.compute_txid();
+    let (genesis, header_1) = base_headers();
+    let header_2 = block_with_tx(&header_1, txid, 200, 0);
+    let header_2b = block_with_tx(&header_1, txid, 222, 1);
+    assert_ne!(header_2.block_hash(), header_2b.block_hash());
+
+    let mut state = new_state(Cache::default(), descriptor, genesis);
+    let mut queue = ReqQueue::new();
+    let mut server = Server {
+        headers: vec![genesis, header_1, header_2],
+        spk_hash,
+        txs: vec![(tx, 2)],
+        merkle_proof: (Vec::new(), 0),
+    };
+
+    state.init(&mut queue);
+    let updates = drain_requests(&mut state, &mut queue, &server);
+    assert!(
+        updates.iter().any(|u| u
+            .tx_update
+            .anchors
+            .contains(&(anchor_of(&header_2, 2), txid))),
+        "tx must first be anchored to the original block"
+    );
+
+    // The tip does not move: same height, different block, unchanged script status.
+    server.headers = vec![genesis, header_1, header_2b];
+    state.advance(
+        &mut queue,
+        raw_msg(json!({
+            "jsonrpc": "2.0",
+            "method": "blockchain.headers.subscribe",
+            "params": [{ "hex": serialize_hex(&header_2b), "height": 2 }],
+        })),
+    )?;
+    let updates = drain_requests(&mut state, &mut queue, &server);
+
+    assert!(
+        updates.iter().any(|u| u
+            .tx_update
+            .anchors
+            .contains(&(anchor_of(&header_2b, 2), txid))),
+        "anchor must be refetched for the block that replaced the evicted one"
+    );
+    Ok(())
+}
+
+/// The refetch is a script hash notification we raise ourselves, so it must not displace one the
+/// server actually sent. A real notification carries a status at least as new as anything we
+/// could replay from cache; replacing its job would resolve the script against a stale history
+/// and drop whatever the new status was reporting.
+#[test]
+fn a_replayed_job_does_not_displace_one_the_server_started() -> anyhow::Result<()> {
+    let (descriptor, spk_hash, spk) = tracked_descriptor()?;
+    let (tx_a, tx_b) = (tx_paying(&spk, 50_000), tx_paying(&spk, 60_000));
+    let (txid_a, txid_b) = (tx_a.compute_txid(), tx_b.compute_txid());
+    let (genesis, _) = base_headers();
+    let header_1 = block_with_tx(&genesis, txid_b, 100, 0);
+    let header_2 = block_with_tx(&header_1, txid_a, 200, 0);
+    // The reorg replaces height 2 with another block holding tx_a, and extends the chain.
+    let header_2b = block_with_tx(&header_1, txid_a, 222, 1);
+    let header_3b = block_with_root(&header_2b, TxMerkleNode::all_zeros(), 300, 0);
+
+    let mut state = new_state(Cache::default(), descriptor, genesis);
+    let mut queue = ReqQueue::new();
+    let mut server = Server {
+        headers: vec![genesis, header_1, header_2],
+        spk_hash,
+        // The server only reports tx_a to begin with.
+        txs: vec![(tx_a, 2)],
+        merkle_proof: (Vec::new(), 0),
+    };
+
+    state.init(&mut queue);
+    let updates = drain_requests(&mut state, &mut queue, &server);
+    assert!(
+        updates.iter().any(|u| u
+            .tx_update
+            .anchors
+            .contains(&(anchor_of(&header_2, 2), txid_a))),
+        "tx_a must first be anchored to the original block"
+    );
+
+    // The server now reports tx_b as well, and notifies the new status. The job that starts is
+    // the only thing which knows about tx_b.
+    server.txs.insert(0, (tx_b, 1));
+    let new_status =
+        ElectrumScriptStatus::from_history(&server.history(&json!(spk_hash.to_string())))
+            .expect("history must be non-empty");
+    state.advance(
+        &mut queue,
+        raw_msg(json!({
+            "jsonrpc": "2.0",
+            "method": "blockchain.scripthash.subscribe",
+            "params": [spk_hash.to_string(), new_status.to_string()],
+        })),
+    )?;
+
+    // Hold back that job's history, so it is still in flight when the reorg lands.
+    let mut in_flight = Vec::new();
+    while let Some(req) = queue.pop_front() {
+        if req.method.as_ref() == "blockchain.scripthash.get_history" {
+            in_flight.push(req);
+            continue;
+        }
+        state.advance(&mut queue, response(&req, &server))?;
+    }
+    let held_req = match in_flight.as_slice() {
+        [req] => req.clone(),
+        reqs => panic!("expected one held history request, got {}", reqs.len()),
+    };
+
+    // The reorg evicts height 2, where this script is recorded — so the refetch wants to replay
+    // its job, and must decline because the server's own job is already there.
+    server.headers = vec![genesis, header_1, header_2b, header_3b];
+    state.advance(
+        &mut queue,
+        raw_msg(json!({
+            "jsonrpc": "2.0",
+            "method": "blockchain.headers.subscribe",
+            "params": [{ "hex": serialize_hex(&header_3b), "height": 3 }],
+        })),
+    )?;
+    let mut updates = drain_requests(&mut state, &mut queue, &server);
+    updates.extend(state.advance(&mut queue, response(&held_req, &server))?);
+    updates.extend(drain_requests(&mut state, &mut queue, &server));
+
+    assert!(
+        updates
+            .iter()
+            .any(|u| u.tx_update.txs.iter().any(|tx| tx.compute_txid() == txid_b)),
+        "the server's own job must survive and deliver what its status was reporting"
+    );
+    assert!(
+        updates.iter().any(|u| u
+            .tx_update
+            .anchors
+            .contains(&(anchor_of(&header_2b, 2), txid_a))),
+        "and must still refetch the anchor the reorg invalidated"
+    );
+    Ok(())
+}
+
+/// A replay is built from the last status and the heights it was seen at, so both have to go
+/// when the server stops reporting a history for the script — an RBF'd transaction, say. Left
+/// behind, a later eviction at that height would rebuild the job from a history the script no
+/// longer has and go asking for proofs of a transaction that is gone.
+#[test]
+fn a_script_whose_history_goes_away_is_not_replayed() -> anyhow::Result<()> {
+    let (descriptor, spk_hash, spk) = tracked_descriptor()?;
+    let tx = tx_paying(&spk, 50_000);
+    let txid = tx.compute_txid();
+    let (genesis, header_1) = base_headers();
+    let header_2 = block_with_tx(&header_1, txid, 200, 0);
+    let header_2b = block_with_root(&header_1, TxMerkleNode::all_zeros(), 222, 1);
+    let header_3b = block_with_root(&header_2b, TxMerkleNode::all_zeros(), 300, 0);
+
+    let mut state = new_state(Cache::default(), descriptor, genesis);
+    let mut queue = ReqQueue::new();
+    let mut server = Server {
+        headers: vec![genesis, header_1, header_2],
+        spk_hash,
+        txs: vec![(tx, 2)],
+        merkle_proof: (Vec::new(), 0),
+    };
+
+    state.init(&mut queue);
+    let updates = drain_requests(&mut state, &mut queue, &server);
+    assert!(
+        updates.iter().any(|u| u
+            .tx_update
+            .anchors
+            .contains(&(anchor_of(&header_2, 2), txid))),
+        "tx must first be anchored"
+    );
+    assert!(
+        state.cache().spk_statuses.contains_key(&spk_hash),
+        "the status must be recorded while the script has a history"
+    );
+
+    // The transaction is gone, so the script's status goes to null.
+    server.txs = Vec::new();
+    state.advance(
+        &mut queue,
+        raw_msg(json!({
+            "jsonrpc": "2.0",
+            "method": "blockchain.scripthash.subscribe",
+            "params": [spk_hash.to_string(), null],
+        })),
+    )?;
+    drain_requests(&mut state, &mut queue, &server);
+    assert!(
+        !state.cache().spk_statuses.contains_key(&spk_hash),
+        "a null status must drop the recorded status"
+    );
+
+    // A reorg evicting the height it used to be seen at must not replay anything.
+    server.headers = vec![genesis, header_1, header_2b, header_3b];
+    state.advance(
+        &mut queue,
+        raw_msg(json!({
+            "jsonrpc": "2.0",
+            "method": "blockchain.headers.subscribe",
+            "params": [{ "hex": serialize_hex(&header_3b), "height": 3 }],
+        })),
+    )?;
+    let mut asked = Vec::new();
+    while let Some(req) = queue.pop_front() {
+        asked.push(req.method.to_string());
+        state.advance(&mut queue, response(&req, &server))?;
+    }
+    assert!(
+        !asked
+            .iter()
+            .any(|m| m == "blockchain.transaction.get_merkle"),
+        "no proof may be asked for a transaction the script no longer has, got: {asked:?}"
+    );
     Ok(())
 }

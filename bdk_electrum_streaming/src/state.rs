@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    collections::{btree_map, BTreeMap, BTreeSet, HashMap, HashSet},
     sync::Arc,
 };
 
@@ -161,6 +161,13 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
                     .context("Failed to deserialize notification from server")?;
                 match notification {
                     Notification::Header(header_notification) => {
+                        // A same-height reorg is applied by `ChainJob`'s short-circuit without
+                        // fetching anything, so this notification is the only place the
+                        // replacement header is ever offered to us. Caching it here saves the
+                        // anchor refetch a round-trip on the very path it exists for.
+                        let header = *header_notification.header();
+                        self.cache.headers.insert(header.block_hash(), header);
+
                         // Always replace prev job since a new notification means a new tip.
                         self.chain_job = ChainJob::new(
                             self.coord.queuer(req_queue, JobId::Chain),
@@ -168,17 +175,7 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
                             *header_notification.header(),
                             header_notification.height(),
                         );
-                        if let Some(job) = self.chain_job.take() {
-                            match job.try_finish(&mut self.cp) {
-                                Ok(cp) => Ok(Some(self.on_chain_job_completed(req_queue, cp))),
-                                Err(job) => {
-                                    self.chain_job = Some(job);
-                                    Ok(None)
-                                }
-                            }
-                        } else {
-                            Ok(None)
-                        }
+                        Ok(self.try_finish_chain_job(req_queue))
                     }
                     Notification::ScriptHash(script_hash_notification) => {
                         let spk_hash = script_hash_notification.script_hash();
@@ -193,6 +190,10 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
                                 ))?;
 
                         let mut last_active_indices = BTreeMap::new();
+
+                        if spk_status.is_none() {
+                            self.forget_spk_history(spk_hash);
+                        }
 
                         if spk_status.is_some() || self.cache.spk_txids.contains_key(&spk_hash) {
                             for script_hash in self.spk_tracker.mark_script_hash_used(&k, i) {
@@ -252,16 +253,9 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
                         if let Some(job) = self.chain_job.take() {
                             let new_blocks = (req.start_height..)
                                 .zip(resp.headers.into_iter().map(|h| h.block_hash()));
-                            match job.process_blocks(new_blocks).try_finish(&mut self.cp) {
-                                Ok(cp) => Ok(Some(self.on_chain_job_completed(req_queue, cp))),
-                                Err(job) => {
-                                    self.chain_job = Some(job);
-                                    Ok(None)
-                                }
-                            }
-                        } else {
-                            Ok(None)
+                            self.chain_job = Some(job.process_blocks(new_blocks));
                         }
+                        Ok(self.try_finish_chain_job(req_queue))
                     }
                     JobRequest::GetHeader(req) => {
                         let resp = from_raw(&req, raw)?;
@@ -301,6 +295,18 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
                                 .entry(req.script_hash)
                                 .or_default()
                                 .extend(resp.iter().map(|tx| tx.txid()));
+                            // Recorded together with the history, so replaying this script's
+                            // job always finds the history its status stands for.
+                            self.cache.spk_statuses.insert(req.script_hash, spk_status);
+                            for tx in &resp {
+                                if let Some(height) = tx.confirmation_height() {
+                                    self.cache
+                                        .spk_hashes_by_height
+                                        .entry(height.to_consensus_u32())
+                                        .or_default()
+                                        .insert(req.script_hash);
+                                }
+                            }
                         }
                         Ok(self.advance_spk_jobs(req_queue, job_ids))
                     }
@@ -311,6 +317,7 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
                     }
                     JobRequest::GetTxMerkle(req) => {
                         let resp = from_raw(&req, raw)?;
+
                         let cp = match self.cp.get(req.height) {
                             Some(cp) if cp.height() == req.height => cp,
                             _ => {
@@ -379,6 +386,10 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
 
                         let mut last_active_indices = BTreeMap::new();
 
+                        if spk_status.is_none() {
+                            self.forget_spk_history(spk_hash);
+                        }
+
                         if spk_status.is_some() || self.cache.spk_txids.contains_key(&spk_hash) {
                             for script_hash in self.spk_tracker.mark_script_hash_used(&k, i) {
                                 self.coord
@@ -408,6 +419,9 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
                     }
                     JobRequest::HeadersSubscribe(req) => {
                         let resp = from_raw(&req, raw)?;
+                        self.cache
+                            .headers
+                            .insert(resp.header.block_hash(), resp.header);
 
                         // Always replace prev job since a new notification means a new tip.
                         self.chain_job = ChainJob::new(
@@ -416,27 +430,90 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
                             resp.header,
                             resp.height,
                         );
-                        if let Some(job) = self.chain_job.take() {
-                            match job.try_finish(&mut self.cp) {
-                                Ok(cp) => Ok(Some(self.on_chain_job_completed(req_queue, cp))),
-                                Err(job) => {
-                                    self.chain_job = Some(job);
-                                    Ok(None)
-                                }
-                            }
-                        } else {
-                            Ok(None)
-                        }
+                        Ok(self.try_finish_chain_job(req_queue))
                     }
                 }
             }
         }
     }
 
+    /// Forget the history the server no longer reports for `spk_hash`.
+    ///
+    /// A replay is built from the last status and the heights that status was seen at, so
+    /// leaving them behind would have a later eviction rebuild this script's job from a history
+    /// it no longer has.
+    fn forget_spk_history(&mut self, spk_hash: ElectrumScriptHash) {
+        self.cache.spk_statuses.remove(&spk_hash);
+        for spk_hashes in self.cache.spk_hashes_by_height.values_mut() {
+            spk_hashes.remove(&spk_hash);
+        }
+    }
+
+    /// Apply the pending chain job to the local chain, if it has everything it needs.
+    ///
+    /// Returns the resulting update, if the job completed.
+    fn try_finish_chain_job(&mut self, req_queue: &mut ReqQueue) -> Option<Update<K>> {
+        let job = self.chain_job.take()?;
+        let prev_cp = self.cp.clone();
+        match job.try_finish(&mut self.cp) {
+            Ok(cp) => Some(self.on_chain_job_completed(req_queue, &prev_cp, cp)),
+            Err(job) => {
+                self.chain_job = Some(job);
+                None
+            }
+        }
+    }
+
+    /// React to the local chain having moved from `prev_cp` to `cp`.
+    ///
     /// Spk jobs cannot extend the local chain, so a job whose anchor is above the local tip
     /// waits with no request in flight. Advancing the tip is what makes such an anchor
     /// resolvable, so every completed chain job must re-advance the stashed spk jobs.
-    fn on_chain_job_completed(&mut self, req_queue: &mut ReqQueue, cp: CheckPoint) -> Update<K> {
+    ///
+    /// A chain job may also drop blocks. Any transaction we have seen at an evicted height is
+    /// anchored to a block which is no longer ours, so its anchor has to be refetched — and a
+    /// spk notification will not tell us to, since a transaction which moved to a different
+    /// block of the same height leaves the spk status untouched.
+    fn on_chain_job_completed(
+        &mut self,
+        req_queue: &mut ReqQueue,
+        prev_cp: &CheckPoint,
+        cp: CheckPoint,
+    ) -> Update<K> {
+        let evicted = evicted_heights(prev_cp, &cp);
+        if !evicted.is_empty() {
+            tracing::info!(
+                heights = ?evicted,
+                "Blocks evicted from the local chain. Refetching anchors."
+            );
+            let affected = evicted
+                .iter()
+                .flat_map(|height| self.cache.spk_hashes_by_height.get(height))
+                .flatten()
+                .copied();
+
+            // Start each affected script the job its own notification would have started, from
+            // the status and history already cached: a script hash notification we raise
+            // ourselves, because the server will not raise one. A transaction which moved to a
+            // different block of the same height leaves the status untouched.
+            for spk_hash in affected {
+                // A vacant entry is the whole rule: never displace a job the server's own
+                // notification built, since that one carries a status at least as new as
+                // anything we could replay, and every stashed job is re-advanced below anyway.
+                if let btree_map::Entry::Vacant(e) = self.spk_jobs.entry(spk_hash) {
+                    if let Some(&status) = self.cache.spk_statuses.get(&spk_hash) {
+                        e.insert(SpkJob::new(&self.cache, spk_hash, Some(status)));
+                    }
+                }
+            }
+        }
+
+        // Only heights inside `ChainJob`'s reorg window can ever be evicted, and only evicted
+        // heights are ever read back, so entries far below the tip can never be consulted
+        // again. Pruning keeps this bounded with a wide margin over that horizon.
+        let prune_below = cp.height().saturating_sub(SPK_HASHES_BY_HEIGHT_HORIZON);
+        self.cache.spk_hashes_by_height = self.cache.spk_hashes_by_height.split_off(&prune_below);
+
         let stashed_jobs = self
             .spk_jobs
             .keys()
@@ -497,6 +574,23 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
     }
 }
 
+/// The heights whose block was dropped from the local chain when it went from `prev` to `next`.
+///
+/// Checkpoint chains share everything below the point at which they diverge, so walking `prev`
+/// down from its tip until `next` agrees is enough.
+fn evicted_heights(prev: &CheckPoint, next: &CheckPoint) -> BTreeSet<u32> {
+    let mut evicted = BTreeSet::new();
+    for cp in prev.iter() {
+        match next.get(cp.height()) {
+            Some(next_cp) if next_cp.hash() == cp.hash() => break,
+            _ => {
+                evicted.insert(cp.height());
+            }
+        }
+    }
+    evicted
+}
+
 pub fn from_raw<R>(_req: &R, raw: serde_json::Value) -> Result<R::Response, serde_json::Error>
 where
     R: Request,
@@ -513,4 +607,33 @@ pub struct Cache {
     pub anchors: HashMap<(Txid, BlockHash), ConfirmationBlockTime>,
     pub failed_anchors: HashSet<(Txid, BlockHash)>,
     pub headers: HashMap<BlockHash, bitcoin::block::Header>,
+    /// The last status the server reported for each script hash.
+    ///
+    /// Replaying a script's job needs its status, since that is the key its history is cached
+    /// under. Only recorded together with that history, so a replay always finds one.
+    pub spk_statuses: HashMap<ElectrumScriptHash, ElectrumScriptStatus>,
+    /// Script hashes whose history reported a transaction at each height.
+    ///
+    /// This is what makes a reorg actionable: when the local chain drops a block, the scripts
+    /// recorded at that height are the ones whose anchors need refetching.
+    ///
+    /// Unlike the rest of the cache this is pruned. Its only reader is the eviction path, and
+    /// evictions can only come from a conflict inside the window [`ChainJob`] rewrites, so
+    /// entries more than [`SPK_HASHES_BY_HEIGHT_HORIZON`] below the tip can never be read
+    /// again.
+    ///
+    /// That window is also the reorg horizon the anchor refetch inherits: a fork deeper than
+    /// [`ChainJob`]'s suffix length leaves the checkpoint chain claiming blocks the server does
+    /// not have, and no eviction is reported for them.
+    ///
+    /// [`ChainJob`]: crate::chain_job::ChainJob
+    pub spk_hashes_by_height: BTreeMap<u32, BTreeSet<ElectrumScriptHash>>,
 }
+
+/// How far below the tip [`Cache::spk_hashes_by_height`] is retained.
+///
+/// Comfortably above [`ChainJob`]'s 21-block suffix, which bounds how deep an eviction — the
+/// only thing that reads the map — can ever reach.
+///
+/// [`ChainJob`]: crate::chain_job::ChainJob
+pub const SPK_HASHES_BY_HEIGHT_HORIZON: u32 = 100;
