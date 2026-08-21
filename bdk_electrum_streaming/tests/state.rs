@@ -1439,3 +1439,41 @@ fn a_proof_for_another_block_is_not_a_verdict_on_ours() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// A job needs both the transactions and their anchors, and the server answers in any order.
+///
+/// Every other test lets the `GetTx` land first, which puts the anchors on the job's final pass
+/// with nothing running after them. This forces the other order: the merkle proof arrives first,
+/// so the anchor resolves early and the job runs again when the transaction finally lands.
+///
+/// Anchors are re-resolved from scratch on every pass, so that later pass must not lose the
+/// anchor already in hand — the set of what to anchor is the question, not the answer, and
+/// clearing it once answered would have the next pass ask an empty question and stage nothing.
+#[test]
+fn anchor_survives_a_pass_that_happens_after_it_resolved() -> anyhow::Result<()> {
+    let (descriptor, spk_hash, spk) = tracked_descriptor()?;
+    let tx = tx_paying(&spk, 50_000);
+    let txid = tx.compute_txid();
+    let (genesis, header_1) = base_headers();
+    let header_2 = block_with_tx(&header_1, txid, 200, 0);
+
+    let mut state = new_state(Cache::default(), descriptor, genesis);
+    let mut queue = ReqQueue::new();
+    let server = Server {
+        headers: vec![genesis, header_1, header_2],
+        spk_hash,
+        txs: vec![(tx, 2)],
+        merkle_proof: (Vec::new(), 0),
+    };
+
+    state.init(&mut queue);
+    let updates = drain_requests_proofs_first(&mut state, &mut queue, &server);
+    assert!(
+        updates.iter().any(|u| u
+            .tx_update
+            .anchors
+            .contains(&(anchor_of(&header_2, 2), txid))),
+        "the anchor must still be emitted after a later pass"
+    );
+    Ok(())
+}
