@@ -1477,3 +1477,142 @@ fn anchor_survives_a_pass_that_happens_after_it_resolved() -> anyhow::Result<()>
     );
     Ok(())
 }
+
+/// A tip notification landing while the previous one's headers are still in flight.
+///
+/// The replacement job asks for the same heights, so its request is byte-identical to the one
+/// already out. Deduplicated against that one, nothing new is sent, and the answer already on its
+/// way describes the chain the server has just left.
+#[test]
+fn a_tip_that_moves_while_headers_are_in_flight_is_not_lost() -> anyhow::Result<()> {
+    let (descriptor, spk_hash, _spk) = tracked_descriptor()?;
+    let (genesis, header_1) = base_headers();
+    let build = |nonce: u32| {
+        let mut chain = vec![genesis, header_1];
+        for height in 2..=3 {
+            let prev = *chain.last().expect("non-empty");
+            chain.push(block_with_root(
+                &prev,
+                TxMerkleNode::all_zeros(),
+                1000 + height,
+                nonce,
+            ));
+        }
+        chain
+    };
+    let (chain_a, chain_b) = (build(0), build(1));
+    assert_ne!(chain_a[3].block_hash(), chain_b[3].block_hash());
+
+    let mut state = new_state(Cache::default(), descriptor, genesis);
+    let mut queue = ReqQueue::new();
+    let mut server = Server {
+        headers: chain_a.clone(),
+        spk_hash,
+        txs: Vec::new(),
+        merkle_proof: (Vec::new(), 0),
+    };
+
+    let notify = |chain: &[block::Header]| {
+        raw_msg(json!({
+            "jsonrpc": "2.0",
+            "method": "blockchain.headers.subscribe",
+            "params": [{ "hex": serialize_hex(chain.last().expect("non-empty")), "height": 3 }],
+        }))
+    };
+
+    // The A-chain tip. Hold its headers request so the job is still waiting.
+    state.advance(&mut queue, notify(&chain_a))?;
+    let held = queue
+        .drain(..)
+        .filter(|req| req.method.as_ref() == "blockchain.block.headers")
+        .collect::<Vec<_>>();
+    assert!(!held.is_empty(), "the job must have asked for headers");
+    let held_resp = held
+        .iter()
+        .map(|req| response(req, &server))
+        .collect::<Vec<_>>();
+
+    // The server reorgs to B and notifies the new tip at the same height.
+    server.headers = chain_b.clone();
+    state.advance(&mut queue, notify(&chain_b))?;
+    assert!(
+        queue
+            .iter()
+            .any(|req| req.method.as_ref() == "blockchain.block.headers"),
+        "the replacement job must send its own request rather than adopt the one in flight"
+    );
+
+    // The held answer describes the chain the server has left.
+    let mut updates = Vec::new();
+    for resp in held_resp {
+        updates.extend(state.advance(&mut queue, resp)?);
+    }
+    updates.extend(drain_requests(&mut state, &mut queue, &server));
+
+    let tip = updates
+        .iter()
+        .rev()
+        .find_map(|u| u.chain_update.clone())
+        .expect("must get a chain update");
+    assert_eq!(
+        tip.hash(),
+        chain_b[3].block_hash(),
+        "the local chain must end on the tip the server actually has"
+    );
+    Ok(())
+}
+
+/// A headers batch answered from a chain other than the one announced.
+///
+/// `blockchain.block.headers` is answered from whichever chain the server holds when it *replies*,
+/// so a reorg between receiving the request and answering it returns blocks for a tip we were
+/// never told about. Adopting them would put the checkpoint chain on a chain no notification ever
+/// announced, and no notification would arrive to correct it.
+#[test]
+fn headers_for_a_chain_we_were_not_told_about_are_not_adopted() -> anyhow::Result<()> {
+    let (descriptor, spk_hash, _spk) = tracked_descriptor()?;
+    let (genesis, h1) = base_headers();
+    let h2 = block_with_root(&h1, TxMerkleNode::all_zeros(), 200, 0);
+    let a3 = block_with_root(&h2, TxMerkleNode::all_zeros(), 300, 0);
+    let b3 = block_with_root(&h2, TxMerkleNode::all_zeros(), 300, 1);
+    assert_ne!(a3.block_hash(), b3.block_hash());
+
+    let mut state = new_state(Cache::default(), descriptor, genesis);
+    let mut queue = ReqQueue::new();
+    let mut server = Server {
+        headers: vec![genesis, h1, h2],
+        spk_hash,
+        txs: Vec::new(),
+        merkle_proof: (Vec::new(), 0),
+    };
+    state.init(&mut queue);
+    drain_requests(&mut state, &mut queue, &server);
+
+    // A3 is announced, so that is the block the job is created to reach.
+    state.advance(
+        &mut queue,
+        raw_msg(json!({
+            "jsonrpc": "2.0",
+            "method": "blockchain.headers.subscribe",
+            "params": [{ "hex": serialize_hex(&a3), "height": 3 }],
+        })),
+    )?;
+
+    // But by the time the server answers, it is on B3 — and it does not announce it, because
+    // this response is the reorg's only appearance.
+    server.headers = vec![genesis, h1, h2, b3];
+    let updates = drain_requests(&mut state, &mut queue, &server);
+
+    let tip = updates.iter().rev().find_map(|u| u.chain_update.clone());
+    assert_ne!(
+        tip.as_ref().map(|cp| cp.hash()),
+        Some(b3.block_hash()),
+        "a chain no notification announced must not be adopted"
+    );
+    assert_ne!(
+        tip.as_ref().map(|cp| cp.hash()),
+        Some(a3.block_hash()),
+        "and the announced block was never actually delivered"
+    );
+    Ok(())
+}

@@ -12,7 +12,7 @@ use serde_json::from_value;
 
 use crate::{
     cache::{Cache, SpkHistories},
-    chain_job::ChainJob,
+    chain_job::{ChainJob, ChainJobOutcome},
     req::{JobRequest, PoppedRequest, ReqCoord, ReqQueue},
     spk_job::SpkJob,
     DerivedSpkTracker, Update,
@@ -166,6 +166,13 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
                         // anchor refetch a round-trip on the very path it exists for.
                         let header = *header_notification.header();
                         self.cache.headers.insert(header.block_hash(), header);
+
+                        // A new tip supersedes whatever the previous job was resolving against,
+                        // and its request has to go with it. The replacement job asks for the
+                        // same heights, so a surviving request would be deduplicated against —
+                        // nothing would be sent, and the answer already in flight would fill the
+                        // new job with the chain the server has just left.
+                        self.coord.forget_job(JobId::Chain);
 
                         // Always replace prev job since a new notification means a new tip.
                         self.chain_job = ChainJob::new(
@@ -497,11 +504,14 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
         let job = self.chain_job.take()?;
         let prev_cp = self.cp.clone();
         match job.try_finish(&mut self.cp) {
-            Ok(cp) => Some(self.on_chain_job_completed(req_queue, &prev_cp, cp)),
-            Err(job) => {
+            ChainJobOutcome::Finished(cp) => {
+                Some(self.on_chain_job_completed(req_queue, &prev_cp, cp))
+            }
+            ChainJobOutcome::Pending(job) => {
                 self.chain_job = Some(job);
                 None
             }
+            ChainJobOutcome::Superseded => None,
         }
     }
 

@@ -138,6 +138,24 @@ impl ReqCoord {
         })
     }
 
+    /// Forget every request `job_id` is still waiting on.
+    ///
+    /// A request wanted by another job stays in flight and merely loses `job_id` as an owner.
+    /// One that nothing else wants is dropped outright, so its response is ignored on arrival
+    /// and an identical request is no longer deduplicated against it.
+    pub fn forget_job(&mut self, job_id: JobId) {
+        let mut orphaned = Vec::new();
+        self.req_to_job.retain(|req, job_ids| {
+            if !job_ids.remove(&job_id) || !job_ids.is_empty() {
+                return true;
+            }
+            orphaned.push(req.clone());
+            false
+        });
+        self.awaiting_responses
+            .retain(|_, (req, _)| !orphaned.contains(req));
+    }
+
     /// To be called when the local chain drops blocks.
     ///
     /// Requests already in flight were made against the old chain, so their responses can no
