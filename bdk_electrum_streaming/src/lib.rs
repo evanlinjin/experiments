@@ -5,6 +5,8 @@ use bdk_core::spk_client::FullScanResponse;
 pub use electrum_streaming_client;
 
 use bdk_core::ConfirmationBlockTime;
+mod cache;
+pub use cache::*;
 mod state;
 use electrum_streaming_client::{
     AsyncPendingRequest, BlockingPendingRequest, MaybeBatch, PendingRequest,

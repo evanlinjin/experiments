@@ -1302,7 +1302,7 @@ fn a_script_whose_history_goes_away_is_not_replayed() -> anyhow::Result<()> {
         "tx must first be anchored"
     );
     assert!(
-        state.cache().spk_statuses.contains_key(&spk_hash),
+        state.spk_histories().status(spk_hash).is_some(),
         "the status must be recorded while the script has a history"
     );
 
@@ -1318,7 +1318,7 @@ fn a_script_whose_history_goes_away_is_not_replayed() -> anyhow::Result<()> {
     )?;
     drain_requests(&mut state, &mut queue, &server);
     assert!(
-        !state.cache().spk_statuses.contains_key(&spk_hash),
+        !state.spk_histories().status(spk_hash).is_some(),
         "a null status must drop the recorded status"
     );
 
