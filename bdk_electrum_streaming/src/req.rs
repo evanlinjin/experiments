@@ -87,6 +87,20 @@ impl From<request::HeadersSubscribe> for JobRequest {
     }
 }
 
+/// A response's originating request, alongside what is needed to route it.
+#[derive(Debug, Clone)]
+pub struct PoppedRequest {
+    /// The request this response is answering.
+    pub request: JobRequest,
+    /// Jobs awaiting this response.
+    pub job_ids: BTreeSet<JobId>,
+    /// Whether the local chain dropped blocks after this request was sent.
+    ///
+    /// The server answers from its own chain, so a response which predates a reorg may describe
+    /// a block which is no longer the one we have at that height.
+    pub reorged_since_sent: bool,
+}
+
 /// Request coordinator.
 ///
 /// Associates responses to their requests and requests to their jobs.
@@ -94,10 +108,12 @@ impl From<request::HeadersSubscribe> for JobRequest {
 pub struct ReqCoord {
     /// Next request id.
     next_id: u32,
-    /// Req id -> Req.
-    awaiting_responses: HashMap<u32, JobRequest>,
+    /// Req id -> the request, and the chain generation it was enqueued at.
+    awaiting_responses: HashMap<u32, (JobRequest, u64)>,
     /// So we won't have duplicate requests.
     req_to_job: HashMap<JobRequest, BTreeSet<JobId>>,
+    /// Bumped every time the local chain drops blocks.
+    chain_generation: u64,
 }
 
 impl ReqCoord {
@@ -112,16 +128,40 @@ impl ReqCoord {
         &mut self.next_id
     }
 
-    pub fn pop(&mut self, req_id: u32) -> Option<(JobRequest, BTreeSet<JobId>)> {
-        let any_req = self.awaiting_responses.remove(&req_id)?;
-        let job_ids = self.req_to_job.remove(&any_req).unwrap_or_default();
-        Some((any_req, job_ids))
+    pub fn pop(&mut self, req_id: u32) -> Option<PoppedRequest> {
+        let (request, generation) = self.awaiting_responses.remove(&req_id)?;
+        let job_ids = self.req_to_job.remove(&request).unwrap_or_default();
+        Some(PoppedRequest {
+            request,
+            job_ids,
+            reorged_since_sent: generation < self.chain_generation,
+        })
     }
 
-    /// To be called when the network resets.
-    pub fn clear(&mut self) {
-        self.awaiting_responses.clear();
-        self.req_to_job.clear();
+    /// Forget every request `job_id` is still waiting on.
+    ///
+    /// A request wanted by another job stays in flight and merely loses `job_id` as an owner.
+    /// One that nothing else wants is dropped outright, so its response is ignored on arrival
+    /// and an identical request is no longer deduplicated against it.
+    pub fn forget_job(&mut self, job_id: JobId) {
+        let mut orphaned = Vec::new();
+        self.req_to_job.retain(|req, job_ids| {
+            if !job_ids.remove(&job_id) || !job_ids.is_empty() {
+                return true;
+            }
+            orphaned.push(req.clone());
+            false
+        });
+        self.awaiting_responses
+            .retain(|_, (req, _)| !orphaned.contains(req));
+    }
+
+    /// To be called when the local chain drops blocks.
+    ///
+    /// Requests already in flight were made against the old chain, so their responses can no
+    /// longer be trusted to describe the blocks we now have.
+    pub fn bump_chain_generation(&mut self) {
+        self.chain_generation += 1;
     }
 
     pub fn queuer<'q>(&'q mut self, queue: &'q mut ReqQueue, job_id: JobId) -> ReqQueuer<'q> {
@@ -136,7 +176,7 @@ impl ReqCoord {
     pub fn pending_requests(&self) -> impl ExactSizeIterator<Item = RawRequest> + '_ {
         self.awaiting_responses
             .iter()
-            .map(|(&req_id, req)| req.to_raw(req_id))
+            .map(|(&req_id, (req, _))| req.to_raw(req_id))
     }
 }
 
@@ -163,7 +203,10 @@ impl<'q> ReqQueuer<'q> {
                 e.insert(BTreeSet::new()).insert(self.job_id);
                 let req_id = self.coord.next_id;
                 self.coord.next_id = self.coord.next_id.wrapping_add(1);
-                self.coord.awaiting_responses.insert(req_id, req.clone());
+                let generation = self.coord.chain_generation;
+                self.coord
+                    .awaiting_responses
+                    .insert(req_id, (req.clone(), generation));
                 self.queue.push_back(req.into_raw(req_id));
             }
         }

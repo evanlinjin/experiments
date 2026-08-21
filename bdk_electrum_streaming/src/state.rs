@@ -1,15 +1,9 @@
-use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
-    sync::Arc,
-};
+use std::collections::{btree_map, BTreeMap, BTreeSet};
 
 use anyhow::Context;
-use bdk_core::{
-    bitcoin::{self, BlockHash, Transaction, Txid},
-    BlockId, CheckPoint, ConfirmationBlockTime,
-};
+use bdk_core::{BlockId, CheckPoint, ConfirmationBlockTime};
 use electrum_streaming_client::{
-    notification::Notification, request, response, AsyncPendingRequest, BlockingPendingRequest,
+    notification::Notification, request, AsyncPendingRequest, BlockingPendingRequest,
     ElectrumScriptHash, ElectrumScriptStatus, MaybeBatch, PendingRequest,
     RawNotificationOrResponse, Request,
 };
@@ -17,8 +11,9 @@ use miniscript::{Descriptor, DescriptorPublicKey};
 use serde_json::from_value;
 
 use crate::{
-    chain_job::ChainJob,
-    req::{JobRequest, ReqCoord, ReqQueue},
+    cache::{Cache, SpkHistories},
+    chain_job::{ChainJob, ChainJobOutcome},
+    req::{JobRequest, PoppedRequest, ReqCoord, ReqQueue},
     spk_job::SpkJob,
     DerivedSpkTracker, Update,
 };
@@ -80,6 +75,10 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
     /// Get a reference to the internal cache.
     pub fn cache(&self) -> &Cache {
         &self.cache
+    }
+
+    pub fn spk_histories(&self) -> &SpkHistories {
+        &self.cache.spk_histories
     }
 
     /// Reset the state to be not initialized.
@@ -161,6 +160,20 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
                     .context("Failed to deserialize notification from server")?;
                 match notification {
                     Notification::Header(header_notification) => {
+                        // A same-height reorg is applied by `ChainJob`'s short-circuit without
+                        // fetching anything, so this notification is the only place the
+                        // replacement header is ever offered to us. Caching it here saves the
+                        // anchor refetch a round-trip on the very path it exists for.
+                        let header = *header_notification.header();
+                        self.cache.headers.insert(header.block_hash(), header);
+
+                        // A new tip supersedes whatever the previous job was resolving against,
+                        // and its request has to go with it. The replacement job asks for the
+                        // same heights, so a surviving request would be deduplicated against —
+                        // nothing would be sent, and the answer already in flight would fill the
+                        // new job with the chain the server has just left.
+                        self.coord.forget_job(JobId::Chain);
+
                         // Always replace prev job since a new notification means a new tip.
                         self.chain_job = ChainJob::new(
                             self.coord.queuer(req_queue, JobId::Chain),
@@ -168,17 +181,7 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
                             *header_notification.header(),
                             header_notification.height(),
                         );
-                        if let Some(job) = self.chain_job.take() {
-                            match job.try_finish(&mut self.cp) {
-                                Ok(cp) => Ok(Some(self.on_chain_job_completed(req_queue, cp))),
-                                Err(job) => {
-                                    self.chain_job = Some(job);
-                                    Ok(None)
-                                }
-                            }
-                        } else {
-                            Ok(None)
-                        }
+                        Ok(self.try_finish_chain_job(req_queue))
                     }
                     Notification::ScriptHash(script_hash_notification) => {
                         let spk_hash = script_hash_notification.script_hash();
@@ -193,6 +196,10 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
                                 ))?;
 
                         let mut last_active_indices = BTreeMap::new();
+
+                        if spk_status.is_none() {
+                            self.cache.spk_histories.remove(spk_hash);
+                        }
 
                         if spk_status.is_some() || self.cache.spk_txids.contains_key(&spk_hash) {
                             for script_hash in self.spk_tracker.mark_script_hash_used(&k, i) {
@@ -227,7 +234,11 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
                 }
             }
             RawNotificationOrResponse::Response(raw_response) => {
-                let (orig_req, job_ids) = match self.coord.pop(raw_response.id) {
+                let PoppedRequest {
+                    request: orig_req,
+                    job_ids,
+                    reorged_since_sent,
+                } = match self.coord.pop(raw_response.id) {
                     Some(req) => req,
                     None => return Ok(None),
                 };
@@ -236,6 +247,38 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
                 let raw = match raw_response.result {
                     Ok(raw) => raw,
                     Err(err) => {
+                        // An anchor fetch is speculative: it asks for a proof of inclusion at
+                        // the height a transaction was last reported at, and a reorg may have
+                        // taken the transaction out of that block, or out of the chain
+                        // altogether. A server answers that with an error, which is an answer,
+                        // not a reason to bring the connection down.
+                        if let JobRequest::GetTxMerkle(req) = &orig_req {
+                            tracing::warn!(
+                                txid = req.txid.to_string(),
+                                block_height = req.height,
+                                ?err,
+                                "Server gave no merkle proof at this height. Reorg?",
+                            );
+                            // An error about the chain we have since left says nothing about
+                            // the block we now have at this height. Discard it and let the
+                            // jobs ask again.
+                            if reorged_since_sent {
+                                return Ok(self.advance_spk_jobs(req_queue, job_ids));
+                            }
+                            // An error proves nothing — it is equally a rate limit, an index
+                            // still catching up or a daemon hiccup — so nothing durable is
+                            // recorded, and there is nowhere to record it: a proof
+                            // request that comes back with nothing leaves no trace.
+                            //
+                            // The job is left stashed rather than cancelled. Returning without
+                            // advancing it is what stops the re-ask loop; keeping it is what
+                            // makes the recovery automatic, since the next chain update advances
+                            // it again and the answer may be different once our chain has caught
+                            // up with the server's. Cancelling would need a notification to
+                            // revive it, and the same-height reorg this all exists for is
+                            // precisely the case that sends none.
+                            return Ok(None);
+                        }
                         // Cancel jobs that resulted in error.
                         self.cancel_jobs(job_ids);
                         return Err(anyhow::anyhow!(err).context("Server responded with error"));
@@ -252,55 +295,65 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
                         if let Some(job) = self.chain_job.take() {
                             let new_blocks = (req.start_height..)
                                 .zip(resp.headers.into_iter().map(|h| h.block_hash()));
-                            match job.process_blocks(new_blocks).try_finish(&mut self.cp) {
-                                Ok(cp) => Ok(Some(self.on_chain_job_completed(req_queue, cp))),
-                                Err(job) => {
-                                    self.chain_job = Some(job);
-                                    Ok(None)
-                                }
-                            }
-                        } else {
-                            Ok(None)
+                            self.chain_job = Some(job.process_blocks(new_blocks));
                         }
+                        Ok(self.try_finish_chain_job(req_queue))
                     }
                     JobRequest::GetHeader(req) => {
                         let resp = from_raw(&req, raw)?;
+                        let hash = resp.header.block_hash();
+                        self.cache.headers.insert(hash, resp.header);
 
-                        self.cache
-                            .headers
-                            .insert(resp.header.block_hash(), resp.header);
-
-                        // Do not extend checkpoints.
-                        if req.height > self.cp.height() {
-                            return Ok(None);
-                        }
-                        // Do not replace blocks.
-                        if self
+                        // The block our own chain has at this height, if it has one.
+                        let ours = self
                             .cp
                             .get(req.height)
-                            .is_some_and(|cp| cp.height() == req.height)
-                        {
+                            .filter(|cp| cp.height() == req.height)
+                            .map(|cp| cp.hash());
+
+                        // `blockchain.block.header` is keyed by height, so this is the only
+                        // block the server will ever hand us there. If our chain claims a
+                        // different one it is stale at a height no chain job will rewrite —
+                        // below `ChainJob`'s suffix nothing reports the difference — and the
+                        // header a job is waiting on can never arrive. Asking again would loop
+                        // for as long as the connection is up, so drop the jobs instead and
+                        // let the next notification rebuild them.
+                        if ours.is_some_and(|ours| ours != hash) && !reorged_since_sent {
+                            tracing::warn!(
+                                height = req.height,
+                                ours = ours.expect("just matched").to_string(),
+                                theirs = hash.to_string(),
+                                "Local chain disagrees with the server below the reorg horizon",
+                            );
+                            self.cancel_jobs(job_ids);
                             return Ok(None);
                         }
-                        self.cp = self
-                            .cp
-                            .clone()
-                            .insert(BlockId::from((req.height, resp.header.block_hash())));
+
+                        // Whether or not the checkpoint chain wants this header, the header
+                        // now being cached is what a waiting anchor may need, and nothing else
+                        // will wake it. So only the insert below is conditional; the jobs are
+                        // advanced either way.
+                        //
+                        // The insert is skipped when the block at this height may have been
+                        // replaced since we asked (`reorged_since_sent`), when it would extend
+                        // the checkpoints, and when we already have this block.
+                        let extends = req.height > self.cp.height();
+                        if !reorged_since_sent && !extends && ours.is_none() {
+                            self.cp = self.cp.clone().insert(BlockId::from((req.height, hash)));
+                        }
                         Ok(self.advance_spk_jobs(req_queue, job_ids))
                     }
                     JobRequest::GetHistory(req) => {
                         let resp = from_raw(&req, raw)?;
                         if let Some(spk_status) = ElectrumScriptStatus::from_history(&resp) {
                             self.cache
-                                .spk_histories
-                                .entry(spk_status)
-                                .or_default()
-                                .extend(resp.clone());
-                            self.cache
                                 .spk_txids
                                 .entry(req.script_hash)
                                 .or_default()
                                 .extend(resp.iter().map(|tx| tx.txid()));
+                            self.cache
+                                .spk_histories
+                                .insert(req.script_hash, spk_status, resp);
                         }
                         Ok(self.advance_spk_jobs(req_queue, job_ids))
                     }
@@ -311,6 +364,15 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
                     }
                     JobRequest::GetTxMerkle(req) => {
                         let resp = from_raw(&req, raw)?;
+
+                        // The proof was built against the server's chain at the time we asked,
+                        // which may not be the block we now have at this height. Checking it
+                        // against that block would read a disagreement between two chains as a
+                        // verdict on this one, so discard it and let the job ask again.
+                        if reorged_since_sent {
+                            return Ok(self.advance_spk_jobs(req_queue, job_ids));
+                        }
+
                         let cp = match self.cp.get(req.height) {
                             Some(cp) if cp.height() == req.height => cp,
                             _ => {
@@ -324,7 +386,7 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
                             }
                         };
                         let header = match self.cache.headers.get(&cp.hash()) {
-                            Some(header) => header,
+                            Some(header) => *header,
                             None => {
                                 tracing::warn!(
                                     ?req,
@@ -357,11 +419,16 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
                                 block_hash = header.block_hash().to_string(),
                                 header_root = header.merkle_root.to_string(),
                                 expected_root = exp_root.to_string(),
-                                "Failed to verify anchor."
+                                "Proof does not match the block we have at this height",
                             );
-                            self.cache
-                                .failed_anchors
-                                .insert((req.txid, header.block_hash()));
+                            // The server proves inclusion in whichever block *it* has at this
+                            // height, so a mismatch says our chain and the server's disagree
+                            // there — not that the transaction is absent from our block. That is
+                            // the conclusion `GetHeader` draws from the same kind of evidence,
+                            // so it gets the same treatment: drop the jobs and let the next
+                            // notification rebuild them.
+                            self.cancel_jobs(job_ids);
+                            return Ok(None);
                         }
                         Ok(self.advance_spk_jobs(req_queue, job_ids))
                     }
@@ -378,6 +445,10 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
                         ))?;
 
                         let mut last_active_indices = BTreeMap::new();
+
+                        if spk_status.is_none() {
+                            self.cache.spk_histories.remove(spk_hash);
+                        }
 
                         if spk_status.is_some() || self.cache.spk_txids.contains_key(&spk_hash) {
                             for script_hash in self.spk_tracker.mark_script_hash_used(&k, i) {
@@ -408,6 +479,9 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
                     }
                     JobRequest::HeadersSubscribe(req) => {
                         let resp = from_raw(&req, raw)?;
+                        self.cache
+                            .headers
+                            .insert(resp.header.block_hash(), resp.header);
 
                         // Always replace prev job since a new notification means a new tip.
                         self.chain_job = ChainJob::new(
@@ -416,27 +490,78 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
                             resp.header,
                             resp.height,
                         );
-                        if let Some(job) = self.chain_job.take() {
-                            match job.try_finish(&mut self.cp) {
-                                Ok(cp) => Ok(Some(self.on_chain_job_completed(req_queue, cp))),
-                                Err(job) => {
-                                    self.chain_job = Some(job);
-                                    Ok(None)
-                                }
-                            }
-                        } else {
-                            Ok(None)
-                        }
+                        Ok(self.try_finish_chain_job(req_queue))
                     }
                 }
             }
         }
     }
 
+    /// Apply the pending chain job to the local chain, if it has everything it needs.
+    ///
+    /// Returns the resulting update, if the job completed.
+    fn try_finish_chain_job(&mut self, req_queue: &mut ReqQueue) -> Option<Update<K>> {
+        let job = self.chain_job.take()?;
+        let prev_cp = self.cp.clone();
+        match job.try_finish(&mut self.cp) {
+            ChainJobOutcome::Finished(cp) => {
+                Some(self.on_chain_job_completed(req_queue, &prev_cp, cp))
+            }
+            ChainJobOutcome::Pending(job) => {
+                self.chain_job = Some(job);
+                None
+            }
+            ChainJobOutcome::Superseded => None,
+        }
+    }
+
+    /// React to the local chain having moved from `prev_cp` to `cp`.
+    ///
     /// Spk jobs cannot extend the local chain, so a job whose anchor is above the local tip
     /// waits with no request in flight. Advancing the tip is what makes such an anchor
     /// resolvable, so every completed chain job must re-advance the stashed spk jobs.
-    fn on_chain_job_completed(&mut self, req_queue: &mut ReqQueue, cp: CheckPoint) -> Update<K> {
+    ///
+    /// A chain job may also drop blocks. Any transaction we have seen at an evicted height is
+    /// anchored to a block which is no longer ours, so its anchor has to be refetched — and a
+    /// spk notification will not tell us to, since a transaction which moved to a different
+    /// block of the same height leaves the spk status untouched.
+    fn on_chain_job_completed(
+        &mut self,
+        req_queue: &mut ReqQueue,
+        prev_cp: &CheckPoint,
+        cp: CheckPoint,
+    ) -> Update<K> {
+        let evicted = evicted_heights(prev_cp, &cp);
+        if !evicted.is_empty() {
+            tracing::info!(
+                heights = ?evicted,
+                "Blocks evicted from the local chain. Refetching anchors."
+            );
+            // Responses to requests which are still in flight describe the chain we just left
+            // behind.
+            self.coord.bump_chain_generation();
+
+            // Start each affected script the job its own notification would have started, from
+            // the status and history already cached: a script hash notification we raise
+            // ourselves, because the server will not raise one. A transaction which moved to a
+            // different block of the same height leaves the status untouched.
+            for spk_hash in self.cache.spk_histories.spk_hashes_at_heights(evicted) {
+                // A vacant entry is the whole rule: never displace a job the server's own
+                // notification built, since that one carries a status at least as new as
+                // anything we could replay, and every stashed job is re-advanced below anyway.
+                if let btree_map::Entry::Vacant(e) = self.spk_jobs.entry(spk_hash) {
+                    if let Some(status) = self.cache.spk_histories.status(spk_hash) {
+                        e.insert(SpkJob::new(&self.cache, spk_hash, Some(status)));
+                    }
+                }
+            }
+        }
+
+        // Only heights inside `ChainJob`'s reorg window can ever be evicted, and only evicted
+        // heights are ever read back, so entries far below the tip can never be consulted
+        // again. Pruning keeps this bounded with a wide margin over that horizon.
+        self.cache.spk_histories.prune(cp.height());
+
         let stashed_jobs = self
             .spk_jobs
             .keys()
@@ -497,20 +622,26 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
     }
 }
 
+/// The heights whose block was dropped from the local chain when it went from `prev` to `next`.
+///
+/// Checkpoint chains share everything below the point at which they diverge, so walking `prev`
+/// down from its tip until `next` agrees is enough.
+fn evicted_heights(prev: &CheckPoint, next: &CheckPoint) -> BTreeSet<u32> {
+    let mut evicted = BTreeSet::new();
+    for cp in prev.iter() {
+        match next.get(cp.height()) {
+            Some(next_cp) if next_cp.hash() == cp.hash() => break,
+            _ => {
+                evicted.insert(cp.height());
+            }
+        }
+    }
+    evicted
+}
+
 pub fn from_raw<R>(_req: &R, raw: serde_json::Value) -> Result<R::Response, serde_json::Error>
 where
     R: Request,
 {
     from_value(raw)
-}
-
-/// A monotonically growing cache.
-#[derive(Debug, Clone, Default)]
-pub struct Cache {
-    pub spk_histories: HashMap<ElectrumScriptStatus, Vec<response::Tx>>,
-    pub spk_txids: HashMap<ElectrumScriptHash, BTreeSet<Txid>>,
-    pub txs: HashMap<Txid, Arc<Transaction>>,
-    pub anchors: HashMap<(Txid, BlockHash), ConfirmationBlockTime>,
-    pub failed_anchors: HashSet<(Txid, BlockHash)>,
-    pub headers: HashMap<BlockHash, bitcoin::block::Header>,
 }
