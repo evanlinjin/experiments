@@ -259,27 +259,45 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
                     }
                     JobRequest::GetHeader(req) => {
                         let resp = from_raw(&req, raw)?;
+                        let hash = resp.header.block_hash();
+                        self.cache.headers.insert(hash, resp.header);
 
-                        self.cache
-                            .headers
-                            .insert(resp.header.block_hash(), resp.header);
-
-                        // Do not extend checkpoints.
-                        if req.height > self.cp.height() {
-                            return Ok(None);
-                        }
-                        // Do not replace blocks.
-                        if self
+                        // The block our own chain has at this height, if it has one.
+                        let ours = self
                             .cp
                             .get(req.height)
-                            .is_some_and(|cp| cp.height() == req.height)
-                        {
+                            .filter(|cp| cp.height() == req.height)
+                            .map(|cp| cp.hash());
+
+                        // `blockchain.block.header` is keyed by height, so this is the only
+                        // block the server will ever hand us there. If our chain claims a
+                        // different one it is stale at a height no chain job will rewrite —
+                        // below `ChainJob`'s suffix nothing reports the difference — and the
+                        // header a job is waiting on can never arrive. Asking again would loop
+                        // for as long as the connection is up, so drop the jobs instead and
+                        // let the next notification rebuild them.
+                        if ours.is_some_and(|ours| ours != hash) {
+                            tracing::warn!(
+                                height = req.height,
+                                ours = ours.expect("just matched").to_string(),
+                                theirs = hash.to_string(),
+                                "Local chain disagrees with the server below the reorg horizon",
+                            );
+                            self.cancel_jobs(job_ids);
                             return Ok(None);
                         }
-                        self.cp = self
-                            .cp
-                            .clone()
-                            .insert(BlockId::from((req.height, resp.header.block_hash())));
+
+                        // Whether or not the checkpoint chain wants this header, the header
+                        // now being cached is what a waiting anchor may need, and nothing else
+                        // will wake it. So only the insert below is conditional; the jobs are
+                        // advanced either way.
+                        //
+                        // The insert is skipped when it would extend the checkpoints, and
+                        // when we already have this block.
+                        let extends = req.height > self.cp.height();
+                        if !extends && ours.is_none() {
+                            self.cp = self.cp.clone().insert(BlockId::from((req.height, hash)));
+                        }
                         Ok(self.advance_spk_jobs(req_queue, job_ids))
                     }
                     JobRequest::GetHistory(req) => {

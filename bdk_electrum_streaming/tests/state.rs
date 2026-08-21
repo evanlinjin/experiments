@@ -147,6 +147,34 @@ fn drain_requests(
     updates
 }
 
+/// Drain like [`drain_requests`], but answer every merkle proof in the queue ahead of everything
+/// else in each round.
+///
+/// The Electrum protocol carries a request id precisely because responses need not come back in
+/// the order they were asked for: romanz/electrs happens to answer in order, Fulcrum processes
+/// requests concurrently. Nothing may depend on the ordering.
+fn drain_requests_proofs_first(
+    state: &mut BlockingState,
+    queue: &mut ReqQueue,
+    server: &Server,
+) -> Vec<Update<&'static str>> {
+    let mut updates = Vec::new();
+    while !queue.is_empty() {
+        let (proofs, rest): (Vec<_>, Vec<_>) = queue
+            .drain(..)
+            .partition(|req| req.method.as_ref() == "blockchain.transaction.get_merkle");
+        for req in proofs.into_iter().chain(rest) {
+            if let Some(update) = state
+                .advance(queue, response(&req, server))
+                .expect("must advance")
+            {
+                updates.push(update);
+            }
+        }
+    }
+    updates
+}
+
 /// The server's answer to `req`, as a raw JSON-RPC result or error message.
 fn response(req: &RawRequest, server: &Server) -> RawNotificationOrResponse {
     raw_msg(match server.answer(req) {
@@ -230,17 +258,24 @@ fn new_state(
     descriptor: Descriptor<DescriptorPublicKey>,
     genesis: block::Header,
 ) -> BlockingState {
-    let mut spk_tracker = DerivedSpkTracker::new(0);
-    spk_tracker.insert_descriptor("external", descriptor, 0);
-    BlockingState::new(
-        ReqCoord::default(),
+    new_state_with_cp(
         cache,
-        spk_tracker,
+        descriptor,
         CheckPoint::new(BlockId {
             height: 0,
             hash: genesis.block_hash(),
         }),
     )
+}
+
+fn new_state_with_cp(
+    cache: Cache,
+    descriptor: Descriptor<DescriptorPublicKey>,
+    cp: CheckPoint,
+) -> BlockingState {
+    let mut spk_tracker = DerivedSpkTracker::new(0);
+    spk_tracker.insert_descriptor("external", descriptor, 0);
+    BlockingState::new(ReqCoord::default(), cache, spk_tracker, cp)
 }
 
 /// The anchor a tx confirmed in `header` at `height` must be given.
@@ -568,6 +603,116 @@ fn anchor_is_refetched_after_a_same_height_reorg() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A proof is verified against the merkle root of the block we have at that height, so a job
+/// which asks for the proof and that block's header together only works if the server answers in
+/// request order. It need not: the protocol carries request ids for that reason.
+#[test]
+fn anchor_is_refetched_whatever_order_the_server_answers_in() -> anyhow::Result<()> {
+    let (descriptor, spk_hash, spk) = tracked_descriptor()?;
+    let tx = tx_paying(&spk, 50_000);
+    let txid = tx.compute_txid();
+    let (genesis, header_1) = base_headers();
+    let header_2 = block_with_tx(&header_1, txid, 200, 0);
+    // Height 2 is replaced and the chain grows, so the notified header is height 3's — the
+    // replacement block's header has to be fetched before its proof can be verified.
+    let header_2b = block_with_tx(&header_1, txid, 222, 1);
+    let header_3b = block_with_root(&header_2b, TxMerkleNode::all_zeros(), 300, 0);
+
+    let mut state = new_state(Cache::default(), descriptor, genesis);
+    let mut queue = ReqQueue::new();
+    let mut server = Server {
+        headers: vec![genesis, header_1, header_2],
+        spk_hash,
+        txs: vec![(tx, 2)],
+        merkle_proof: (Vec::new(), 0),
+    };
+
+    state.init(&mut queue);
+    let updates = drain_requests(&mut state, &mut queue, &server);
+    assert!(
+        updates.iter().any(|u| u
+            .tx_update
+            .anchors
+            .contains(&(anchor_of(&header_2, 2), txid))),
+        "tx must first be anchored to the original block"
+    );
+
+    server.headers = vec![genesis, header_1, header_2b, header_3b];
+    state.advance(
+        &mut queue,
+        raw_msg(json!({
+            "jsonrpc": "2.0",
+            "method": "blockchain.headers.subscribe",
+            "params": [{ "hex": serialize_hex(&header_3b), "height": 3 }],
+        })),
+    )?;
+    let updates = drain_requests_proofs_first(&mut state, &mut queue, &server);
+
+    assert!(
+        updates.iter().any(|u| u
+            .tx_update
+            .anchors
+            .contains(&(anchor_of(&header_2b, 2), txid))),
+        "the anchor must be refetched even when the proof overtakes the header"
+    );
+    Ok(())
+}
+
+/// A client restored from a persisted checkpoint chain starts with blocks in its chain whose
+/// headers are not in its cache. Resolving an anchor at such a height needs both the header and
+/// the proof, and nothing else will fetch that header — `ChainJob` short-circuits, since the tip
+/// is already correct.
+///
+/// So this is the case where the two halves of the ordering fix are load-bearing: the proof must
+/// not be asked for before the header is cached, and the header response must advance the waiting
+/// job even though the chain itself has nothing to learn from it.
+#[test]
+fn anchor_resolves_when_the_chain_is_restored_without_its_headers() -> anyhow::Result<()> {
+    let (descriptor, spk_hash, spk) = tracked_descriptor()?;
+    let tx = tx_paying(&spk, 50_000);
+    let txid = tx.compute_txid();
+    let (genesis, header_1) = base_headers();
+    let header_2 = block_with_tx(&header_1, txid, 200, 0);
+    let header_3 = block_with_root(&header_2, TxMerkleNode::all_zeros(), 300, 0);
+
+    // The restored chain knows the blocks, the fresh cache knows none of their headers. The tx
+    // is one block below the tip, so the header it needs is not the one `headers.subscribe`
+    // hands back and nothing else fetches it either — `ChainJob` short-circuits, the tip being
+    // already correct.
+    let cp = CheckPoint::new(BlockId {
+        height: 0,
+        hash: genesis.block_hash(),
+    })
+    .insert(BlockId {
+        height: 2,
+        hash: header_2.block_hash(),
+    })
+    .insert(BlockId {
+        height: 3,
+        hash: header_3.block_hash(),
+    });
+    let mut state = new_state_with_cp(Cache::default(), descriptor, cp);
+    let mut queue = ReqQueue::new();
+    let server = Server {
+        headers: vec![genesis, header_1, header_2, header_3],
+        spk_hash,
+        txs: vec![(tx, 2)],
+        merkle_proof: (Vec::new(), 0),
+    };
+
+    state.init(&mut queue);
+    let updates = drain_requests_proofs_first(&mut state, &mut queue, &server);
+
+    assert!(
+        updates.iter().any(|u| u
+            .tx_update
+            .anchors
+            .contains(&(anchor_of(&header_2, 2), txid))),
+        "the anchor must resolve even when the proof overtakes the header it is verified against"
+    );
+    Ok(())
+}
+
 /// The refetch is a script hash notification we raise ourselves, so it must not displace one the
 /// server actually sent. A real notification carries a status at least as new as anything we
 /// could replay from cache; replacing its job would resolve the script against a stale history
@@ -661,6 +806,70 @@ fn a_replayed_job_does_not_displace_one_the_server_started() -> anyhow::Result<(
             .contains(&(anchor_of(&header_2b, 2), txid_a))),
         "and must still refetch the anchor the reorg invalidated"
     );
+    Ok(())
+}
+
+/// A persisted checkpoint chain can be stale at a height below the window [`ChainJob`] rewrites
+/// — an offline reorg, say. Then the block *we* have at that height is one the server does not
+/// have, and `blockchain.block.header` is keyed by height, so no request can ever fetch it.
+///
+/// Withholding the proof until that header is cached must not turn into an endless request loop.
+#[test]
+fn a_header_the_server_does_not_have_does_not_loop() -> anyhow::Result<()> {
+    let (descriptor, spk_hash, spk) = tracked_descriptor()?;
+    let tx = tx_paying(&spk, 50_000);
+    let txid = tx.compute_txid();
+    let (genesis, header_1) = base_headers();
+    // The server's height 2, and the stale one our persisted chain still claims.
+    let server_2 = block_with_tx(&header_1, txid, 200, 0);
+    let stale_2 = block_with_tx(&header_1, txid, 999, 7);
+    assert_ne!(server_2.block_hash(), stale_2.block_hash());
+
+    let mut chain = vec![genesis, header_1, server_2];
+    for height in 3..=30u32 {
+        let prev = *chain.last().expect("non-empty");
+        chain.push(block_with_root(
+            &prev,
+            TxMerkleNode::all_zeros(),
+            1000 + height,
+            0,
+        ));
+    }
+
+    // Tip agrees with the server, so `ChainJob` short-circuits and never rewrites height 2.
+    let cp = CheckPoint::new(BlockId {
+        height: 0,
+        hash: genesis.block_hash(),
+    })
+    .insert(BlockId {
+        height: 2,
+        hash: stale_2.block_hash(),
+    })
+    .insert(BlockId {
+        height: 30,
+        hash: chain[30].block_hash(),
+    });
+    let mut state = new_state_with_cp(Cache::default(), descriptor, cp);
+    let mut queue = ReqQueue::new();
+    let server = Server {
+        headers: chain,
+        spk_hash,
+        txs: vec![(tx, 2)],
+        merkle_proof: (Vec::new(), 0),
+    };
+
+    state.init(&mut queue);
+    let mut served = 0;
+    while let Some(req) = queue.pop_front() {
+        served += 1;
+        assert!(
+            served < 200,
+            "the client must not loop: {served} requests, last was {} {:?}",
+            req.method,
+            req.params
+        );
+        state.advance(&mut queue, response(&req, &server))?;
+    }
     Ok(())
 }
 
