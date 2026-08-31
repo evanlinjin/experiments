@@ -3,11 +3,10 @@ use std::{
     sync::Arc,
 };
 
-use bdk_core::{
-    bitcoin::{self, block::Header, BlockHash, Transaction, Txid},
-    ConfirmationBlockTime,
-};
-use electrum_streaming_client::{request, response, ElectrumScriptHash, ElectrumScriptStatus};
+use bdk_core::bitcoin::{self, BlockHash, Transaction, Txid};
+use electrum_streaming_client::{response, ElectrumScriptHash, ElectrumScriptStatus};
+
+use crate::ProvenAnchor;
 
 /// Everything learned from the server, kept so a reconnect need not ask again.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -21,9 +20,6 @@ pub struct Cache {
     /// would only give the two something to disagree about. Seed it from wallet data instead.
     #[serde(skip)]
     pub tx_cache: TxCache,
-
-    /// This can be removed once we can place `Header`s in `CheckPoint`s.
-    pub headers: HashMap<BlockHash, bitcoin::block::Header>,
 }
 
 /// The transaction data a job consults before asking the server for anything.
@@ -49,38 +45,7 @@ pub struct TxCache {
     /// Written as a sequence: a `(Txid, BlockHash)` key is not a string, so a map would be
     /// unserializable in JSON and every other format that requires string keys.
     #[serde(with = "persist::anchors_as_seq")]
-    pub anchors: HashMap<(Txid, BlockHash), ConfirmationBlockTime>,
-}
-
-impl Cache {
-    pub fn resolve_headers_query(
-        &mut self,
-        req: request::Headers,
-        resp: response::HeadersResp,
-    ) -> impl Iterator<Item = (u32, Header)> {
-        self.headers
-            .extend(resp.headers.iter().map(|&h| (h.block_hash(), h)));
-        (req.start_height..).zip(resp.headers)
-    }
-
-    pub fn resolve_history_query(
-        &mut self,
-        req: request::GetHistory,
-        resp: Vec<response::Tx>,
-    ) -> Option<ElectrumScriptStatus> {
-        let status_opt = ElectrumScriptStatus::from_history(&resp);
-        if let Some(status) = status_opt {
-            self.tx_cache
-                .spk_txids
-                .entry(req.script_hash)
-                .or_default()
-                .extend(resp.iter().map(|tx| tx.txid()));
-            self.subscriptions.insert_spk(req.script_hash, status, resp);
-        } else {
-            self.subscriptions.remove_spk(req.script_hash);
-        }
-        status_opt
-    }
+    pub anchors: HashMap<(Txid, BlockHash), ProvenAnchor>,
 }
 
 /// The last history the server reported for each script hash.
@@ -280,7 +245,7 @@ mod persist {
         use super::*;
         use serde::{Deserialize, Deserializer, Serializer};
 
-        type Anchors = HashMap<(Txid, BlockHash), ConfirmationBlockTime>;
+        type Anchors = HashMap<(Txid, BlockHash), ProvenAnchor>;
 
         pub fn serialize<S: Serializer>(
             anchors: &Anchors,
@@ -297,7 +262,7 @@ mod persist {
             deserializer: D,
         ) -> Result<Anchors, D::Error> {
             Ok(
-                Vec::<(Txid, BlockHash, ConfirmationBlockTime)>::deserialize(deserializer)?
+                Vec::<(Txid, BlockHash, ProvenAnchor)>::deserialize(deserializer)?
                     .into_iter()
                     .map(|(txid, block_hash, anchor)| ((txid, block_hash), anchor))
                     .collect(),
@@ -392,9 +357,17 @@ mod test {
     fn tx_cache_round_trips_through_json() {
         let anchor = (txid(1), bitcoin::BlockHash::from_byte_array([2; 32]));
         let mut before = TxCache::default();
-        before
-            .anchors
-            .insert(anchor, ConfirmationBlockTime::default());
+        before.anchors.insert(
+            anchor,
+            ProvenAnchor {
+                block_id: bdk_core::BlockId {
+                    height: 2,
+                    hash: bitcoin::BlockHash::from_byte_array([2; 32]),
+                },
+                pos: 0,
+                merkle: Vec::new(),
+            },
+        );
 
         let json = serde_json::to_string(&before).expect("must serialize");
         let after: TxCache = serde_json::from_str(&json).expect("must deserialize");

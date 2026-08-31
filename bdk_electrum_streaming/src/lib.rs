@@ -2,10 +2,13 @@
 
 use std::collections::BTreeSet;
 
-use bdk_core::{bitcoin::Txid, spk_client::FullScanResponse};
+use bdk_core::{
+    bitcoin::{block::Header, Txid},
+    spk_client::FullScanResponse,
+};
+/// Re-export.
 pub use electrum_streaming_client;
 
-use bdk_core::ConfirmationBlockTime;
 mod cache;
 pub use cache::*;
 mod state;
@@ -26,9 +29,18 @@ mod blocking_client;
 pub use blocking_client::*;
 mod confirmation_job;
 pub use confirmation_job::*;
+mod header_chain;
+pub use header_chain::*;
+mod anchor;
+pub use anchor::*;
 
-pub type Update<K> = FullScanResponse<K, ConfirmationBlockTime>;
-pub type AnchorUpdate = BTreeSet<(ConfirmationBlockTime, Txid)>;
+/// What a sync produces.
+///
+/// Anchors are [`ProvenAnchor`]s — merkle-proved against a header in the verified
+/// [`HeaderChain`] — and the chain update carries full [`Header`]s, so a block's time is read
+/// from there rather than copied onto every anchor.
+pub type Update<K> = FullScanResponse<K, ProvenAnchor, Header>;
+pub type AnchorUpdate = BTreeSet<(ProvenAnchor, Txid)>;
 
 pub type BlockingClientAction<K> = ClientAction<K, Box<BlockingPendingRequest>>;
 pub type AsyncClientAction<K> = ClientAction<K, AsyncPendingRequest>;

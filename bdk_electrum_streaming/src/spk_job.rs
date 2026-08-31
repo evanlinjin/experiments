@@ -5,11 +5,11 @@ use std::{
 
 use bdk_core::{
     bitcoin::{OutPoint, Txid},
-    ConfirmationBlockTime, TxUpdate,
+    TxUpdate,
 };
 use electrum_streaming_client::{request, response, ElectrumScriptHash, ElectrumScriptStatus};
 
-use crate::{req::ReqQueuer, Cache};
+use crate::{req::ReqQueuer, Cache, ProvenAnchor};
 
 /// Where a [`SpkJob`] has got to.
 ///
@@ -62,7 +62,7 @@ pub enum SpkProgress {
     Blocked,
     /// Everything asked for has arrived. Carries what the job gathered, leaving it empty, so a
     /// job polled again after finishing contributes nothing a second time.
-    Done(TxUpdate<ConfirmationBlockTime>),
+    Done(TxUpdate<ProvenAnchor>),
 }
 
 /// The job to perform once we receive a script status notification.
@@ -80,7 +80,9 @@ pub struct SpkJob {
     pub spk_hash: ElectrumScriptHash,
 
     stage: SpkStage,
-    tx_update: TxUpdate<ConfirmationBlockTime>,
+
+    /// Staged tx update.
+    tx_update: TxUpdate<ProvenAnchor>,
 }
 
 impl SpkJob {

@@ -1,20 +1,24 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use bdk_core::{
-    bitcoin::{block::Header, BlockHash, Txid},
+    bitcoin::{block::Header, Txid},
     BlockId, CheckPoint,
 };
 use electrum_streaming_client::{request, ElectrumScriptStatus};
 
-use crate::{AnchorUpdate, Cache, ReqQueuer};
+use crate::{AnchorUpdate, Cache, HeaderChain, ReqQueuer};
 
 /// How far along [`ConfirmationJob`] is.
 #[derive(Debug, Default, Clone)]
 pub enum ConfirmationStage {
     #[default]
     Init,
-    FetchBlocks {
-        to_fetch: BTreeSet<u32>,
+    /// Waiting on contiguous runs of headers, each `start -> end` inclusive.
+    ///
+    /// Runs, not scattered heights: [`HeaderChain`] verifies each header against the one below
+    /// it, so a header is only worth having as part of an unbroken run reaching the chain.
+    FetchHeaders {
+        runs: BTreeMap<u32, u32>,
     },
     FetchAnchors {
         to_fetch: BTreeSet<(u32, Txid)>,
@@ -26,29 +30,12 @@ pub enum ConfirmationStage {
     Done,
     /// Nothing left to do until the target tip or the statuses move.
     ///
-    /// The update was taken, or the job was abandoned on inconsistent headers. Distinct from
-    /// [`Done`], which still owes one — a single stage for both would hand the same update over
-    /// twice, and hand one over for an abandoned job.
+    /// The update was taken, or the job was abandoned on a chain the server has left. Distinct
+    /// from [`Done`], which still owes one — a single stage for both would hand the same update
+    /// over twice, and hand one over for an abandoned job.
     ///
     /// [`Done`]: Self::Done
     Idle,
-}
-
-impl ConfirmationStage {
-    pub fn fetch_anchors(
-        cache: &Cache,
-        spk_statuses: impl IntoIterator<Item = ElectrumScriptStatus>,
-    ) -> Self {
-        let to_fetch = cache
-            .subscriptions
-            .spk_histories(spk_statuses)
-            .filter_map(|tx| {
-                let conf_height = tx.confirmation_height()?.to_consensus_u32();
-                Some((conf_height, tx.txid()))
-            })
-            .collect();
-        Self::FetchAnchors { to_fetch }
-    }
 }
 
 /// What one [`ConfirmationJob::poll`] achieved.
@@ -58,12 +45,13 @@ impl ConfirmationStage {
 ///
 /// [`Update`]: crate::Update
 /// [`SpkJob`]: crate::SpkJob
+#[derive(Debug)]
 pub enum ConfirmationProgress {
-    /// The local chain moved.
-    CheckPointUpdate {
-        cp: CheckPoint,
-        /// If there are any evictions, we need to check which spks need reanchoring
-        evicted: Vec<u32>,
+    /// The verified chain moved.
+    ChainUpdate {
+        cp: CheckPoint<Header>,
+        /// Whether the run displaced blocks we already had.
+        reorged: bool,
     },
     /// Every anchor the job set out to prove, resolved against one chain.
     AnchorUpdate(AnchorUpdate),
@@ -75,7 +63,7 @@ pub enum ConfirmationProgress {
     Done,
 }
 
-/// The single job that moves the local chain and anchors what the scripts found.
+/// The single job that moves the verified chain and anchors what the scripts found.
 ///
 /// Runs once every [`SpkJob`] has its history — the heights those histories name are all it
 /// reads, so a script still downloading its own transactions has already told it every block it
@@ -93,16 +81,28 @@ pub struct ConfirmationJob {
     target_header: Header,
     target_statuses: BTreeSet<ElectrumScriptStatus>,
 
-    /// Always contains the target header; the notification carries it, so it is never fetched.
+    /// Headers as the server gave them, before [`HeaderChain`] has verified any of them.
+    ///
+    /// Kept apart from the chain deliberately: nothing here has been checked, and a header only
+    /// becomes part of the chain once its whole run passes. Always contains the target header;
+    /// the notification carries it, so it is never fetched.
     fetched_headers: BTreeMap<u32, Header>,
     stage: ConfirmationStage,
 }
 
 impl ConfirmationJob {
-    /// An assumption of the max reorg depth.
-    const MAX_REORG_DEPTH: u32 = 21;
+    /// How far below the tip to re-download so a reorg is noticed.
+    ///
+    /// A reorg deeper than this is not walked back to; the run will not link to what we hold and
+    /// the connection errors out rather than quietly keeping a chain the server has left. The
+    /// verified chain is what stops a deep fork being adopted wrongly — it still has to out-work
+    /// what it replaces — but noticing one at all stops here.
+    ///
+    /// ponytail: fixed 21-block window, downloading every header and verifying work from genesis
+    /// removes the need for a window at all.
+    const REORG_WINDOW: u32 = 21;
 
-    /// Number of blocks before difficulty adjustment.
+    /// Most headers a server will hand over in one `blockchain.block.headers`.
     const MAX_BATCH_HEADERS_REQUEST: u32 = 2016;
 
     pub fn new(target_height: u32, target_header: Header) -> Self {
@@ -196,162 +196,107 @@ impl ConfirmationJob {
         self.fetched_headers.extend(blocks);
     }
 
-    /// Polls the job as far as it will go.
+    /// Take one step towards a verified chain that covers everything worth anchoring.
     pub fn poll(
         &mut self,
         queuer: &mut ReqQueuer,
         cache: &Cache,
-        cp: &CheckPoint,
+        chain: &mut HeaderChain,
     ) -> anyhow::Result<ConfirmationProgress> {
         match core::mem::take(&mut self.stage) {
             ConfirmationStage::Init => {
-                let to_fetch = self.missing_heights(cache, cp);
-
-                // NOTE: This logic is not perfect and we may duplicate requests due to spk history
-                // changes between calls to `ConfirmationJob::poll`. Let's not fix it here as we will
-                // change this crate to download all headers and verify PoW later so there will be
-                // no need for this logic.
-                let mut start_height_opt = Option::<u32>::None;
-                let mut iter = to_fetch
-                    .iter()
-                    .copied()
-                    .filter(|h| !self.fetched_headers.contains_key(h))
-                    .peekable();
-                while let Some(h) = iter.next() {
-                    if start_height_opt.is_none() {
-                        start_height_opt = Some(h);
-                    }
-                    let start_height = start_height_opt.expect("must exist");
-                    if iter.peek().is_some_and(|&next_h| {
-                        next_h <= h.saturating_add(1)
-                            && next_h.saturating_sub(start_height) < Self::MAX_BATCH_HEADERS_REQUEST
-                    }) {
-                        continue;
-                    }
-                    queuer.enqueue(request::Headers {
-                        start_height,
-                        count: (h + 1).saturating_sub(start_height) as usize,
-                    });
-                    start_height_opt = None;
+                let runs = self.required_runs(cache, chain);
+                for (&start, &end) in &runs {
+                    self.queue_gaps(queuer, start, end);
                 }
-
-                self.stage = ConfirmationStage::FetchBlocks { to_fetch };
+                self.stage = ConfirmationStage::FetchHeaders { runs };
                 Ok(ConfirmationProgress::Continue)
             }
-            ConfirmationStage::FetchBlocks { to_fetch } => {
-                if !to_fetch
-                    .iter()
-                    .all(|h| self.fetched_headers.contains_key(h))
-                {
-                    self.stage = ConfirmationStage::FetchBlocks { to_fetch };
+            ConfirmationStage::FetchHeaders { runs } => {
+                let complete = runs.iter().all(|(&start, &end)| {
+                    (start..=end).all(|h| self.fetched_headers.contains_key(&h))
+                });
+                if !complete {
+                    self.stage = ConfirmationStage::FetchHeaders { runs };
                     return Ok(ConfirmationProgress::Blocked);
                 }
 
-                // Headers that disagree mean a reorg landed between fetches; wait to be told.
-                let mut iter = self
-                    .fetched_headers
-                    .iter()
-                    .rev()
-                    .take((Self::MAX_REORG_DEPTH + 1) as usize)
-                    .peekable();
-                while let Some((&height, header)) = iter.next() {
-                    if let Some(&(&prev_height, prev_header)) = iter.peek() {
-                        if prev_height + 1 == height
-                            && prev_header.block_hash() != header.prev_blockhash
-                        {
-                            tracing::info!(
-                                height,
-                                prev_blockhash = header.prev_blockhash.to_string(),
-                                actual_prev_blockhash = prev_header.block_hash().to_string(),
-                                "Fetched headers are inconsistent. Reorg? Abandoning."
-                            );
-                            self.reset_headers();
-                            self.stage = ConfirmationStage::Idle;
-                            return Ok(ConfirmationProgress::Blocked);
-                        }
+                // A run reaching the target must put the announced block at the announced
+                // height. Anything else is a chain we were never told about — the server has
+                // moved on, and moving is what makes it announce again, so abandon rather than
+                // retry.
+                if let Some(header) = self.fetched_headers.get(&self.target_height) {
+                    if header.block_hash() != self.target_header.block_hash() {
+                        tracing::info!(
+                            height = self.target_height,
+                            announced = self.target_header.block_hash().to_string(),
+                            received = header.block_hash().to_string(),
+                            "Headers describe a chain other than the one announced. Abandoning.",
+                        );
+                        self.reset_headers();
+                        self.stage = ConfirmationStage::Idle;
+                        return Ok(ConfirmationProgress::Blocked);
                     }
                 }
 
-                // Everything we hold is spliced in from the lowest header up. The target
-                // header is always one of them, so there is always a run to splice.
-                let start = self
-                    .fetched_headers
-                    .keys()
-                    .next()
-                    .copied()
-                    .unwrap_or(self.target_height);
-                let mut extension = BTreeMap::<u32, BlockHash>::new();
-                let mut base_opt = Option::<CheckPoint>::None;
-                for cp in cp.iter() {
-                    if cp.height() < start {
-                        base_opt = Some(cp);
-                        break;
+                let was = chain.tip().map(|cp| (cp.height(), cp.hash()));
+                // Ascending, so a backfill run lands before the run that extends the tip — which
+                // is the order `HeaderChain::apply` needs, since backfill has to reach the base
+                // the other run may then move.
+                for (&start, &end) in &runs {
+                    let headers = (start..=end)
+                        .map(|h| self.fetched_headers[&h])
+                        .collect::<Vec<_>>();
+                    chain.apply(start, headers)?;
+                }
+                let cp = match chain.tip() {
+                    Some(cp) => cp.clone(),
+                    None => {
+                        self.stage = ConfirmationStage::Done;
+                        return Ok(ConfirmationProgress::Done);
                     }
-                    extension.insert(cp.height(), cp.hash());
-                }
-                let new_blocks = self
-                    .fetched_headers
-                    .iter()
-                    .map(|(&height, header)| (height, header.block_hash()));
-                extension.extend(new_blocks);
-                if extension.get(&0).is_some_and(|&genesis_hash| {
-                    genesis_hash != cp.get(0).expect("genesis must exist").hash()
-                }) {
-                    return Err(anyhow::anyhow!("server attempted to replace genesis"));
-                }
-                let extension = extension
-                    .into_iter()
-                    .map(|(height, hash)| BlockId { height, hash });
-                let cp_update = match base_opt {
-                    Some(base) => base.extend(extension).expect("must not error"),
-                    None => CheckPoint::from_block_ids(extension).expect("must not error"),
                 };
+                let reorged =
+                    was.is_some_and(|(height, hash)| chain.block_hash(height) != Some(hash));
 
-                let mut evicted_heights = Vec::<u32>::new();
-                for cp in cp.iter() {
-                    if cp_update
-                        .get(cp.height())
-                        .is_some_and(|cp_update| cp_update == cp)
-                    {
-                        break;
-                    }
-                    evicted_heights.push(cp.height());
-                }
-
-                self.stage =
-                    ConfirmationStage::fetch_anchors(cache, self.target_statuses.iter().copied());
-                Ok(ConfirmationProgress::CheckPointUpdate {
-                    cp: cp_update,
-                    evicted: evicted_heights,
-                })
+                self.stage = self.anchor_stage(cache);
+                Ok(ConfirmationProgress::ChainUpdate { cp, reorged })
             }
             ConfirmationStage::FetchAnchors { to_fetch } => {
                 let mut resolved = AnchorUpdate::new();
                 let mut all_resolved = true;
+                let mut needs_backfill = false;
                 for &(height, txid) in &to_fetch {
-                    let header = match self.fetched_headers.get(&height) {
+                    let header = match chain.header(height) {
                         Some(header) => header,
-                        // Not expected to fire: a changed history moves the status set, which
-                        // sends the job back to `Init` to plan this height. Release goes back and
-                        // fetches rather than assume which block this height holds.
+                        // Below where the chain starts: it has to grow downwards before this
+                        // height can be checked at all, which `Init` plans a run for.
+                        None if height < chain.base_height() => {
+                            needs_backfill = true;
+                            continue;
+                        }
+                        // Above the verified tip. There is nothing to plan: a run only reaches
+                        // the tip the server has announced, and this height is beyond it. The
+                        // announcement that carries it is what re-polls this — going back to
+                        // `Init` here would replan the same unreachable run forever.
                         None => {
-                            debug_assert!(
-                                false,
-                                "history named height {height}, which the header pass did not cover"
-                            );
-                            self.stage = ConfirmationStage::Init;
-                            return Ok(ConfirmationProgress::Continue);
+                            all_resolved = false;
+                            continue;
                         }
                     };
                     match cache.tx_cache.anchors.get(&(txid, header.block_hash())) {
-                        Some(&anchor) => {
-                            resolved.insert((anchor, txid));
+                        Some(anchor) => {
+                            resolved.insert((anchor.clone(), txid));
                         }
                         None => {
                             all_resolved = false;
                             queuer.enqueue(request::GetTxMerkle { txid, height });
                         }
                     }
+                }
+                if needs_backfill {
+                    self.stage = ConfirmationStage::Init;
+                    return Ok(ConfirmationProgress::Continue);
                 }
                 if !all_resolved {
                     // The whole set is kept, not just what is left: each pass resolves all of it
@@ -376,60 +321,74 @@ impl ConfirmationJob {
         }
     }
 
-    /// The heights we still need from the server.
-    ///
-    /// Heights whose header is already reachable from `cp` and `cache` are absorbed into
-    /// `fetched_headers` on the way through, so what comes back is only the gap.
-    fn missing_heights(&mut self, cache: &Cache, cp: &CheckPoint) -> BTreeSet<u32> {
-        let mut to_fetch = BTreeSet::<u32>::new();
+    /// The heights carrying a transaction we have to anchor.
+    fn anchor_heights(&self, cache: &Cache) -> BTreeSet<(u32, Txid)> {
+        cache
+            .subscriptions
+            .spk_histories(self.target_statuses.iter().copied())
+            .filter_map(|tx| Some((tx.confirmation_height()?.to_consensus_u32(), tx.txid())))
+            .collect()
+    }
 
-        // Heights the chain itself has to be checked at. Settled first, because a height in
-        // here is one whose block may be about to be replaced — absorbing it from `cp` below
-        // would answer the question with the very block under suspicion.
-        if self.target_tip() != cp.block_id() {
-            let only_extends_tip = self
-                .target_height
-                .checked_sub(1)
-                .map(|height| {
-                    let hash = self.target_header.prev_blockhash;
-                    BlockId { height, hash }
-                })
-                .is_some_and(|prev| cp.block_id() == prev);
-            if only_extends_tip {
-                to_fetch.extend(cp.height() + 1..=self.target_height);
-            } else {
-                // Assumes no reorg is deeper than `MAX_REORG_DEPTH`.
-                let old_tip = cp.height();
-                let new_tip = self.target_height;
-                to_fetch.extend(old_tip.saturating_sub(Self::MAX_REORG_DEPTH)..=old_tip);
-                to_fetch.extend(new_tip.saturating_sub(Self::MAX_REORG_DEPTH)..=new_tip);
+    fn anchor_stage(&self, cache: &Cache) -> ConfirmationStage {
+        ConfirmationStage::FetchAnchors {
+            to_fetch: self.anchor_heights(cache),
+        }
+    }
+
+    /// The contiguous runs of headers the chain needs before every anchor can be checked.
+    ///
+    /// At most two: one up to the announced tip, and one backfilling history below where the
+    /// chain currently starts. Both are runs rather than the individual heights that want them,
+    /// because a header is only verifiable as part of a chain reaching a block we trust.
+    fn required_runs(&self, cache: &Cache, chain: &HeaderChain) -> BTreeMap<u32, u32> {
+        let mut runs = BTreeMap::new();
+
+        let base = chain.base_height();
+        let start = match chain.tip_height() {
+            // Re-download a window below the tip, so a reorg within it is seen at all. Never
+            // below the base: the run has to stay contiguous with what is already verified.
+            Some(tip) => base.max(tip.saturating_sub(Self::REORG_WINDOW)),
+            None => base,
+        };
+        if start <= self.target_height {
+            runs.insert(start, self.target_height);
+        }
+
+        // A transaction confirmed below where the chain starts cannot be checked against it, so
+        // the chain has to grow downwards to a block we already trust.
+        if let Some(&(lowest, _)) = self.anchor_heights(cache).iter().next() {
+            if lowest < base {
+                let from = chain.trusted_at_or_below(lowest).unwrap_or(0) + 1;
+                if from < base {
+                    runs.insert(from, base - 1);
+                }
             }
         }
 
-        // Heights that carry a transaction to anchor. One the chain already places, and whose
-        // header we have, needs no request.
-        let anchor_heights = self
-            .target_statuses
-            .iter()
-            .filter_map(|&spk_status| {
-                let heights = cache
-                    .subscriptions
-                    .spk_history(spk_status)?
-                    .iter()
-                    .filter_map(|tx| Some(tx.confirmation_height()?.to_consensus_u32()));
-                Some(heights)
-            })
-            .flatten()
-            .collect::<BTreeSet<u32>>();
-        for height in anchor_heights {
-            if !to_fetch.insert(height) {
+        runs
+    }
+
+    /// Queue whatever part of `start..=end` we do not already hold, in server-sized batches.
+    fn queue_gaps(&self, queuer: &mut ReqQueuer, start: u32, end: u32) {
+        let mut height = start;
+        while height <= end {
+            if self.fetched_headers.contains_key(&height) {
+                height += 1;
                 continue;
             }
-            if let Some(&header) = cp.get(height).and_then(|cp| cache.headers.get(&cp.hash())) {
-                self.fetched_headers.insert(height, header);
+            let mut count = 0;
+            while height + count <= end
+                && count < Self::MAX_BATCH_HEADERS_REQUEST
+                && !self.fetched_headers.contains_key(&(height + count))
+            {
+                count += 1;
             }
+            queuer.enqueue(request::Headers {
+                start_height: height,
+                count: count as usize,
+            });
+            height += count;
         }
-
-        to_fetch
     }
 }

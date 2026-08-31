@@ -9,13 +9,13 @@ use bdk_core::{
         transaction, Amount, CompactTarget, Network, OutPoint, ScriptBuf, Sequence, Transaction,
         TxIn, TxMerkleNode, TxOut, Txid, Witness,
     },
-    BlockId, CheckPoint, ConfirmationBlockTime,
+    BlockId,
 };
 use bdk_electrum_streaming::{
     electrum_streaming_client::{
         response, ElectrumScriptHash, ElectrumScriptStatus, RawNotificationOrResponse, RawRequest,
     },
-    BlockingState, Cache, DerivedSpkTracker, ReqCoord, ReqQueue, Update,
+    BlockingState, Cache, DerivedSpkTracker, HeaderChain, ProvenAnchor, ReqCoord, ReqQueue, Update,
 };
 use miniscript::{Descriptor, DescriptorPublicKey};
 use serde_json::json;
@@ -152,6 +152,21 @@ fn drain_requests(
     updates
 }
 
+/// Drain like [`drain_requests`], but hand back the first error rather than panicking on it.
+fn drain_requests_fallible(
+    state: &mut BlockingState,
+    queue: &mut ReqQueue,
+    server: &Server,
+) -> anyhow::Result<Vec<Update<&'static str>>> {
+    let mut updates = Vec::new();
+    while let Some(req) = queue.pop_front() {
+        if let Some(update) = state.poll(queue, response(&req, server))? {
+            updates.push(update);
+        }
+    }
+    Ok(updates)
+}
+
 /// Drain like [`drain_requests`], but answer every merkle proof in the queue ahead of everything
 /// else in each round.
 ///
@@ -222,17 +237,28 @@ fn tx_paying(spk: &ScriptBuf, sats: u64) -> Transaction {
     }
 }
 
+/// Grind `nonce` upwards until the header actually clears its own target.
+///
+/// Regtest's target is easy but not free: a little under half of all nonces miss it, and the
+/// header chain checks proof-of-work for real.
+fn mine(mut header: block::Header) -> block::Header {
+    while header.validate_pow(header.target()).is_err() {
+        header.nonce = header.nonce.wrapping_add(1);
+    }
+    header
+}
+
 /// The regtest genesis block and an empty block on top of it.
 fn base_headers() -> (block::Header, block::Header) {
     let genesis = constants::genesis_block(Network::Regtest).header;
-    let header_1 = block::Header {
+    let header_1 = mine(block::Header {
         version: block::Version::ONE,
         prev_blockhash: genesis.block_hash(),
         merkle_root: TxMerkleNode::all_zeros(),
         time: 100,
         bits: CompactTarget::from_consensus(0x207fffff),
         nonce: 0,
-    };
+    });
     (genesis, header_1)
 }
 
@@ -243,14 +269,14 @@ fn block_with_root(
     time: u32,
     nonce: u32,
 ) -> block::Header {
-    block::Header {
+    mine(block::Header {
         version: block::Version::ONE,
         prev_blockhash: prev.block_hash(),
         merkle_root,
         time,
         bits: CompactTarget::from_consensus(0x207fffff),
         nonce,
-    }
+    })
 }
 
 /// A block whose only transaction is `txid`, so that its merkle root is the txid itself.
@@ -258,39 +284,42 @@ fn block_with_tx(prev: &block::Header, txid: Txid, time: u32, nonce: u32) -> blo
     block_with_root(prev, Txid::to_raw_hash(txid).into(), time, nonce)
 }
 
-fn new_state(
-    cache: Cache,
-    descriptor: Descriptor<DescriptorPublicKey>,
-    genesis: block::Header,
-) -> BlockingState {
-    new_state_with_cp(
-        cache,
-        descriptor,
-        CheckPoint::new(BlockId {
-            height: 0,
-            hash: genesis.block_hash(),
-        }),
-    )
+/// A state that trusts nothing but genesis, so everything above it has to be verified.
+fn new_state(cache: Cache, descriptor: Descriptor<DescriptorPublicKey>) -> BlockingState {
+    new_state_trusting(cache, descriptor, [])
 }
 
-fn new_state_with_cp(
+fn new_state_trusting(
     cache: Cache,
     descriptor: Descriptor<DescriptorPublicKey>,
-    cp: CheckPoint,
+    trusted: impl IntoIterator<Item = (u32, block::Header)>,
 ) -> BlockingState {
     let mut spk_tracker = DerivedSpkTracker::new(0);
     spk_tracker.insert_descriptor("external", descriptor, 0);
-    BlockingState::new(ReqCoord::default(), cache, spk_tracker, cp)
+    let chain = HeaderChain::new(Network::Regtest, trusted).expect("must build header chain");
+    BlockingState::new(ReqCoord::default(), cache, spk_tracker, chain)
 }
 
-/// The anchor a tx confirmed in `header` at `height` must be given.
-fn anchor_of(header: &block::Header, height: u32) -> ConfirmationBlockTime {
-    ConfirmationBlockTime {
+/// The anchor a tx confirmed in `header` at `height` must be given, for a server answering with
+/// the empty proof that a single-transaction block has.
+fn anchor_of(header: &block::Header, height: u32) -> ProvenAnchor {
+    anchor_proved_by(header, height, Vec::new(), 0)
+}
+
+/// The same, for a server answering with a real merkle branch.
+fn anchor_proved_by(
+    header: &block::Header,
+    height: u32,
+    merkle: Vec<sha256d::Hash>,
+    pos: usize,
+) -> ProvenAnchor {
+    ProvenAnchor {
         block_id: BlockId {
             height,
             hash: header.block_hash(),
         },
-        confirmation_time: header.time as u64,
+        pos,
+        merkle,
     }
 }
 
@@ -310,7 +339,7 @@ fn anchor_above_local_tip_is_deferred_until_tip_catches_up() -> anyhow::Result<(
     let mut cache = Cache::default();
     cache.tx_cache.txs.insert(txid, Arc::new(tx.clone()));
 
-    let mut state = new_state(cache, descriptor, genesis);
+    let mut state = new_state(cache, descriptor);
     let mut queue = ReqQueue::new();
     let mut server = Server {
         headers: vec![genesis, header_1],
@@ -373,15 +402,11 @@ fn descriptor_inserted_mid_connection_is_subscribed() -> anyhow::Result<()> {
     let descriptor = Descriptor::<DescriptorPublicKey>::from_str(&format!("wpkh({XPUB}/0/*)"))?;
     let spk_hash = ElectrumScriptHash::new(descriptor.at_derivation_index(0)?.script_pubkey());
 
-    let genesis = constants::genesis_block(Network::Regtest).header;
     let mut state = BlockingState::new(
         ReqCoord::default(),
         Cache::default(),
         DerivedSpkTracker::new(0),
-        CheckPoint::new(BlockId {
-            height: 0,
-            hash: genesis.block_hash(),
-        }),
+        HeaderChain::new(Network::Regtest, [])?,
     );
 
     let mut queue = ReqQueue::new();
@@ -422,10 +447,7 @@ fn last_active_index_is_index_of_active_spk() -> anyhow::Result<()> {
         ReqCoord::default(),
         Cache::default(),
         spk_tracker,
-        CheckPoint::new(BlockId {
-            height: 0,
-            hash: genesis.block_hash(),
-        }),
+        HeaderChain::new(Network::Regtest, []).expect("must build header chain"),
     );
     let mut queue = ReqQueue::new();
     let server = Server {
@@ -480,10 +502,7 @@ fn last_active_index_is_highest_regardless_of_notification_order() -> anyhow::Re
         ReqCoord::default(),
         Cache::default(),
         spk_tracker,
-        CheckPoint::new(BlockId {
-            height: 0,
-            hash: genesis.block_hash(),
-        }),
+        HeaderChain::new(Network::Regtest, []).expect("must build header chain"),
     );
     let mut queue = ReqQueue::new();
     let mut server = Server {
@@ -550,14 +569,10 @@ fn anchor_is_refetched_when_tx_moves_to_another_block_of_same_height() -> anyhow
     let header_2 = block_with_tx(&header_1, txid, 200, 0);
     // The block that replaces height 2 contains the tx too, hence the identical script status.
     let header_2b = block_with_tx(&header_1, txid, 222, 1);
-    let header_3b = block::Header {
-        prev_blockhash: header_2b.block_hash(),
-        time: 300,
-        ..header_1
-    };
+    let header_3b = block_with_root(&header_2b, TxMerkleNode::all_zeros(), 300, 0);
     assert_ne!(header_2.block_hash(), header_2b.block_hash());
 
-    let mut state = new_state(Cache::default(), descriptor, genesis);
+    let mut state = new_state(Cache::default(), descriptor);
     let mut queue = ReqQueue::new();
     let mut server = Server {
         headers: vec![genesis, header_1, header_2],
@@ -626,7 +641,7 @@ fn merkle_proof_predating_a_reorg_is_not_taken_as_a_failed_anchor() -> anyhow::R
     let header_2b = block_with_root(&header_1, proof_2b.expected_merkle_root(txid), 222, 1);
     let header_3b = block_with_root(&header_2b, TxMerkleNode::all_zeros(), 300, 0);
 
-    let mut state = new_state(Cache::default(), descriptor, genesis);
+    let mut state = new_state(Cache::default(), descriptor);
     let mut queue = ReqQueue::new();
     let mut server = Server {
         headers: vec![genesis, header_1, header_2],
@@ -673,10 +688,13 @@ fn merkle_proof_predating_a_reorg_is_not_taken_as_a_failed_anchor() -> anyhow::R
 
     let anchors = updates
         .iter()
-        .flat_map(|u| u.tx_update.anchors.iter().copied())
+        .flat_map(|u| u.tx_update.anchors.iter().cloned())
         .collect::<Vec<_>>();
     assert!(
-        anchors.contains(&(anchor_of(&header_2b, 2), txid)),
+        anchors.contains(&(
+            anchor_proved_by(&header_2b, 2, proof_2b.merkle.clone(), proof_2b.pos),
+            txid
+        )),
         "the anchor must be refetched rather than written off from a proof of the evicted block"
     );
     Ok(())
@@ -700,7 +718,7 @@ fn anchors_staged_before_a_reorg_are_not_emitted_after_it() -> anyhow::Result<()
     let header_3b = block_with_tx(&header_2b, txid_b, 333, 1);
     let header_4b = block_with_root(&header_3b, TxMerkleNode::all_zeros(), 400, 0);
 
-    let mut state = new_state(Cache::default(), descriptor, genesis);
+    let mut state = new_state(Cache::default(), descriptor);
     let mut queue = ReqQueue::new();
     let mut server = Server {
         headers: vec![genesis, header_1, header_2, header_3],
@@ -742,7 +760,7 @@ fn anchors_staged_before_a_reorg_are_not_emitted_after_it() -> anyhow::Result<()
 
     let anchors = updates
         .iter()
-        .flat_map(|u| u.tx_update.anchors.iter().copied())
+        .flat_map(|u| u.tx_update.anchors.iter().cloned())
         .collect::<Vec<_>>();
     for evicted in [
         (anchor_of(&header_2, 2), txid_a),
@@ -780,7 +798,7 @@ fn a_tx_unconfirmed_by_a_reorg_does_not_error_the_connection() -> anyhow::Result
     let header_2b = block_with_root(&header_1, TxMerkleNode::all_zeros(), 222, 1);
     let header_3b = block_with_root(&header_2b, TxMerkleNode::all_zeros(), 333, 0);
 
-    let mut state = new_state(Cache::default(), descriptor, genesis);
+    let mut state = new_state(Cache::default(), descriptor);
     let mut queue = ReqQueue::new();
     let mut server = Server {
         headers: vec![genesis, header_1, header_2],
@@ -834,7 +852,7 @@ fn merkle_error_predating_a_reorg_is_not_taken_as_a_failed_anchor() -> anyhow::R
     let header_2b = block_with_tx(&header_1, txid, 222, 1);
     let header_3b = block_with_root(&header_2b, TxMerkleNode::all_zeros(), 300, 0);
 
-    let mut state = new_state(Cache::default(), descriptor, genesis);
+    let mut state = new_state(Cache::default(), descriptor);
     let mut queue = ReqQueue::new();
     let mut server = Server {
         headers: vec![genesis, header_1, header_2],
@@ -910,7 +928,7 @@ fn a_merkle_error_is_not_recorded_as_a_failed_anchor() -> anyhow::Result<()> {
     let header_2b = block_with_tx(&header_1, txid, 222, 1);
     let header_3b = block_with_root(&header_2b, TxMerkleNode::all_zeros(), 300, 0);
 
-    let mut state = new_state(Cache::default(), descriptor, genesis);
+    let mut state = new_state(Cache::default(), descriptor);
     let mut queue = ReqQueue::new();
     let mut server = Server {
         headers: vec![genesis, header_1, header_2],
@@ -970,12 +988,16 @@ fn a_merkle_error_is_not_recorded_as_a_failed_anchor() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Issue #12's literal case: a reorg to a block of the *same* height, with no growth at all.
-/// The tip announcement carries the replacement header, so this is the one reorg shape that can
-/// be applied without fetching a single block — and every other reorg test here also grows the
-/// chain, which takes a different path.
+/// A fork of the same height, carrying no more work than the chain it would replace, must be
+/// refused — and refusing it must leave the anchor we already have intact.
+///
+/// This is what a full node does: an equal-work fork loses to the chain already in hand. The
+/// server having moved to it is not evidence, since a server is exactly what the verified chain
+/// exists to stop trusting. When the fork does out-work us, the tip announcement that says so is
+/// what triggers the switch, and
+/// [`anchor_is_refetched_when_tx_moves_to_another_block_of_same_height`] covers that.
 #[test]
-fn anchor_is_refetched_after_a_same_height_reorg() -> anyhow::Result<()> {
+fn a_fork_without_more_work_is_refused() -> anyhow::Result<()> {
     let (descriptor, _spk_hash, spk) = tracked_descriptor()?;
     let tx = tx_paying(&spk, 50_000);
     let txid = tx.compute_txid();
@@ -984,7 +1006,7 @@ fn anchor_is_refetched_after_a_same_height_reorg() -> anyhow::Result<()> {
     let header_2b = block_with_tx(&header_1, txid, 222, 1);
     assert_ne!(header_2.block_hash(), header_2b.block_hash());
 
-    let mut state = new_state(Cache::default(), descriptor, genesis);
+    let mut state = new_state(Cache::default(), descriptor);
     let mut queue = ReqQueue::new();
     let mut server = Server {
         headers: vec![genesis, header_1, header_2],
@@ -1004,22 +1026,25 @@ fn anchor_is_refetched_after_a_same_height_reorg() -> anyhow::Result<()> {
 
     // The tip does not move: same height, different block, unchanged script status.
     server.headers = vec![genesis, header_1, header_2b];
-    state.poll(
+    let notified = state.poll(
         &mut queue,
         raw_msg(json!({
             "jsonrpc": "2.0",
             "method": "blockchain.headers.subscribe",
             "params": [{ "hex": serialize_hex(&header_2b), "height": 2 }],
         })),
-    )?;
-    let updates = drain_requests(&mut state, &mut queue, &server);
-
+    );
+    let err = notified
+        .and_then(|_| drain_requests_fallible(&mut state, &mut queue, &server))
+        .expect_err("an equal-work fork must be refused");
     assert!(
-        updates.iter().any(|u| u
-            .tx_update
-            .anchors
-            .contains(&(anchor_of(&header_2b, 2), txid))),
-        "anchor must be refetched for the block that replaced the evicted one"
+        format!("{err:#}").contains("without more work"),
+        "the error must name the reason, got: {err:#}"
+    );
+    assert_eq!(
+        state.chain().block_hash(2),
+        Some(header_2.block_hash()),
+        "the chain must be left on the block it already had"
     );
     Ok(())
 }
@@ -1039,7 +1064,7 @@ fn anchor_is_refetched_whatever_order_the_server_answers_in() -> anyhow::Result<
     let header_2b = block_with_tx(&header_1, txid, 222, 1);
     let header_3b = block_with_root(&header_2b, TxMerkleNode::all_zeros(), 300, 0);
 
-    let mut state = new_state(Cache::default(), descriptor, genesis);
+    let mut state = new_state(Cache::default(), descriptor);
     let mut queue = ReqQueue::new();
     let mut server = Server {
         headers: vec![genesis, header_1, header_2],
@@ -1078,16 +1103,14 @@ fn anchor_is_refetched_whatever_order_the_server_answers_in() -> anyhow::Result<
     Ok(())
 }
 
-/// A client restored from a persisted checkpoint chain starts with blocks in its chain whose
-/// headers are not in its cache. Resolving an anchor at such a height needs both the header and
-/// the proof, and nothing else will fetch that header — the chain consistency pass has nothing to
-/// do, the tip being already correct.
+/// A client restored from a trusted block has no verified history below it, so a transaction
+/// confirmed down there cannot be anchored until the chain is backfilled to a block it trusts.
 ///
-/// So this is the case where the two halves of the ordering fix are load-bearing: the proof must
-/// not be asked for before the header is cached, and the header response must poll the waiting
-/// job even though the chain itself has nothing to learn from it.
+/// The proof must still not be checked before the header it is verified against arrives, which
+/// `drain_requests_proofs_first` forces by answering every merkle request ahead of everything
+/// else.
 #[test]
-fn anchor_resolves_when_the_chain_is_restored_without_its_headers() -> anyhow::Result<()> {
+fn anchor_below_the_trusted_block_is_backfilled() -> anyhow::Result<()> {
     let (descriptor, _spk_hash, spk) = tracked_descriptor()?;
     let tx = tx_paying(&spk, 50_000);
     let txid = tx.compute_txid();
@@ -1095,23 +1118,9 @@ fn anchor_resolves_when_the_chain_is_restored_without_its_headers() -> anyhow::R
     let header_2 = block_with_tx(&header_1, txid, 200, 0);
     let header_3 = block_with_root(&header_2, TxMerkleNode::all_zeros(), 300, 0);
 
-    // The restored chain knows the blocks, the fresh cache knows none of their headers. The tx
-    // is one block below the tip, so the header it needs is not the one `headers.subscribe`
-    // hands back, and the chain consistency pass has nothing to do either, the tip being
-    // already correct.
-    let cp = CheckPoint::new(BlockId {
-        height: 0,
-        hash: genesis.block_hash(),
-    })
-    .insert(BlockId {
-        height: 2,
-        hash: header_2.block_hash(),
-    })
-    .insert(BlockId {
-        height: 3,
-        hash: header_3.block_hash(),
-    });
-    let mut state = new_state_with_cp(Cache::default(), descriptor, cp);
+    // Trusting the tip puts the chain base above the transaction, so nothing below it is
+    // verified and the sync range covers none of it.
+    let mut state = new_state_trusting(Cache::default(), descriptor, [(3, header_3)]);
     let mut queue = ReqQueue::new();
     let server = Server {
         headers: vec![genesis, header_1, header_2, header_3],
@@ -1127,18 +1136,22 @@ fn anchor_resolves_when_the_chain_is_restored_without_its_headers() -> anyhow::R
             .tx_update
             .anchors
             .contains(&(anchor_of(&header_2, 2), txid))),
-        "the anchor must resolve even when the proof overtakes the header it is verified against"
+        "the anchor must resolve once history below the trusted block is backfilled"
+    );
+    assert_eq!(
+        state.chain().base_height(),
+        1,
+        "the chain must have grown down to just above genesis"
     );
     Ok(())
 }
 
 /// A header batch fetched before a reorg describes the chain we have since left behind, and
-/// splicing it in would put a purged block into the checkpoint chain.
+/// splicing it in would put a purged block into the verified chain.
 ///
-/// The case that exposes it is a *sparse* chain — a restored one, or one whose missing heights
-/// sit below the reorg window `ConfirmationJob` rewrites — reorged deeper than that window, so the
-/// consistency pass never learns the low block changed too. Only the height the anchor needs
-/// brings it back, and that fetch was in flight when the chain moved.
+/// The batch is dropped when the tip that wanted it is abandoned, so the answer never reaches
+/// the chain at all — and even if it did, it neither links to the chain we moved to nor
+/// out-works it.
 #[test]
 fn header_fetched_before_a_reorg_is_not_spliced_into_the_chain() -> anyhow::Result<()> {
     let (descriptor, _spk_hash, spk) = tracked_descriptor()?;
@@ -1146,8 +1159,9 @@ fn header_fetched_before_a_reorg_is_not_spliced_into_the_chain() -> anyhow::Resu
     let txid = tx.compute_txid();
     let (genesis, header_1) = base_headers();
 
-    // Two chains which differ at height 2 as well as near the tip. Both contain the tx at
-    // height 2, so the anchor stays valid throughout — only the block it belongs to changes.
+    // Two chains which differ at height 2. Both contain the tx there, so the anchor stays valid
+    // throughout — only the block it belongs to changes. The second is longer, so it carries
+    // more work and is allowed to replace the first.
     let build = |second: block::Header, tip: u32, nonce: u32| {
         let mut chain = vec![genesis, header_1, second];
         for height in 3..=tip {
@@ -1161,22 +1175,12 @@ fn header_fetched_before_a_reorg_is_not_spliced_into_the_chain() -> anyhow::Resu
         }
         chain
     };
-    let chain_a = build(block_with_tx(&header_1, txid, 200, 0), 30, 0);
-    let chain_b = build(block_with_tx(&header_1, txid, 222, 1), 31, 1);
+    let chain_a = build(block_with_tx(&header_1, txid, 200, 0), 8, 0);
+    let chain_b = build(block_with_tx(&header_1, txid, 222, 1), 9, 1);
     let (a2, b2) = (chain_a[2], chain_b[2]);
     assert_ne!(a2.block_hash(), b2.block_hash());
 
-    // A restored chain sparse enough that height 2 is a gap — so the anchor has to fetch that
-    // header, and `replaces` will not decline it when it comes back.
-    let cp = CheckPoint::new(BlockId {
-        height: 0,
-        hash: genesis.block_hash(),
-    })
-    .insert(BlockId {
-        height: 30,
-        hash: chain_a[30].block_hash(),
-    });
-    let mut state = new_state_with_cp(Cache::default(), descriptor, cp);
+    let mut state = new_state(Cache::default(), descriptor);
     let mut queue = ReqQueue::new();
     let mut server = Server {
         headers: chain_a.clone(),
@@ -1204,15 +1208,13 @@ fn header_fetched_before_a_reorg_is_not_spliced_into_the_chain() -> anyhow::Resu
     };
     let stale_resp = response(&stale_req, &server);
 
-    // The reorg lands. It runs deeper than the reorg window, so the consistency pass rewrites
-    // only the top of the chain and never learns that height 2 changed too.
     server.headers = chain_b.clone();
     state.poll(
         &mut queue,
         raw_msg(json!({
             "jsonrpc": "2.0",
             "method": "blockchain.headers.subscribe",
-            "params": [{ "hex": serialize_hex(&chain_b[31]), "height": 31 }],
+            "params": [{ "hex": serialize_hex(&chain_b[9]), "height": 9 }],
         })),
     )?;
     let mut updates = drain_requests(&mut state, &mut queue, &server);
@@ -1221,21 +1223,15 @@ fn header_fetched_before_a_reorg_is_not_spliced_into_the_chain() -> anyhow::Resu
     updates.extend(state.poll(&mut queue, stale_resp)?);
     updates.extend(drain_requests(&mut state, &mut queue, &server));
 
-    let tip = updates
-        .iter()
-        .rev()
-        .find_map(|u| u.chain_update.clone())
-        .expect("must get a chain update");
-    let at_2 = tip.iter().find(|cp| cp.height() == 2);
-    assert_ne!(
-        at_2.as_ref().map(|cp| cp.hash()),
-        Some(a2.block_hash()),
-        "a header from the chain we left must not be spliced into the checkpoint chain"
-    );
     assert_eq!(
-        at_2.map(|cp| cp.hash()),
+        state.chain().block_hash(2),
         Some(b2.block_hash()),
-        "the height must be refetched against the chain we are actually on"
+        "the height must be verified against the chain we are actually on"
+    );
+    assert_ne!(
+        state.chain().block_hash(2),
+        Some(a2.block_hash()),
+        "a header from the chain we left must not enter the verified chain"
     );
     assert!(
         updates
@@ -1262,7 +1258,7 @@ fn a_replayed_job_does_not_displace_one_the_server_started() -> anyhow::Result<(
     let header_2b = block_with_tx(&header_1, txid_a, 222, 1);
     let header_3b = block_with_root(&header_2b, TxMerkleNode::all_zeros(), 300, 0);
 
-    let mut state = new_state(Cache::default(), descriptor, genesis);
+    let mut state = new_state(Cache::default(), descriptor);
     let mut queue = ReqQueue::new();
     let mut server = Server {
         headers: vec![genesis, header_1, header_2],
@@ -1341,24 +1337,25 @@ fn a_replayed_job_does_not_displace_one_the_server_started() -> anyhow::Result<(
     Ok(())
 }
 
-/// A persisted checkpoint chain can be stale at a height below the window `ConfirmationJob` rewrites
-/// — an offline reorg, say. Then the block *we* have at that height is one the server does not
-/// have, and a header request is keyed by height, so no request can ever fetch it.
+/// A trusted block the server disagrees with must stop the connection, not spin it.
 ///
-/// Withholding the proof until that header is cached must not turn into an endless request loop.
+/// Trusting a block is the user's assertion that it is canonical, so a server offering a
+/// different one at that height is not something to reconcile — every header above it descends
+/// from a block we do not accept. The old client would ask again forever; this one refuses the
+/// run and errors out, and the error names the conflict.
 #[test]
-fn a_header_the_server_does_not_have_does_not_loop() -> anyhow::Result<()> {
+fn a_server_disagreeing_with_a_trusted_block_stops_the_connection() -> anyhow::Result<()> {
     let (descriptor, _spk_hash, spk) = tracked_descriptor()?;
     let tx = tx_paying(&spk, 50_000);
     let txid = tx.compute_txid();
     let (genesis, header_1) = base_headers();
-    // The server's height 2, and the stale one our persisted chain still claims.
+    // The server's height 2, and the one we have been told to trust.
     let server_2 = block_with_tx(&header_1, txid, 200, 0);
-    let stale_2 = block_with_tx(&header_1, txid, 999, 7);
-    assert_ne!(server_2.block_hash(), stale_2.block_hash());
+    let trusted_2 = block_with_tx(&header_1, txid, 999, 7);
+    assert_ne!(server_2.block_hash(), trusted_2.block_hash());
 
     let mut chain = vec![genesis, header_1, server_2];
-    for height in 3..=30u32 {
+    for height in 3..=8u32 {
         let prev = *chain.last().expect("non-empty");
         chain.push(block_with_root(
             &prev,
@@ -1368,20 +1365,7 @@ fn a_header_the_server_does_not_have_does_not_loop() -> anyhow::Result<()> {
         ));
     }
 
-    // Tip agrees with the server, so the consistency pass never rewrites height 2.
-    let cp = CheckPoint::new(BlockId {
-        height: 0,
-        hash: genesis.block_hash(),
-    })
-    .insert(BlockId {
-        height: 2,
-        hash: stale_2.block_hash(),
-    })
-    .insert(BlockId {
-        height: 30,
-        hash: chain[30].block_hash(),
-    });
-    let mut state = new_state_with_cp(Cache::default(), descriptor, cp);
+    let mut state = new_state_trusting(Cache::default(), descriptor, [(2, trusted_2)]);
     let mut queue = ReqQueue::new();
     let server = Server {
         headers: chain,
@@ -1391,7 +1375,11 @@ fn a_header_the_server_does_not_have_does_not_loop() -> anyhow::Result<()> {
 
     state.start(&mut queue);
     let mut served = 0;
-    while let Some(req) = queue.pop_front() {
+    let err = loop {
+        let req = match queue.pop_front() {
+            Some(req) => req,
+            None => panic!("the client must not settle while it disagrees with the server"),
+        };
         served += 1;
         assert!(
             served < 200,
@@ -1399,8 +1387,15 @@ fn a_header_the_server_does_not_have_does_not_loop() -> anyhow::Result<()> {
             req.method,
             req.params
         );
-        state.poll(&mut queue, response(&req, &server))?;
-    }
+        if let Err(err) = state.poll(&mut queue, response(&req, &server)) {
+            break err;
+        }
+    };
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("does not link") || msg.contains("trusted"),
+        "the error must name the conflict, got: {msg}"
+    );
     Ok(())
 }
 
@@ -1420,7 +1415,7 @@ fn a_history_that_comes_back_empty_clears_the_subscription() -> anyhow::Result<(
     let (genesis, header_1) = base_headers();
     let header_2 = block_with_tx(&header_1, txid, 200, 0);
 
-    let mut state = new_state(Cache::default(), descriptor, genesis);
+    let mut state = new_state(Cache::default(), descriptor);
     let mut queue = ReqQueue::new();
     let mut server = Server {
         headers: vec![genesis, header_1, header_2],
@@ -1495,7 +1490,7 @@ fn a_script_whose_history_goes_away_is_not_replayed() -> anyhow::Result<()> {
     let header_2b = block_with_root(&header_1, TxMerkleNode::all_zeros(), 222, 1);
     let header_3b = block_with_root(&header_2b, TxMerkleNode::all_zeros(), 300, 0);
 
-    let mut state = new_state(Cache::default(), descriptor, genesis);
+    let mut state = new_state(Cache::default(), descriptor);
     let mut queue = ReqQueue::new();
     let mut server = Server {
         headers: vec![genesis, header_1, header_2],
@@ -1578,8 +1573,11 @@ fn a_proof_for_another_block_is_not_a_verdict_on_ours() -> anyhow::Result<()> {
     let theirs = block_with_root(&header_1, proof_theirs.expected_merkle_root(txid), 222, 1);
     assert_ne!(ours.merkle_root, theirs.merkle_root);
 
-    let mut chain = vec![genesis, header_1, theirs];
-    for height in 3..=30u32 {
+    // The chain the server serves is ours — a block it genuinely disagreed with would be caught
+    // by header verification long before any proof. What it gets wrong is the *proof*: the
+    // branch it answers with expands to a root that is not the one in our block.
+    let mut chain = vec![genesis, header_1, ours];
+    for height in 3..=8u32 {
         let prev = *chain.last().expect("non-empty");
         chain.push(block_with_root(
             &prev,
@@ -1589,24 +1587,7 @@ fn a_proof_for_another_block_is_not_a_verdict_on_ours() -> anyhow::Result<()> {
         ));
     }
 
-    // A persisted chain holding our block at height 2, and its header already cached — otherwise
-    // `GetHeader` catches the disagreement before any proof is asked for. The tip agrees, so no
-    // chain job runs and nothing rewrites height 2: the disagreement is below the window.
-    let mut cache = Cache::default();
-    cache.headers.insert(ours.block_hash(), ours);
-    let cp = CheckPoint::new(BlockId {
-        height: 0,
-        hash: genesis.block_hash(),
-    })
-    .insert(BlockId {
-        height: 2,
-        hash: ours.block_hash(),
-    })
-    .insert(BlockId {
-        height: 30,
-        hash: chain[30].block_hash(),
-    });
-    let mut state = new_state_with_cp(cache, descriptor, cp);
+    let mut state = new_state(Cache::default(), descriptor);
     let mut queue = ReqQueue::new();
     let mut server = Server {
         headers: chain,
@@ -1626,9 +1607,8 @@ fn a_proof_for_another_block_is_not_a_verdict_on_ours() -> anyhow::Result<()> {
         "a proof for a block we do not have must not anchor anything"
     );
 
-    // The server comes back to our block at that height. Nothing durable was written against it,
-    // so the job a notification rebuilds must be able to anchor there.
-    server.headers[2] = ours;
+    // The server starts answering with the right proof. Nothing durable was written against the
+    // bad one, so the job a notification rebuilds must be able to anchor there.
     server.merkle_proof = (Vec::new(), 0);
     let status = ElectrumScriptStatus::from_history(&server.history(&json!(spk_hash.to_string())))
         .expect("history must be non-empty");
@@ -1650,9 +1630,9 @@ fn a_proof_for_another_block_is_not_a_verdict_on_ours() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A server that will not prove a transaction at a height says our two chains disagree there. It
-/// does not say the transaction is absent from our block, and below the reorg window nothing
-/// rewrites that height, so the tip never moves and no tip notification is coming.
+/// A server erroring a merkle request says nothing about the block itself — the headers agree
+/// throughout — so no reorg is coming to explain it, and below the reorg window nothing about
+/// the chain ever changes to trigger a refetch either. The tip stays put.
 ///
 /// The script notification is the only thing that comes back, and it can only revive a job that
 /// still exists — [`ConfirmationJob`] is built in `on_new_tip` and nowhere else. Dropping the job
@@ -1665,11 +1645,8 @@ fn a_merkle_error_below_the_reorg_window_is_recovered_by_a_script_notification(
     let txid = tx.compute_txid();
     let (genesis, header_1) = base_headers();
     let ours = block_with_tx(&header_1, txid, 200, 0);
-    // Their block at that height does not hold the tx, so they will not prove it there.
-    let theirs = block_with_root(&header_1, TxMerkleNode::all_zeros(), 222, 1);
-    assert_ne!(ours.merkle_root, theirs.merkle_root);
 
-    let mut chain = vec![genesis, header_1, theirs];
+    let mut chain = vec![genesis, header_1, ours];
     for height in 3..=30u32 {
         let prev = *chain.last().expect("non-empty");
         chain.push(block_with_root(
@@ -1680,26 +1657,9 @@ fn a_merkle_error_below_the_reorg_window_is_recovered_by_a_script_notification(
         ));
     }
 
-    // As in `a_proof_for_another_block_is_not_a_verdict_on_ours`: our block at height 2 is already
-    // in the cache and the chain, so `GetHeader` does not catch the disagreement first, and the
-    // agreeing tip keeps any chain job from rewriting that height.
-    let mut cache = Cache::default();
-    cache.headers.insert(ours.block_hash(), ours);
-    let cp = CheckPoint::new(BlockId {
-        height: 0,
-        hash: genesis.block_hash(),
-    })
-    .insert(BlockId {
-        height: 2,
-        hash: ours.block_hash(),
-    })
-    .insert(BlockId {
-        height: 30,
-        hash: chain[30].block_hash(),
-    });
-    let mut state = new_state_with_cp(cache, descriptor, cp);
+    let mut state = new_state(Cache::default(), descriptor);
     let mut queue = ReqQueue::new();
-    let mut server = Server {
+    let server = Server {
         headers: chain,
         txs: vec![(tx, 2)],
         merkle_proof: (Vec::new(), 0),
@@ -1725,10 +1685,14 @@ fn a_merkle_error_below_the_reorg_window_is_recovered_by_a_script_notification(
         state.cache().tx_cache.anchors.is_empty(),
         "an error must not anchor anything"
     );
+    assert_eq!(
+        state.chain().tip_height(),
+        Some(30),
+        "the tip must have synced past the reorg window despite the error"
+    );
 
-    // The server comes back to our block at that height. The tip is untouched, so this
-    // notification is the whole of the recovery.
-    server.headers[2] = ours;
+    // The tip is untouched and 28 blocks above height 2 — well past the reorg window a tip
+    // movement would rewrite — so this notification is the whole of the recovery.
     let status = ElectrumScriptStatus::from_history(&server.history(&json!(spk_hash.to_string())))
         .expect("history must be non-empty");
     state.poll(
@@ -1766,7 +1730,7 @@ fn anchor_survives_a_pass_that_happens_after_it_resolved() -> anyhow::Result<()>
     let (genesis, header_1) = base_headers();
     let header_2 = block_with_tx(&header_1, txid, 200, 0);
 
-    let mut state = new_state(Cache::default(), descriptor, genesis);
+    let mut state = new_state(Cache::default(), descriptor);
     let mut queue = ReqQueue::new();
     let server = Server {
         headers: vec![genesis, header_1, header_2],
@@ -1811,7 +1775,7 @@ fn a_tip_that_moves_while_headers_are_in_flight_is_not_lost() -> anyhow::Result<
     let (chain_a, chain_b) = (build(0), build(1));
     assert_ne!(chain_a[3].block_hash(), chain_b[3].block_hash());
 
-    let mut state = new_state(Cache::default(), descriptor, genesis);
+    let mut state = new_state(Cache::default(), descriptor);
     let mut queue = ReqQueue::new();
     let mut server = Server {
         headers: chain_a.clone(),
@@ -1884,7 +1848,7 @@ fn headers_for_a_chain_we_were_not_told_about_are_not_adopted() -> anyhow::Resul
     let b3 = block_with_root(&h2, TxMerkleNode::all_zeros(), 300, 1);
     assert_ne!(a3.block_hash(), b3.block_hash());
 
-    let mut state = new_state(Cache::default(), descriptor, genesis);
+    let mut state = new_state(Cache::default(), descriptor);
     let mut queue = ReqQueue::new();
     let mut server = Server {
         headers: vec![genesis, h1, h2],
@@ -1947,7 +1911,7 @@ fn a_reorg_reanchors_every_script_not_just_the_last_to_notify() -> anyhow::Resul
     let header_3b = block_with_tx(&header_2b, txid_b, 333, 1);
     let header_4b = block_with_root(&header_3b, TxMerkleNode::all_zeros(), 400, 0);
 
-    let mut state = new_state(Cache::default(), descriptor, genesis);
+    let mut state = new_state(Cache::default(), descriptor);
     let mut queue = ReqQueue::new();
     let mut server = Server {
         headers: vec![genesis, header_1, header_2, header_3],
@@ -1958,7 +1922,7 @@ fn a_reorg_reanchors_every_script_not_just_the_last_to_notify() -> anyhow::Resul
     let anchors_of = |updates: &[Update<&'static str>]| {
         updates
             .iter()
-            .flat_map(|u| u.tx_update.anchors.iter().copied())
+            .flat_map(|u| u.tx_update.anchors.iter().cloned())
             .collect::<Vec<_>>()
     };
 
@@ -2026,7 +1990,7 @@ fn a_history_that_cannot_match_the_job_is_not_re_asked() -> anyhow::Result<()> {
     let txid = tx.compute_txid();
     let (genesis, header_1) = base_headers();
 
-    let mut state = new_state(Cache::default(), descriptor, genesis);
+    let mut state = new_state(Cache::default(), descriptor);
     let mut queue = ReqQueue::new();
     // The server's chain is one block long, so its history for this script is empty — it will
     // never answer with the status the notification below carries.
@@ -2090,7 +2054,7 @@ fn confirmation_job_runs_ahead_but_the_update_waits_for_the_scripts() -> anyhow:
     let header_2 = block_with_tx(&header_1, txid, 200, 0);
 
     // Deliberately not seeded with the transaction, so the spk job has to ask for it.
-    let mut state = new_state(Cache::default(), descriptor, genesis);
+    let mut state = new_state(Cache::default(), descriptor);
     let mut queue = ReqQueue::new();
     let mut server = Server {
         headers: vec![genesis, header_1],
@@ -2231,7 +2195,7 @@ fn a_transaction_that_is_not_the_one_asked_for_is_rejected() -> anyhow::Result<(
     assert_ne!(impostor.compute_txid(), tx.compute_txid());
     let (genesis, header_1) = base_headers();
 
-    let mut state = new_state(Cache::default(), descriptor, genesis);
+    let mut state = new_state(Cache::default(), descriptor);
     let mut queue = ReqQueue::new();
     let server = Server {
         headers: vec![genesis, header_1],
