@@ -2032,6 +2032,74 @@ fn a_history_that_cannot_match_the_job_is_not_re_asked() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A history can name a confirmation height above the tip the server has announced: electrs
+/// notifies the script hash before the header. That anchor has to *wait* for the tip to catch
+/// up. Treating it as history the chain has not backfilled yet sends the job back to plan a run
+/// it can never fetch, and the state machine spins.
+#[test]
+fn an_anchor_above_the_announced_tip_does_not_spin() -> anyhow::Result<()> {
+    let (descriptor, spk_hash, spk) = tracked_descriptor()?;
+    let tx = tx_paying(&spk, 50_000);
+    let txid = tx.compute_txid();
+    let (genesis, header_1) = base_headers();
+    let header_2 = block_with_tx(&header_1, txid, 200, 0);
+
+    let mut state = new_state(Cache::default(), descriptor);
+    let mut queue = ReqQueue::new();
+    let mut server = Server {
+        headers: vec![genesis, header_1],
+        txs: vec![(tx, 2)],
+        merkle_proof: (Vec::new(), 0),
+    };
+
+    state.start(&mut queue);
+    drain_requests(&mut state, &mut queue, &server);
+
+    // The server now has the block, so its history reports the transaction at height 2 — but
+    // only the script hash is notified, which is the order electrs really uses.
+    server.headers.push(header_2);
+    let status = ElectrumScriptStatus::from_history(&server.history(&json!(spk_hash.to_string())))
+        .expect("history is not empty");
+    state.poll(
+        &mut queue,
+        raw_msg(json!({
+            "jsonrpc": "2.0",
+            "method": "blockchain.scripthash.subscribe",
+            "params": [spk_hash.to_string(), status.to_string()],
+        })),
+    )?;
+    drain_requests(&mut state, &mut queue, &server);
+
+    assert_eq!(
+        state.chain().tip_height(),
+        Some(1),
+        "no tip was announced, so the chain must not have moved"
+    );
+    assert!(
+        state.cache().tx_cache.anchors.is_empty(),
+        "and nothing may be anchored at a height the chain has not reached"
+    );
+
+    // The tip catches up, and only now can the anchor resolve.
+    state.poll(
+        &mut queue,
+        raw_msg(json!({
+            "jsonrpc": "2.0",
+            "method": "blockchain.headers.subscribe",
+            "params": [{ "hex": serialize_hex(&header_2), "height": 2 }],
+        })),
+    )?;
+    let updates = drain_requests(&mut state, &mut queue, &server);
+    assert!(
+        updates.iter().any(|u| u
+            .tx_update
+            .anchors
+            .contains(&(anchor_of(&header_2, 2), txid))),
+        "the anchor must be delivered once the tip catches up"
+    );
+    Ok(())
+}
+
 /// The confirmation job must not wait on transactions it never reads.
 ///
 /// It works from the heights a history names, so once every script has its history it already
