@@ -435,7 +435,15 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
                     .queuer(req_queue, JobId::Spk(script_hash))
                     .enqueue(request::ScriptHashSubscribe { script_hash });
             }
-            self.staged.last_active_indices.insert(k, i);
+            // Notifications for spks of the same keychain can arrive in any order (it is
+            // unrelated to derivation order), so keep the highest index seen rather than the
+            // last one notified. Overwriting would under-report the last active index and leave
+            // a higher spk unrevealed.
+            self.staged
+                .last_active_indices
+                .entry(k)
+                .and_modify(|last| *last = (*last).max(i))
+                .or_insert(i);
         }
 
         self.spk_jobs
@@ -477,7 +485,6 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
     ) -> anyhow::Result<()> {
         // Borrowed field by field so a job is polled where it sits, not lifted out and put back.
         let Self {
-            spk_tracker,
             coord,
             cache,
             spk_jobs,
@@ -501,10 +508,14 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
                             spk_hash = spk_hash.to_string(),
                             "Spk job finished"
                         );
+                        // `last_active_indices` is not touched here: `on_spk_status` already
+                        // records it, gated on the spk actually having history, at the moment
+                        // the notification/subscription response names that history — not on job
+                        // completion. Every spk we ever poll here (active or not, from the
+                        // initial subscribe or a later notification) resolves to a finished job,
+                        // so deriving the index from mere completion would tag every unused
+                        // look-ahead spk as active too.
                         staged.tx_update.extend(tx_update);
-                        staged
-                            .last_active_indices
-                            .extend(spk_tracker.index_of_spk_hash(spk_hash));
                         break;
                     }
                 }
