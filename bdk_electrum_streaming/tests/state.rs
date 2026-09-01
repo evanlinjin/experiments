@@ -318,7 +318,7 @@ fn anchor_above_local_tip_is_deferred_until_tip_catches_up() -> anyhow::Result<(
         merkle_proof: (Vec::new(), 0),
     };
 
-    state.init(&mut queue);
+    state.start(&mut queue);
     let updates = drain_requests(&mut state, &mut queue, &server);
     assert!(
         updates
@@ -366,7 +366,7 @@ fn anchor_above_local_tip_is_deferred_until_tip_catches_up() -> anyhow::Result<(
 }
 
 /// A descriptor inserted while the connection is live must be subscribed to immediately.
-/// Only [`State::init`] subscribes to the tracker's existing spks, so a subscription missed here
+/// Only [`State::start`] subscribes to the tracker's existing spks, so a subscription missed here
 /// is missed until the next reconnection.
 #[test]
 fn descriptor_inserted_mid_connection_is_subscribed() -> anyhow::Result<()> {
@@ -385,7 +385,7 @@ fn descriptor_inserted_mid_connection_is_subscribed() -> anyhow::Result<()> {
     );
 
     let mut queue = ReqQueue::new();
-    state.init(&mut queue);
+    state.start(&mut queue);
     queue.clear();
 
     state.insert_descriptor(&mut queue, "external", descriptor, 0);
@@ -427,7 +427,7 @@ fn anchor_is_refetched_when_tx_moves_to_another_block_of_same_height() -> anyhow
         merkle_proof: (Vec::new(), 0),
     };
 
-    state.init(&mut queue);
+    state.start(&mut queue);
     let updates = drain_requests(&mut state, &mut queue, &server);
     assert!(
         updates.iter().any(|u| u
@@ -497,7 +497,7 @@ fn merkle_proof_predating_a_reorg_is_not_taken_as_a_failed_anchor() -> anyhow::R
     };
 
     // Sync, but hold back the merkle proof so the anchor fetch is still in flight.
-    state.init(&mut queue);
+    state.start(&mut queue);
     let mut in_flight = Vec::new();
     while let Some(req) = queue.pop_front() {
         if req.method.as_ref() == "blockchain.transaction.get_merkle" {
@@ -572,7 +572,7 @@ fn anchors_staged_before_a_reorg_are_not_emitted_after_it() -> anyhow::Result<()
 
     // Sync, but hold back tx_b's proof so that the job has staged tx_a's anchor and is still
     // waiting on tx_b's when the reorg lands.
-    state.init(&mut queue);
+    state.start(&mut queue);
     let mut in_flight = Vec::new();
     while let Some(req) = queue.pop_front() {
         if req.method.as_ref() == "blockchain.transaction.get_merkle"
@@ -650,7 +650,7 @@ fn a_tx_unconfirmed_by_a_reorg_does_not_error_the_connection() -> anyhow::Result
         merkle_proof: (Vec::new(), 0),
     };
 
-    state.init(&mut queue);
+    state.start(&mut queue);
     let updates = drain_requests(&mut state, &mut queue, &server);
     assert!(
         updates.iter().any(|u| u
@@ -705,7 +705,7 @@ fn merkle_error_predating_a_reorg_is_not_taken_as_a_failed_anchor() -> anyhow::R
     };
 
     // Sync, but hold back the merkle request so the anchor fetch is still in flight.
-    state.init(&mut queue);
+    state.start(&mut queue);
     let mut in_flight = Vec::new();
     while let Some(req) = queue.pop_front() {
         if req.method.as_ref() == "blockchain.transaction.get_merkle" {
@@ -781,7 +781,7 @@ fn a_merkle_error_is_not_recorded_as_a_failed_anchor() -> anyhow::Result<()> {
     };
 
     // Sync, but fail every merkle request the way a busy server would.
-    state.init(&mut queue);
+    state.start(&mut queue);
     let mut merkle_requests = 0;
     while let Some(req) = queue.pop_front() {
         let resp = if req.method.as_ref() == "blockchain.transaction.get_merkle" {
@@ -854,7 +854,7 @@ fn anchor_is_refetched_after_a_same_height_reorg() -> anyhow::Result<()> {
         merkle_proof: (Vec::new(), 0),
     };
 
-    state.init(&mut queue);
+    state.start(&mut queue);
     let updates = drain_requests(&mut state, &mut queue, &server);
     assert!(
         updates.iter().any(|u| u
@@ -909,7 +909,7 @@ fn anchor_is_refetched_whatever_order_the_server_answers_in() -> anyhow::Result<
         merkle_proof: (Vec::new(), 0),
     };
 
-    state.init(&mut queue);
+    state.start(&mut queue);
     let updates = drain_requests(&mut state, &mut queue, &server);
     assert!(
         updates.iter().any(|u| u
@@ -981,7 +981,7 @@ fn anchor_resolves_when_the_chain_is_restored_without_its_headers() -> anyhow::R
         merkle_proof: (Vec::new(), 0),
     };
 
-    state.init(&mut queue);
+    state.start(&mut queue);
     let updates = drain_requests_proofs_first(&mut state, &mut queue, &server);
 
     assert!(
@@ -1047,7 +1047,7 @@ fn header_fetched_before_a_reorg_is_not_spliced_into_the_chain() -> anyhow::Resu
     };
 
     // Sync, but hold back the batch covering height 2 so that fetch is still in flight.
-    state.init(&mut queue);
+    state.start(&mut queue);
     let mut in_flight = Vec::new();
     while let Some(req) = queue.pop_front() {
         if req.method.as_ref() == "blockchain.block.headers" {
@@ -1133,7 +1133,7 @@ fn a_replayed_job_does_not_displace_one_the_server_started() -> anyhow::Result<(
         merkle_proof: (Vec::new(), 0),
     };
 
-    state.init(&mut queue);
+    state.start(&mut queue);
     let updates = drain_requests(&mut state, &mut queue, &server);
     assert!(
         updates.iter().any(|u| u
@@ -1251,7 +1251,7 @@ fn a_header_the_server_does_not_have_does_not_loop() -> anyhow::Result<()> {
         merkle_proof: (Vec::new(), 0),
     };
 
-    state.init(&mut queue);
+    state.start(&mut queue);
     let mut served = 0;
     while let Some(req) = queue.pop_front() {
         served += 1;
@@ -1290,7 +1290,7 @@ fn a_history_that_comes_back_empty_clears_the_subscription() -> anyhow::Result<(
         merkle_proof: (Vec::new(), 0),
     };
 
-    state.init(&mut queue);
+    state.start(&mut queue);
     drain_requests(&mut state, &mut queue, &server);
     let old_status = state
         .subscriptions()
@@ -1365,7 +1365,7 @@ fn a_script_whose_history_goes_away_is_not_replayed() -> anyhow::Result<()> {
         merkle_proof: (Vec::new(), 0),
     };
 
-    state.init(&mut queue);
+    state.start(&mut queue);
     let updates = drain_requests(&mut state, &mut queue, &server);
     assert!(
         updates.iter().any(|u| u
@@ -1476,7 +1476,7 @@ fn a_proof_for_another_block_is_not_a_verdict_on_ours() -> anyhow::Result<()> {
         merkle_proof: (proof_theirs.merkle.clone(), proof_theirs.pos),
     };
 
-    state.init(&mut queue);
+    state.start(&mut queue);
     let mut served = 0;
     while let Some(req) = queue.pop_front() {
         served += 1;
@@ -1567,7 +1567,7 @@ fn a_merkle_error_below_the_reorg_window_is_recovered_by_a_script_notification(
         merkle_proof: (Vec::new(), 0),
     };
 
-    state.init(&mut queue);
+    state.start(&mut queue);
     let mut served = 0;
     while let Some(req) = queue.pop_front() {
         served += 1;
@@ -1636,7 +1636,7 @@ fn anchor_survives_a_pass_that_happens_after_it_resolved() -> anyhow::Result<()>
         merkle_proof: (Vec::new(), 0),
     };
 
-    state.init(&mut queue);
+    state.start(&mut queue);
     let updates = drain_requests_proofs_first(&mut state, &mut queue, &server);
     assert!(
         updates.iter().any(|u| u
@@ -1753,7 +1753,7 @@ fn headers_for_a_chain_we_were_not_told_about_are_not_adopted() -> anyhow::Resul
         txs: Vec::new(),
         merkle_proof: (Vec::new(), 0),
     };
-    state.init(&mut queue);
+    state.start(&mut queue);
     drain_requests(&mut state, &mut queue, &server);
 
     // A3 is announced, so that is the block the job is created to reach.
@@ -1824,7 +1824,7 @@ fn a_reorg_reanchors_every_script_not_just_the_last_to_notify() -> anyhow::Resul
             .collect::<Vec<_>>()
     };
 
-    state.init(&mut queue);
+    state.start(&mut queue);
     let anchors = anchors_of(&drain_requests(&mut state, &mut queue, &server));
     assert!(
         anchors.contains(&(anchor_of(&header_2, 2), txid_a)),
@@ -1898,7 +1898,7 @@ fn a_history_that_cannot_match_the_job_is_not_re_asked() -> anyhow::Result<()> {
         merkle_proof: (Vec::new(), 0),
     };
 
-    state.init(&mut queue);
+    state.start(&mut queue);
     drain_requests(&mut state, &mut queue, &server);
 
     let status =
@@ -1960,7 +1960,7 @@ fn confirmation_job_runs_ahead_but_the_update_waits_for_the_scripts() -> anyhow:
         merkle_proof: (Vec::new(), 0),
     };
 
-    state.init(&mut queue);
+    state.start(&mut queue);
     drain_requests(&mut state, &mut queue, &server);
 
     let status =
@@ -2103,7 +2103,7 @@ fn a_transaction_that_is_not_the_one_asked_for_is_rejected() -> anyhow::Result<(
 
     // Answer the initial sync honestly, except that every transaction comes back as the
     // impostor. The subscribe response carries the status, so this drives the whole flow.
-    state.init(&mut queue);
+    state.start(&mut queue);
     let mut substituted = false;
     let mut result = Ok(None);
     while let Some(req) = queue.pop_front() {

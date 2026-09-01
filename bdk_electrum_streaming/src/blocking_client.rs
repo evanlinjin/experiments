@@ -106,8 +106,7 @@ where
         let read_stream = electrum_streaming_client::io::ReadStreamer::new(BufReader::new(read));
 
         let mut req_queue = ReqQueue::new();
-        state.reset();
-        state.init(&mut req_queue);
+        state.start(&mut req_queue);
 
         // For sending to the write thread.
         let (write_tx, write_rx) = mpsc::channel::<RawRequest>();

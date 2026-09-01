@@ -54,9 +54,6 @@ pub struct State<PReq: PendingRequest, K = &'static str> {
     staged: Update<K>,
 
     user_state: electrum_streaming_client::State<PReq>,
-
-    /// Whether the header subscription, spk subscriptions and pending requests have been sent.
-    init_reqs_sent: bool,
 }
 
 impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
@@ -75,7 +72,6 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
             confirmation_job: None,
             staged: Update::default(),
             user_state: electrum_streaming_client::State::new(),
-            init_reqs_sent: false,
         }
     }
 
@@ -85,16 +81,6 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
 
     pub fn subscriptions(&self) -> &Subscriptions {
         &self.cache.subscriptions
-    }
-
-    /// Reset the state to be not initialized.
-    ///
-    /// Call this after disconnection otherwise pending requests will not be resent and no
-    /// subscriptions to the chain or spks will be made.
-    pub fn reset(&mut self) {
-        tracing::trace!("Reseting state");
-        self.confirmation_job = None;
-        self.init_reqs_sent = false;
     }
 
     /// Insert a descriptor and queue outgoing requests (if needed).
@@ -114,25 +100,34 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
         }
     }
 
-    pub fn init(&mut self, req_queue: &mut ReqQueue) {
-        if !self.init_reqs_sent {
-            self.init_reqs_sent = true;
-            req_queue.extend(self.user_state.pending_requests());
-            req_queue.extend(self.coord.pending_requests());
+    /// Start (or restart) the state machine on a fresh connection.
+    ///
+    /// Drops the in-flight confirmation job, resends pending requests and resubscribes to the
+    /// chain and all tracked spks. Call this exactly once per connection, before feeding anything
+    /// to [`poll`](Self::poll) - otherwise nothing is ever sent to the server and the connection
+    /// stays silent. `run_async`/`run_blocking` do it for you.
+    ///
+    /// Stashed spk jobs survive: their requests are resent, so they resume where they left off.
+    pub fn start(&mut self, req_queue: &mut ReqQueue) {
+        tracing::trace!("Starting state");
+        self.confirmation_job = None;
 
-            tracing::info!("Queue headers subscribe");
-            self.coord
-                .queuer(req_queue, JobId::Confirmation)
-                .enqueue(request::HeadersSubscribe);
+        // Resend pending requests.
+        req_queue.extend(self.user_state.pending_requests());
+        req_queue.extend(self.coord.pending_requests());
 
-            for script_hash in self.spk_tracker.all_spk_hashes() {
-                tracing::info!(
-                    script_hash = script_hash.to_string(),
-                    "Queue script subscribe"
-                );
-                let mut queuer = self.coord.queuer(req_queue, JobId::Spk(script_hash));
-                queuer.enqueue(request::ScriptHashSubscribe { script_hash });
-            }
+        tracing::info!("Queue headers subscribe");
+        self.coord
+            .queuer(req_queue, JobId::Confirmation)
+            .enqueue(request::HeadersSubscribe);
+
+        for script_hash in self.spk_tracker.all_spk_hashes() {
+            tracing::info!(
+                script_hash = script_hash.to_string(),
+                "Queue script subscribe"
+            );
+            let mut queuer = self.coord.queuer(req_queue, JobId::Spk(script_hash));
+            queuer.enqueue(request::ScriptHashSubscribe { script_hash });
         }
     }
 
@@ -182,7 +177,6 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
         req_queue: &mut ReqQueue,
         raw: RawNotificationOrResponse,
     ) -> anyhow::Result<()> {
-        self.init(req_queue);
         if let Err(e) = self.user_state.process_incoming(raw.clone()) {
             match e {
                 electrum_streaming_client::ProcessError::MissingRequest(_) => {}
