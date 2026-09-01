@@ -107,10 +107,10 @@ impl SpkJob {
     }
 
     pub fn elapsed_seconds(&self) -> String {
-        let duration = UNIX_EPOCH.elapsed().expect("must get current timestamp") - self.start;
-        let seconds = duration.as_secs();
-        let subsec = duration.subsec_millis();
-        format!("{seconds}s {subsec}ms")
+        let now = UNIX_EPOCH.elapsed().expect("must get current timestamp");
+        // The system clock can step backwards, which must not bring a log line down with it.
+        let duration = now.saturating_sub(self.start);
+        format!("{}s {}ms", duration.as_secs(), duration.subsec_millis())
     }
 
     /// Try fullfill all that is missing.
@@ -144,17 +144,17 @@ impl SpkJob {
 
     pub fn try_finish(&mut self) -> Option<(ElectrumScriptHash, TxUpdate<ConfirmationBlockTime>)> {
         if self.stage.is_done() {
-            tracing::trace!(
-                elapsed_seconds = self.elapsed_seconds(),
-                spk_hash = self.spk_hash.to_string(),
-                "Spk job not finished"
-            );
-            Some((self.spk_hash, core::mem::take(&mut self.tx_update)))
-        } else {
             tracing::info!(
                 elapsed_seconds = self.elapsed_seconds(),
                 spk_hash = self.spk_hash.to_string(),
                 "Spk job finished"
+            );
+            Some((self.spk_hash, core::mem::take(&mut self.tx_update)))
+        } else {
+            tracing::trace!(
+                elapsed_seconds = self.elapsed_seconds(),
+                spk_hash = self.spk_hash.to_string(),
+                "Spk job not finished"
             );
             None
         }
