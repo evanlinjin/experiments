@@ -85,11 +85,11 @@ fn blocking_env() -> anyhow::Result<()> {
     let run_handle = std::thread::spawn(move || {
         let res = run_blocking(
             &mut state,
-            &mut AtomicBool::new(false),
+            &AtomicBool::new(false),
             &mut update_tx,
             &mut client_rx,
-            &mut &run_conn,
-            &mut &run_conn,
+            &run_conn,
+            &run_conn,
         );
         state.reset();
         res

@@ -207,7 +207,7 @@ fn anchor_above_local_tip_is_deferred_until_tip_catches_up() -> anyhow::Result<(
 #[test]
 fn descriptor_inserted_mid_connection_is_subscribed() -> anyhow::Result<()> {
     let descriptor = Descriptor::<DescriptorPublicKey>::from_str(&format!("wpkh({XPUB}/0/*)"))?;
-    let spk_hash = ElectrumScriptHash::new(&descriptor.at_derivation_index(0)?.script_pubkey());
+    let spk_hash = ElectrumScriptHash::new(descriptor.at_derivation_index(0)?.script_pubkey());
 
     let genesis = constants::genesis_block(Network::Regtest).header;
     let mut state = BlockingState::new(
