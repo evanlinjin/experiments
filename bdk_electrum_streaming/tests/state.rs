@@ -399,6 +399,144 @@ fn descriptor_inserted_mid_connection_is_subscribed() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `last_active_indices` must name the derivation index of the spk that has history, not the
+/// index after it. Emitting `index + 1` reveals one spk too many on every sync, permanently
+/// skipping an unused address.
+#[test]
+fn last_active_index_is_index_of_active_spk() -> anyhow::Result<()> {
+    const ACTIVE_INDEX: u32 = 3;
+    const LOOKAHEAD: u32 = 5;
+
+    let descriptor = Descriptor::<DescriptorPublicKey>::from_str(&format!("wpkh({XPUB}/0/*)"))?;
+    let spk = descriptor
+        .at_derivation_index(ACTIVE_INDEX)?
+        .script_pubkey();
+    let tx = tx_paying(&spk, 50_000);
+    let txid = tx.compute_txid();
+    let (genesis, header_1) = base_headers();
+    let header_2 = block_with_tx(&header_1, txid, 200, 0);
+
+    let mut spk_tracker = DerivedSpkTracker::new(LOOKAHEAD);
+    spk_tracker.insert_descriptor("external", descriptor, 0);
+    let mut state = BlockingState::new(
+        ReqCoord::default(),
+        Cache::default(),
+        spk_tracker,
+        CheckPoint::new(BlockId {
+            height: 0,
+            hash: genesis.block_hash(),
+        }),
+    );
+    let mut queue = ReqQueue::new();
+    let server = Server {
+        headers: vec![genesis, header_1, header_2],
+        txs: vec![(tx, 2)],
+        merkle_proof: (Vec::new(), 0),
+    };
+
+    state.start(&mut queue);
+    let updates = drain_requests(&mut state, &mut queue, &server);
+
+    let emitted = updates
+        .iter()
+        .flat_map(|update| &update.last_active_indices)
+        .map(|(&k, &i)| (k, i))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        emitted,
+        vec![("external", ACTIVE_INDEX)],
+        "only the spk with history is active, at its own index"
+    );
+    Ok(())
+}
+
+/// Two spks of the same keychain can each have history, and the server notifies their statuses
+/// independently, in an order that has nothing to do with derivation index — a later-derived spk
+/// can be notified first. The keychain's last active index must still end up as the *highest* of
+/// the two. Reporting a lower one leaves the higher spk unrevealed, so the wallet does not
+/// recognise its txouts as its own.
+#[test]
+fn last_active_index_is_highest_regardless_of_notification_order() -> anyhow::Result<()> {
+    const LOOKAHEAD: u32 = 5;
+
+    let descriptor = Descriptor::<DescriptorPublicKey>::from_str(&format!("wpkh({XPUB}/0/*)"))?;
+    let spk_3 = descriptor.at_derivation_index(3)?.script_pubkey();
+    let spk_4 = descriptor.at_derivation_index(4)?.script_pubkey();
+    let spk_hash_3 = ElectrumScriptHash::new(&spk_3);
+    let spk_hash_4 = ElectrumScriptHash::new(&spk_4);
+    let tx_3 = tx_paying(&spk_3, 10_000);
+    let tx_4 = tx_paying(&spk_4, 20_000);
+    let txid_3 = tx_3.compute_txid();
+    let txid_4 = tx_4.compute_txid();
+    let (genesis, header_1) = base_headers();
+    // Each in its own single-tx block, so the block's merkle root is the txid and no real proof
+    // construction is needed.
+    let header_2 = block_with_tx(&header_1, txid_3, 200, 0);
+    let header_3 = block_with_tx(&header_2, txid_4, 300, 0);
+
+    let mut spk_tracker = DerivedSpkTracker::new(LOOKAHEAD);
+    spk_tracker.insert_descriptor("external", descriptor, 0);
+    let mut state = BlockingState::new(
+        ReqCoord::default(),
+        Cache::default(),
+        spk_tracker,
+        CheckPoint::new(BlockId {
+            height: 0,
+            hash: genesis.block_hash(),
+        }),
+    );
+    let mut queue = ReqQueue::new();
+    let mut server = Server {
+        headers: vec![genesis, header_1, header_2, header_3],
+        txs: Vec::new(),
+        merkle_proof: (Vec::new(), 0),
+    };
+
+    // Sync with neither spk active yet, so both are only ever reached through the notifications
+    // sent below, not through the initial subscribe responses.
+    state.start(&mut queue);
+    drain_requests(&mut state, &mut queue, &server);
+
+    server.txs = vec![(tx_3, 2), (tx_4, 3)];
+    let status_3 =
+        ElectrumScriptStatus::from_history(&server.history(&json!(spk_hash_3.to_string())))
+            .expect("history is not empty");
+    let status_4 =
+        ElectrumScriptStatus::from_history(&server.history(&json!(spk_hash_4.to_string())))
+            .expect("history is not empty");
+
+    // The higher derivation index is notified first.
+    state.poll(
+        &mut queue,
+        raw_msg(json!({
+            "jsonrpc": "2.0",
+            "method": "blockchain.scripthash.subscribe",
+            "params": [spk_hash_4.to_string(), status_4.to_string()],
+        })),
+    )?;
+    state.poll(
+        &mut queue,
+        raw_msg(json!({
+            "jsonrpc": "2.0",
+            "method": "blockchain.scripthash.subscribe",
+            "params": [spk_hash_3.to_string(), status_3.to_string()],
+        })),
+    )?;
+
+    let updates = drain_requests(&mut state, &mut queue, &server);
+    let emitted = updates
+        .iter()
+        .flat_map(|update| &update.last_active_indices)
+        .map(|(&k, &i)| (k, i))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        emitted,
+        vec![("external", 4)],
+        "the highest active index must survive being notified before the lower one"
+    );
+    Ok(())
+}
+
 /// A reorg can move a transaction into a different block at the *same* height. An Electrum
 /// script status is a hash over txid-height pairs, so it does not change and the server has no
 /// reason to send a script hash notification. The anchor we already delivered now points at a
