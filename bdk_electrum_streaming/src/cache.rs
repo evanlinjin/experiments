@@ -1,96 +1,141 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    collections::{BTreeSet, HashMap},
     sync::Arc,
 };
 
 use bdk_core::{
-    bitcoin::{self, BlockHash, Transaction, Txid},
+    bitcoin::{self, block::Header, BlockHash, Transaction, Txid},
     ConfirmationBlockTime,
 };
-use electrum_streaming_client::{response, ElectrumScriptHash, ElectrumScriptStatus};
+use electrum_streaming_client::{request, response, ElectrumScriptHash, ElectrumScriptStatus};
 
 /// Everything learned from the server, kept so a reconnect need not ask again.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Cache {
     /// The server's per-script histories.
-    pub spk_histories: SpkHistories,
+    pub subscriptions: Subscriptions,
+
+    /// What we already hold, so a job knows what it need not ask for.
+    ///
+    /// Not persisted: every part of it is in the caller's wallet already, and a second copy
+    /// would only give the two something to disagree about. Seed it from wallet data instead.
+    #[serde(skip)]
+    pub tx_cache: TxCache,
+
+    /// This can be removed once we can place `Header`s in `CheckPoint`s.
+    pub headers: HashMap<BlockHash, bitcoin::block::Header>,
+}
+
+/// The transaction data a job consults before asking the server for anything.
+///
+/// Separate from the rest of [`Cache`] because a caller can rebuild all of it from their own
+/// wallet: the transactions are in their graph, the anchors with them, and which transactions
+/// paid a script is what their spk index is for. So none of it is persisted alongside
+/// [`Subscriptions`], which nothing can reconstruct.
+///
+/// Starting empty is always correct, only expensive: a job asks the server for whatever it
+/// cannot find here, so an empty one re-downloads every transaction and reproves every anchor.
+/// It is not a mirror of the wallet, though — whatever a job fetches lands here too, so it
+/// answers "do we already have this" whoever supplied it.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct TxCache {
     /// Every txid ever seen for each script hash.
     ///
-    /// Stays here rather than in [`SpkHistories`] because it is the one spk-keyed map that must
-    /// survive [`SpkHistories::remove`]. Two things read it after the server has stopped
-    /// reporting a history: evictions are the difference between this set and the history now
-    /// in hand, so replacing it with the latest history would make that difference empty and
-    /// no transaction would ever be reported as evicted; and it is the record that a script
-    /// was *once* active, which keeps its derivation index revealed and the lookahead
-    /// extended past it.
+    /// This is monotonically growing so that we can detect evictions.
     pub spk_txids: HashMap<ElectrumScriptHash, BTreeSet<Txid>>,
+
     pub txs: HashMap<Txid, Arc<Transaction>>,
+
     /// Written as a sequence: a `(Txid, BlockHash)` key is not a string, so a map would be
     /// unserializable in JSON and every other format that requires string keys.
     #[serde(with = "persist::anchors_as_seq")]
     pub anchors: HashMap<(Txid, BlockHash), ConfirmationBlockTime>,
-    pub headers: HashMap<BlockHash, bitcoin::block::Header>,
+}
+
+impl Cache {
+    pub fn resolve_headers_query(
+        &mut self,
+        req: request::Headers,
+        resp: response::HeadersResp,
+    ) -> impl Iterator<Item = (u32, Header)> {
+        self.headers
+            .extend(resp.headers.iter().map(|&h| (h.block_hash(), h)));
+        (req.start_height..).zip(resp.headers)
+    }
+
+    pub fn resolve_history_query(
+        &mut self,
+        req: request::GetHistory,
+        resp: Vec<response::Tx>,
+    ) -> Option<ElectrumScriptStatus> {
+        let status_opt = ElectrumScriptStatus::from_history(&resp);
+        if let Some(status) = status_opt {
+            self.tx_cache
+                .spk_txids
+                .entry(req.script_hash)
+                .or_default()
+                .extend(resp.iter().map(|tx| tx.txid()));
+            self.subscriptions.insert_spk(req.script_hash, status, resp);
+        } else {
+            self.subscriptions.remove_spk(req.script_hash);
+        }
+        status_opt
+    }
 }
 
 /// The last history the server reported for each script hash.
 ///
-/// The only part of [`Cache`] a caller cannot rebuild from wallet data, since the server reports
-/// a script's history as it stands now and will never again mention a transaction it has dropped.
+/// Unlike [`TxCache`], a caller cannot rebuild this from wallet data: a status is a hash Electrum
+/// computes over the history it stands for and no wallet stores, and the server reports a history
+/// as it stands now, never again mentioning a transaction it has dropped.
 ///
-/// Fields are private: the height index is derived from the histories, and letting it be set
-/// independently would reintroduce the desync the type exists to prevent.
+/// Fields are private: a status is a hash of the history it stands for, and letting the two be
+/// set independently would reintroduce the desync the type exists to prevent.
 #[derive(Debug, Clone, Default)]
-pub struct SpkHistories {
-    /// The last history reported for each script hash, with the status it stands for.
+pub struct Subscriptions {
+    /// The last reported status for a given script.
+    spk_hash_to_status: HashMap<ElectrumScriptHash, ElectrumScriptStatus>,
+    /// Script history by status.
     ///
-    /// The status is stored with the history rather than beside it so the two cannot desync: a
-    /// replay needs the last status, and [`Self::get`] needs to know which status the
-    /// history it hands back is an answer to.
-    spk_hash_to_history: HashMap<ElectrumScriptHash, (ElectrumScriptStatus, Vec<response::Tx>)>,
-    /// Script hashes whose history reported a transaction at each height.
-    ///
-    /// This is what makes a reorg actionable: when the local chain drops a block, the scripts
-    /// recorded at that height are the ones whose anchors need refetching. Derived from
-    /// `spk_hash_to_history`, so it is rebuilt on deserialization rather than stored.
-    height_to_spk_hashes: BTreeMap<u32, BTreeSet<ElectrumScriptHash>>,
+    /// An entry is dropped once no script answers to its status, which costs a scan of
+    /// `spk_hash_to_status` on every insert. Fine for a wallet's worth of scripts; a refcount
+    /// would be the fix if that ever stops being true.
+    spk_status_to_history: HashMap<ElectrumScriptStatus, Vec<response::Tx>>,
 }
 
-impl SpkHistories {
-    /// How far below the tip the height index is retained by [`Self::prune`].
-    ///
-    /// Comfortably above [`ChainJob`]'s 21-block suffix, which bounds how deep an eviction — the
-    /// only thing that reads the index — can ever reach.
-    ///
-    /// [`ChainJob`]: crate::chain_job::ChainJob
-    pub const HEIGHT_INDEX_HORIZON: u32 = 100;
+impl Subscriptions {
+    fn clear_history_if_no_longer_needed(&mut self, old_status: ElectrumScriptStatus) {
+        // A status is a hash of the history it stands for, so two scripts paid by the same
+        // transactions and nothing else share one. The history is only dead once no script
+        // answers to it any more — dropping it while another still does would leave that
+        // script with no history and no notification coming to rebuild it.
+        let still_wanted = self
+            .spk_hash_to_status
+            .values()
+            .any(|&status| status == old_status);
+        if !still_wanted {
+            self.spk_status_to_history.remove(&old_status);
+        }
+    }
 
     /// Drop the history for `spk_hash`, for when the server stops reporting one.
-    ///
-    /// Does not touch [`Cache::spk_txids`], which has to outlive this to report the evictions.
-    pub fn remove(&mut self, spk_hash: ElectrumScriptHash) {
-        self.spk_hash_to_history.remove(&spk_hash);
-        for spk_hashes in self.height_to_spk_hashes.values_mut() {
-            spk_hashes.remove(&spk_hash);
+    pub fn remove_spk(&mut self, spk_hash: ElectrumScriptHash) {
+        if let Some(old_status) = self.spk_hash_to_status.remove(&spk_hash) {
+            self.clear_history_if_no_longer_needed(old_status);
         }
     }
 
     /// Record `history` as the answer to `spk_status`, replacing whatever `spk_hash` had before.
-    pub fn insert(
+    pub fn insert_spk(
         &mut self,
         spk_hash: ElectrumScriptHash,
         spk_status: ElectrumScriptStatus,
         history: Vec<response::Tx>,
     ) {
-        for tx in &history {
-            if let Some(height) = tx.confirmation_height() {
-                self.height_to_spk_hashes
-                    .entry(height.to_consensus_u32())
-                    .or_default()
-                    .insert(spk_hash);
-            }
+        if let Some(old_status) = self.spk_hash_to_status.insert(spk_hash, spk_status) {
+            self.clear_history_if_no_longer_needed(old_status);
         }
-        self.spk_hash_to_history
-            .insert(spk_hash, (spk_status, history));
+        self.spk_status_to_history.insert(spk_status, history);
     }
 
     /// The history for `spk_hash`, but only if it is the one `spk_status` stands for.
@@ -98,49 +143,40 @@ impl SpkHistories {
     /// A job fetches for the status its notification carried, so handing it a history that
     /// answers an older status would have it finish on stale data. `None` sends it to the
     /// server instead, which is why the status is effectively part of the key.
-    pub fn get(
-        &self,
-        spk_hash: ElectrumScriptHash,
-        spk_status: ElectrumScriptStatus,
-    ) -> Option<&[response::Tx]> {
-        match self.spk_hash_to_history.get(&spk_hash)? {
-            (status, history) if *status == spk_status => Some(history),
-            _ => None,
-        }
+    pub fn spk_history(&self, spk_status: ElectrumScriptStatus) -> Option<&[response::Tx]> {
+        self.spk_status_to_history
+            .get(&spk_status)
+            .map(Vec::as_slice)
     }
 
-    /// Every script hash whose history reported a transaction at one of `heights`, deduplicated.
-    ///
-    /// Given the heights a reorg evicted, these are the scripts whose anchors need refetching.
-    pub fn spk_hashes_at_heights<'a>(
+    pub fn spk_histories<'a>(
         &'a self,
-        heights: impl IntoIterator<Item = u32> + 'a,
-    ) -> impl Iterator<Item = ElectrumScriptHash> + 'a {
-        heights
+        spk_status: impl IntoIterator<Item = ElectrumScriptStatus> + 'a,
+    ) -> impl Iterator<Item = response::Tx> + 'a {
+        spk_status
             .into_iter()
-            .filter_map(|height| self.height_to_spk_hashes.get(&height))
+            .filter_map(|spk_status| self.spk_history(spk_status))
             .flatten()
-            .copied()
             .filter({
-                let mut dedup = HashSet::new();
-                move |&spk_hash| dedup.insert(spk_hash)
+                // Two scripts in the same transaction would otherwise yield it twice.
+                let mut dedup = BTreeSet::new();
+                move |tx: &&response::Tx| dedup.insert(tx.txid())
             })
+            .cloned()
     }
 
     /// The last status the server reported for `spk_hash`, if it still has a history.
-    pub fn status(&self, spk_hash: ElectrumScriptHash) -> Option<ElectrumScriptStatus> {
-        self.spk_hash_to_history
-            .get(&spk_hash)
-            .map(|&(status, _)| status)
+    pub fn spk_status(&self, spk_hash: ElectrumScriptHash) -> Option<ElectrumScriptStatus> {
+        self.spk_hash_to_status.get(&spk_hash).copied()
     }
 
-    /// Drop height index entries too far below `tip_height` for any reorg to reach.
+    /// The last status reported for every script that still has a history.
     ///
-    /// The histories themselves are untouched; only the index is bounded.
-    pub fn prune(&mut self, tip_height: u32) {
-        if let Some(height) = tip_height.checked_sub(Self::HEIGHT_INDEX_HORIZON) {
-            self.height_to_spk_hashes = self.height_to_spk_hashes.split_off(&height);
-        }
+    /// This, rather than whichever jobs are currently in flight, is the set of scripts an
+    /// update has to anchor: a reorg moves transactions the server will never mention again,
+    /// because one that keeps its height keeps its status.
+    pub fn spk_statuses(&self) -> impl Iterator<Item = ElectrumScriptStatus> + '_ {
+        self.spk_hash_to_status.values().copied()
     }
 }
 
@@ -205,24 +241,22 @@ mod persist {
         }
     }
 
-    /// Only the histories are written; the height index is rebuilt from them on the way back in.
-    impl serde::Serialize for SpkHistories {
+    /// Written as `spk_hash -> (status, history)`, which is what rebuilds both maps on the way
+    /// back in.
+    impl serde::Serialize for Subscriptions {
         fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-            serializer.collect_map(self.spk_hash_to_history.iter().map(
-                |(&spk_hash, (status, history))| {
-                    (
-                        spk_hash,
-                        (
-                            status,
-                            history.iter().map(HistoryTx::from).collect::<Vec<_>>(),
-                        ),
-                    )
-                },
-            ))
+            serializer.collect_map(self.spk_hash_to_status.iter().map(|(&spk_hash, &status)| {
+                let history = self
+                    .spk_status_to_history
+                    .get(&status)
+                    .map(|history| history.iter().map(HistoryTx::from).collect::<Vec<_>>())
+                    .unwrap_or_default();
+                (spk_hash, (status, history))
+            }))
         }
     }
 
-    impl<'de> serde::Deserialize<'de> for SpkHistories {
+    impl<'de> serde::Deserialize<'de> for Subscriptions {
         fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
             use serde::de::Error;
             let stored =
@@ -236,7 +270,7 @@ mod persist {
                     .map(response::Tx::try_from)
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(D::Error::custom)?;
-                spk_histories.insert(spk_hash, status, history);
+                spk_histories.insert_spk(spk_hash, status, history);
             }
             Ok(spk_histories)
         }
@@ -285,9 +319,10 @@ mod test {
         ElectrumScriptHash::from_byte_array([byte; 32])
     }
 
-    /// The height index is not stored, so it has to come back from the histories themselves.
+    /// `response::Tx` derives `Deserialize` only, so histories round-trip through `HistoryTx`.
+    /// Both of its variants have to survive the trip intact.
     #[test]
-    fn spk_histories_round_trip_rebuilds_the_height_index() {
+    fn spk_histories_round_trip() {
         let history = vec![
             response::Tx::Confirmed(response::ConfirmedTx {
                 txid: txid(1),
@@ -301,46 +336,92 @@ mod test {
         ];
         let status = ElectrumScriptStatus::from_history(&history).expect("history is not empty");
 
-        let mut before = SpkHistories::default();
-        before.insert(spk_hash(9), status, history);
+        let mut before = Subscriptions::default();
+        before.insert_spk(spk_hash(9), status, history);
 
         let json = serde_json::to_string(&before).expect("must serialize");
-        assert!(
-            !json.contains("height_to_spk_hashes"),
-            "the derived index must not be stored"
-        );
-        let after: SpkHistories = serde_json::from_str(&json).expect("must deserialize");
+        let after: Subscriptions = serde_json::from_str(&json).expect("must deserialize");
 
         assert_eq!(
-            after.get(spk_hash(9), status).map(|h| h.len()),
+            after.spk_history(status).map(<[_]>::len),
             Some(2),
             "the history must survive, and still answer to its status"
         );
-        assert_eq!(
-            after.spk_hashes_at_heights([700_000]).collect::<Vec<_>>(),
-            vec![spk_hash(9)],
-            "the confirmed entry must be indexed by height again"
-        );
-        assert_eq!(
-            after.spk_hashes_at_heights([700_001]).count(),
-            0,
-            "only heights the history actually reported"
-        );
-        assert_eq!(after.status(spk_hash(9)), Some(status));
+        assert_eq!(after.spk_status(spk_hash(9)), Some(status));
     }
 
-    /// `anchors` is keyed by a tuple, which JSON cannot use as a map key.
+    /// Two scripts paid by the same transaction, and nothing else, have identical histories —
+    /// so they share a status. One of them moving on must not take the other's history with it.
     #[test]
-    fn cache_round_trips_through_json() {
+    fn a_shared_history_survives_one_of_its_scripts_moving_on() {
+        let shared = vec![response::Tx::Confirmed(response::ConfirmedTx {
+            txid: txid(1),
+            height: bitcoin::absolute::Height::from_consensus(700_000).unwrap(),
+        })];
+        let shared_status = ElectrumScriptStatus::from_history(&shared).expect("not empty");
+
+        let mut subs = Subscriptions::default();
+        subs.insert_spk(spk_hash(1), shared_status, shared.clone());
+        subs.insert_spk(spk_hash(2), shared_status, shared);
+
+        // Script 1 sees another transaction, so its status moves on. Script 2's has not changed,
+        // and no notification is coming for it.
+        let moved_on = vec![
+            response::Tx::Confirmed(response::ConfirmedTx {
+                txid: txid(1),
+                height: bitcoin::absolute::Height::from_consensus(700_000).unwrap(),
+            }),
+            response::Tx::Confirmed(response::ConfirmedTx {
+                txid: txid(2),
+                height: bitcoin::absolute::Height::from_consensus(700_001).unwrap(),
+            }),
+        ];
+        let moved_status = ElectrumScriptStatus::from_history(&moved_on).expect("not empty");
+        subs.insert_spk(spk_hash(1), moved_status, moved_on);
+
+        assert_eq!(subs.spk_status(spk_hash(2)), Some(shared_status));
+        assert!(
+            subs.spk_history(shared_status).is_some(),
+            "script 2 still answers to the shared status, so its history must still be there"
+        );
+    }
+
+    /// `anchors` is keyed by a tuple, which JSON cannot use as a map key. A caller who chooses
+    /// to persist a [`TxCache`] rather than rebuild it must still be able to.
+    #[test]
+    fn tx_cache_round_trips_through_json() {
         let anchor = (txid(1), bitcoin::BlockHash::from_byte_array([2; 32]));
-        let mut before = Cache::default();
+        let mut before = TxCache::default();
         before
             .anchors
             .insert(anchor, ConfirmationBlockTime::default());
 
         let json = serde_json::to_string(&before).expect("must serialize");
-        let after: Cache = serde_json::from_str(&json).expect("must deserialize");
+        let after: TxCache = serde_json::from_str(&json).expect("must deserialize");
 
         assert_eq!(after.anchors.get(&anchor), before.anchors.get(&anchor));
+    }
+
+    /// A `Cache` carries none of it, so persisting one cannot go stale against the wallet.
+    #[test]
+    fn cache_does_not_persist_the_tx_cache() {
+        let mut before = Cache::default();
+        before.tx_cache.txs.insert(
+            txid(1),
+            Arc::new(bitcoin::Transaction {
+                version: bitcoin::transaction::Version::ONE,
+                lock_time: bitcoin::absolute::LockTime::ZERO,
+                input: Vec::new(),
+                output: Vec::new(),
+            }),
+        );
+
+        let json = serde_json::to_string(&before).expect("must serialize");
+        assert!(
+            !json.contains(&txid(1).to_string()),
+            "the wallet's own data must not be written here: {json}"
+        );
+        let after: Cache = serde_json::from_str(&json).expect("must deserialize");
+        assert!(after.tx_cache.txs.is_empty());
     }
 }

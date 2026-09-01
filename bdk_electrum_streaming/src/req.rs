@@ -6,7 +6,6 @@ use crate::JobId;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum JobRequest {
-    GetHeader(request::Header),
     GetHeaders(request::Headers),
     GetHistory(request::GetHistory),
     GetTx(request::GetTx),
@@ -25,7 +24,6 @@ pub enum UserRequest {
 impl JobRequest {
     pub fn into_raw(self, req_id: u32) -> RawRequest {
         let (method, params) = match self {
-            JobRequest::GetHeader(header) => header.to_method_and_params(),
             JobRequest::GetHeaders(headers) => headers.to_method_and_params(),
             JobRequest::GetHistory(get_history) => get_history.to_method_and_params(),
             JobRequest::GetTx(get_tx) => get_tx.to_method_and_params(),
@@ -42,12 +40,6 @@ impl JobRequest {
 
     pub fn to_raw(&self, req_id: u32) -> RawRequest {
         self.clone().into_raw(req_id)
-    }
-}
-
-impl From<request::Header> for JobRequest {
-    fn from(value: request::Header) -> Self {
-        Self::GetHeader(value)
     }
 }
 
@@ -106,11 +98,10 @@ pub struct PoppedRequest {
 /// Associates responses to their requests and requests to their jobs.
 #[derive(Debug, Clone, Default)]
 pub struct ReqCoord {
-    /// Next request id.
     next_id: u32,
     /// Req id -> the request, and the chain generation it was enqueued at.
     awaiting_responses: HashMap<u32, (JobRequest, u64)>,
-    /// So we won't have duplicate requests.
+    /// Also what an identical request is deduplicated against.
     req_to_job: HashMap<JobRequest, BTreeSet<JobId>>,
     /// Bumped every time the local chain drops blocks.
     chain_generation: u64,
@@ -136,6 +127,24 @@ impl ReqCoord {
             job_ids,
             reorged_since_sent: generation < self.chain_generation,
         })
+    }
+
+    /// Forget every request `job_id` is still waiting on.
+    ///
+    /// A request wanted by another job stays in flight and merely loses `job_id` as an owner.
+    /// One that nothing else wants is dropped outright, so its response is ignored on arrival
+    /// and an identical request is no longer deduplicated against it.
+    pub fn forget_job(&mut self, job_id: JobId) {
+        let mut orphaned = Vec::new();
+        self.req_to_job.retain(|req, job_ids| {
+            if !job_ids.remove(&job_id) || !job_ids.is_empty() {
+                return true;
+            }
+            orphaned.push(req.clone());
+            false
+        });
+        self.awaiting_responses
+            .retain(|_, (req, _)| !orphaned.contains(req));
     }
 
     /// To be called when the local chain drops blocks.

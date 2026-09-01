@@ -1,7 +1,8 @@
 //! BDK Electrum goodness.
 
-use bdk_core::spk_client::FullScanResponse;
-/// Re-export.
+use std::collections::BTreeSet;
+
+use bdk_core::{bitcoin::Txid, spk_client::FullScanResponse};
 pub use electrum_streaming_client;
 
 use bdk_core::ConfirmationBlockTime;
@@ -13,8 +14,6 @@ use electrum_streaming_client::{
 };
 use miniscript::{Descriptor, DescriptorPublicKey};
 pub use state::*;
-mod chain_job;
-pub use chain_job::*;
 mod req;
 pub use req::*;
 mod spk_job;
@@ -25,8 +24,11 @@ mod derived_spk_tracker;
 pub use derived_spk_tracker::*;
 mod blocking_client;
 pub use blocking_client::*;
+mod confirmation_job;
+pub use confirmation_job::*;
 
 pub type Update<K> = FullScanResponse<K, ConfirmationBlockTime>;
+pub type AnchorUpdate = BTreeSet<(ConfirmationBlockTime, Txid)>;
 
 pub type BlockingClientAction<K> = ClientAction<K, Box<BlockingPendingRequest>>;
 pub type AsyncClientAction<K> = ClientAction<K, AsyncPendingRequest>;

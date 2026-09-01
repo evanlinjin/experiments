@@ -200,7 +200,7 @@ where
                 };
                 match action {
                     StateAction::FromServer(raw) => {
-                        if let Some(update) = state.advance(&mut req_queue, raw)? {
+                        if let Some(update) = state.poll(&mut req_queue, raw)? {
                             update_tx
                                 .send(update)
                                 .map_err(|err| anyhow::anyhow!(err.to_string()))

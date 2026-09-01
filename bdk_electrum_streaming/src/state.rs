@@ -1,7 +1,7 @@
-use std::collections::{btree_map, BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use anyhow::Context;
-use bdk_core::{BlockId, CheckPoint, ConfirmationBlockTime};
+use bdk_core::{CheckPoint, ConfirmationBlockTime};
 use electrum_streaming_client::{
     notification::Notification, request, AsyncPendingRequest, BlockingPendingRequest,
     ElectrumScriptHash, ElectrumScriptStatus, MaybeBatch, PendingRequest,
@@ -11,17 +11,18 @@ use miniscript::{Descriptor, DescriptorPublicKey};
 use serde_json::from_value;
 
 use crate::{
-    cache::{Cache, SpkHistories},
-    chain_job::ChainJob,
+    cache::{Cache, Subscriptions},
+    confirmation_job::{ConfirmationJob, ConfirmationProgress},
     req::{JobRequest, PoppedRequest, ReqCoord, ReqQueue},
-    spk_job::SpkJob,
+    spk_job::{SpkJob, SpkProgress},
     DerivedSpkTracker, Update,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum JobId {
     Spk(ElectrumScriptHash),
-    Chain,
+    /// The single job that moves the local chain and anchors what the scripts found.
+    Confirmation,
 }
 
 impl JobId {
@@ -44,12 +45,17 @@ pub struct State<PReq: PendingRequest, K = &'static str> {
     cache: Cache,
 
     spk_jobs: BTreeMap<ElectrumScriptHash, SpkJob>,
-    chain_job: Option<ChainJob>,
+    confirmation_job: Option<ConfirmationJob>,
+
+    /// The update being built up.
+    ///
+    /// Both job kinds write here as they progress, and it is handed to the caller whole when all
+    /// pending jobs complete.
+    staged: Update<K>,
+
     user_state: electrum_streaming_client::State<PReq>,
 
-    /// Whether we have sent initial requests.
-    ///
-    /// This includes subscribing to headers, and existing pending requests.
+    /// Whether the header subscription, spk subscriptions and pending requests have been sent.
     init_reqs_sent: bool,
 }
 
@@ -66,19 +72,19 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
             cp,
             cache,
             spk_jobs: BTreeMap::new(),
-            chain_job: None,
+            confirmation_job: None,
+            staged: Update::default(),
             user_state: electrum_streaming_client::State::new(),
             init_reqs_sent: false,
         }
     }
 
-    /// Get a reference to the internal cache.
     pub fn cache(&self) -> &Cache {
         &self.cache
     }
 
-    pub fn spk_histories(&self) -> &SpkHistories {
-        &self.cache.spk_histories
+    pub fn subscriptions(&self) -> &Subscriptions {
+        &self.cache.subscriptions
     }
 
     /// Reset the state to be not initialized.
@@ -87,7 +93,7 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
     /// subscriptions to the chain or spks will be made.
     pub fn reset(&mut self) {
         tracing::trace!("Reseting state");
-        self.chain_job = None;
+        self.confirmation_job = None;
         self.init_reqs_sent = false;
     }
 
@@ -111,13 +117,12 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
     pub fn init(&mut self, req_queue: &mut ReqQueue) {
         if !self.init_reqs_sent {
             self.init_reqs_sent = true;
-            // Resend pending requests.
             req_queue.extend(self.user_state.pending_requests());
             req_queue.extend(self.coord.pending_requests());
 
             tracing::info!("Queue headers subscribe");
             self.coord
-                .queuer(req_queue, JobId::Chain)
+                .queuer(req_queue, JobId::Confirmation)
                 .enqueue(request::HeadersSubscribe);
 
             for script_hash in self.spk_tracker.all_spk_hashes() {
@@ -142,11 +147,41 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
         );
     }
 
-    pub fn advance(
+    pub fn poll(
         &mut self,
         req_queue: &mut ReqQueue,
         raw: RawNotificationOrResponse,
     ) -> anyhow::Result<Option<Update<K>>> {
+        self.handle(req_queue, raw)?;
+
+        // Any path through `handle` may have been the one that finished a job, so the update is
+        // handed over here rather than in each of them. Both job kinds have to be done.
+        let job = match &mut self.confirmation_job {
+            Some(job) => job,
+            None => return Ok(None),
+        };
+        if !job.is_done() || !self.spk_jobs.values().all(SpkJob::is_done) {
+            return Ok(None);
+        }
+        job.set_idle();
+        // The scripts have been anchored, so their jobs have served their purpose.
+        self.spk_jobs.clear();
+        let update = core::mem::take(&mut self.staged);
+        tracing::info!(
+            tip_height = self.cp.height(),
+            anchors = update.tx_update.anchors.len(),
+            txs = update.tx_update.txs.len(),
+            "Confirmation job finished"
+        );
+        Ok(Some(update))
+    }
+
+    /// Apply one message from the server, driving whatever jobs it touches.
+    fn handle(
+        &mut self,
+        req_queue: &mut ReqQueue,
+        raw: RawNotificationOrResponse,
+    ) -> anyhow::Result<()> {
         self.init(req_queue);
         if let Err(e) = self.user_state.process_incoming(raw.clone()) {
             match e {
@@ -159,71 +194,11 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
                 let notification = Notification::new(&raw_notification)
                     .context("Failed to deserialize notification from server")?;
                 match notification {
-                    Notification::Header(header_notification) => {
-                        // A same-height reorg is applied by `ChainJob`'s short-circuit without
-                        // fetching anything, so this notification is the only place the
-                        // replacement header is ever offered to us. Caching it here saves the
-                        // anchor refetch a round-trip on the very path it exists for.
-                        let header = *header_notification.header();
-                        self.cache.headers.insert(header.block_hash(), header);
-
-                        // Always replace prev job since a new notification means a new tip.
-                        self.chain_job = ChainJob::new(
-                            self.coord.queuer(req_queue, JobId::Chain),
-                            &self.cp,
-                            *header_notification.header(),
-                            header_notification.height(),
-                        );
-                        Ok(self.try_finish_chain_job(req_queue))
+                    Notification::Header(n) => self.on_new_tip(req_queue, n.height(), *n.header()),
+                    Notification::ScriptHash(n) => {
+                        self.on_spk_status(req_queue, n.script_hash(), n.script_status())
                     }
-                    Notification::ScriptHash(script_hash_notification) => {
-                        let spk_hash = script_hash_notification.script_hash();
-                        let spk_status = script_hash_notification.script_status();
-
-                        let (k, i) =
-                            self.spk_tracker
-                                .index_of_spk_hash(spk_hash)
-                                .ok_or(anyhow::anyhow!(
-                                    "unexpected script hash notification: {}",
-                                    spk_hash
-                                ))?;
-
-                        let mut last_active_indices = BTreeMap::new();
-
-                        if spk_status.is_none() {
-                            self.cache.spk_histories.remove(spk_hash);
-                        }
-
-                        if spk_status.is_some() || self.cache.spk_txids.contains_key(&spk_hash) {
-                            for script_hash in self.spk_tracker.mark_script_hash_used(&k, i) {
-                                self.coord
-                                    .queuer(req_queue, JobId::Spk(script_hash))
-                                    .enqueue(request::ScriptHashSubscribe { script_hash });
-                            }
-                            last_active_indices.insert(k, i);
-                        }
-
-                        let mut job = SpkJob::new(&self.cache, spk_hash, spk_status).advance(
-                            &mut self.coord.queuer(req_queue, JobId::Spk(spk_hash)),
-                            &self.cache,
-                            &self.cp,
-                        );
-                        match job.try_finish() {
-                            Some((_, tx_update)) => {
-                                self.spk_jobs.remove(&spk_hash);
-                                Ok(Some(Update {
-                                    tx_update,
-                                    last_active_indices,
-                                    chain_update: Some(self.cp.clone()),
-                                }))
-                            }
-                            None => {
-                                self.spk_jobs.insert(spk_hash, job);
-                                Ok(None)
-                            }
-                        }
-                    }
-                    Notification::Unknown(_) => Ok(None),
+                    Notification::Unknown(_) => Ok(()),
                 }
             }
             RawNotificationOrResponse::Response(raw_response) => {
@@ -233,18 +208,28 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
                     reorged_since_sent,
                 } = match self.coord.pop(raw_response.id) {
                     Some(req) => req,
-                    None => return Ok(None),
+                    None => return Ok(()),
                 };
                 tracing::trace!(?raw_response, ?orig_req, ?job_ids, "Got raw response");
 
                 let raw = match raw_response.result {
                     Ok(raw) => raw,
                     Err(err) => {
-                        // An anchor fetch is speculative: it asks for a proof of inclusion at
-                        // the height a transaction was last reported at, and a reorg may have
-                        // taken the transaction out of that block, or out of the chain
-                        // altogether. A server answers that with an error, which is an answer,
-                        // not a reason to bring the connection down.
+                        // Cancel the jobs waiting on this request.
+                        for jid in job_ids {
+                            match jid {
+                                JobId::Spk(spk_hash) => {
+                                    self.spk_jobs.remove(&spk_hash);
+                                }
+                                JobId::Confirmation => self.confirmation_job = None,
+                            }
+                        }
+
+                        // An anchor fetch is speculative: a reorg may have taken the
+                        // transaction out of the block its height was reported at, or out of the
+                        // chain. An error there is an answer, not a reason to bring the
+                        // connection down. The job went with the loop above, and the next
+                        // notification builds one that asks again.
                         if let JobRequest::GetTxMerkle(req) = &orig_req {
                             tracing::warn!(
                                 txid = req.txid.to_string(),
@@ -252,27 +237,10 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
                                 ?err,
                                 "Server gave no merkle proof at this height. Reorg?",
                             );
-                            // An error about the chain we have since left says nothing about
-                            // the block we now have at this height. Discard it and let the
-                            // jobs ask again.
-                            if reorged_since_sent {
-                                return Ok(self.advance_spk_jobs(req_queue, job_ids));
-                            }
-                            // An error proves nothing about the block we hold, so nothing
-                            // durable is recorded, and there is nowhere to record it: a proof
-                            // request that comes back with nothing leaves no trace.
-                            //
-                            // The job is left stashed rather than cancelled. Returning without
-                            // advancing it is what stops the re-ask loop; keeping it is what
-                            // makes the recovery automatic, since the next chain update advances
-                            // it again and the answer may be different once our chain has caught
-                            // up with the server's. Cancelling would need a notification to
-                            // revive it, and the same-height reorg this all exists for is
-                            // precisely the case that sends none.
-                            return Ok(None);
+                            return Ok(());
                         }
-                        // Cancel jobs that resulted in error.
-                        self.cancel_jobs(job_ids);
+
+                        // The connection goes down here.
                         return Err(anyhow::anyhow!(err).context("Server responded with error"));
                     }
                 };
@@ -280,113 +248,93 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
                 match orig_req {
                     JobRequest::GetHeaders(req) => {
                         let resp = from_raw(&req, raw)?;
-                        self.cache
-                            .headers
-                            .extend(resp.headers.iter().map(|&h| (h.block_hash(), h)));
-                        debug_assert!(job_ids.contains(&JobId::Chain));
-                        if let Some(job) = self.chain_job.take() {
-                            let new_blocks = (req.start_height..)
-                                .zip(resp.headers.into_iter().map(|h| h.block_hash()));
-                            self.chain_job = Some(job.process_blocks(new_blocks));
+                        debug_assert!(job_ids.contains(&JobId::Confirmation));
+                        let blocks = self
+                            .cache
+                            .resolve_headers_query(req, resp)
+                            .collect::<Vec<_>>();
+                        if let Some(job) = &mut self.confirmation_job {
+                            job.resolve_blocks(blocks);
                         }
-                        Ok(self.try_finish_chain_job(req_queue))
-                    }
-                    JobRequest::GetHeader(req) => {
-                        let resp = from_raw(&req, raw)?;
-                        let hash = resp.header.block_hash();
-                        self.cache.headers.insert(hash, resp.header);
-
-                        // The block our own chain has at this height, if it has one.
-                        let ours = self
-                            .cp
-                            .get(req.height)
-                            .filter(|cp| cp.height() == req.height)
-                            .map(|cp| cp.hash());
-
-                        // `blockchain.block.header` is keyed by height, so this is the only
-                        // block the server will ever hand us there. If our chain claims a
-                        // different one it is stale at a height no chain job will rewrite —
-                        // below `ChainJob`'s suffix nothing reports the difference — and the
-                        // header a job is waiting on can never arrive. Asking again would loop
-                        // for as long as the connection is up, so drop the jobs instead and
-                        // let the next notification rebuild them.
-                        if ours.is_some_and(|ours| ours != hash) && !reorged_since_sent {
-                            tracing::warn!(
-                                height = req.height,
-                                ours = ours.expect("just matched").to_string(),
-                                theirs = hash.to_string(),
-                                "Local chain disagrees with the server below the reorg horizon",
-                            );
-                            self.cancel_jobs(job_ids);
-                            return Ok(None);
-                        }
-
-                        // Whether or not the checkpoint chain wants this header, the header
-                        // now being cached is what a waiting anchor may need, and nothing else
-                        // will wake it. So only the insert below is conditional; the jobs are
-                        // advanced either way.
-                        //
-                        // The insert is skipped when the block at this height may have been
-                        // replaced since we asked (`reorged_since_sent`), when it would extend
-                        // the checkpoints, and when we already have this block.
-                        let extends = req.height > self.cp.height();
-                        if !reorged_since_sent && !extends && ours.is_none() {
-                            self.cp = self.cp.clone().insert(BlockId::from((req.height, hash)));
-                        }
-                        Ok(self.advance_spk_jobs(req_queue, job_ids))
+                        self.poll_confirmation_job(req_queue)
                     }
                     JobRequest::GetHistory(req) => {
                         let resp = from_raw(&req, raw)?;
-                        if let Some(spk_status) = ElectrumScriptStatus::from_history(&resp) {
-                            self.cache
-                                .spk_txids
-                                .entry(req.script_hash)
-                                .or_default()
-                                .extend(resp.iter().map(|tx| tx.txid()));
-                            self.cache
-                                .spk_histories
-                                .insert(req.script_hash, spk_status, resp);
+                        let resp_status = self.cache.resolve_history_query(req, resp);
+
+                        // A history that does not hash to the status a job awaits can never
+                        // satisfy it, and the two differing means the status moved — so a
+                        // notification is coming, and it will build the job again.
+                        let superseded = self.spk_jobs.get(&req.script_hash).is_some_and(|job| {
+                            job.awaiting_history()
+                                .is_some_and(|awaited| Some(awaited) != resp_status)
+                        });
+                        if superseded {
+                            tracing::debug!(
+                                spk_hash = req.script_hash.to_string(),
+                                "History answers a status the job is not waiting for. Dropping.",
+                            );
+                            self.spk_jobs.remove(&req.script_hash);
                         }
-                        Ok(self.advance_spk_jobs(req_queue, job_ids))
+                        self.poll_spk_jobs(req_queue, job_ids)?;
+                        self.poll_confirmation_job(req_queue)
                     }
                     JobRequest::GetTx(get_tx) => {
                         let resp = from_raw(&get_tx, raw)?;
-                        self.cache.txs.insert(get_tx.txid, resp.tx.into());
-                        Ok(self.advance_spk_jobs(req_queue, job_ids))
+                        self.cache.tx_cache.txs.insert(get_tx.txid, resp.tx.into());
+                        self.poll_spk_jobs(req_queue, job_ids)?;
+                        self.poll_confirmation_job(req_queue)
                     }
                     JobRequest::GetTxMerkle(req) => {
                         let resp = from_raw(&req, raw)?;
 
-                        // The proof was built against the server's chain at the time we asked,
-                        // which may not be the block we now have at this height. Checking it
-                        // against that block would read a disagreement between two chains as a
-                        // verdict on this one, so discard it and let the job ask again.
+                        // The proof answers the server's chain as it was when we asked. Checking
+                        // it against the block we now hold would read a disagreement between two
+                        // chains as a verdict on this one, so discard it and ask again.
                         if reorged_since_sent {
-                            return Ok(self.advance_spk_jobs(req_queue, job_ids));
+                            return self.poll_confirmation_job(req_queue);
                         }
 
                         let cp = match self.cp.get(req.height) {
-                            Some(cp) if cp.height() == req.height => cp,
-                            _ => {
-                                tracing::warn!(
+                            Some(cp) => cp,
+                            // Not expected to fire: the job places every height before it asks
+                            // a proof for it, and a height leaving the chain bumps the generation
+                            // the check above catches. Getting here is our own bookkeeping
+                            // breaking, not the server misbehaving.
+                            None => {
+                                debug_assert!(
+                                    false,
+                                    "proof for height {}, which is not in our chain",
+                                    req.height
+                                );
+                                tracing::error!(
                                     ?req,
                                     ?resp,
-                                    "Received a merkle proof before we got the header"
+                                    "Received a merkle proof before we placed the block"
                                 );
-                                self.cancel_jobs(job_ids);
-                                return Ok(None);
+                                self.confirmation_job = None;
+                                return Ok(());
                             }
                         };
                         let header = match self.cache.headers.get(&cp.hash()) {
                             Some(header) => *header,
+                            // Not expected either, and a reorg is not the reason — that is the
+                            // check above. Every header a job puts in the chain lands in
+                            // `Cache::headers` as it arrives, and nothing prunes them.
                             None => {
-                                tracing::warn!(
+                                debug_assert!(
+                                    false,
+                                    "no header for {}, the block we hold at height {}",
+                                    cp.hash(),
+                                    req.height
+                                );
+                                tracing::error!(
                                     ?req,
                                     blockhash = cp.hash().to_string(),
-                                    "Missing associated header. Reorg?",
+                                    "No header for the block we hold at this height",
                                 );
-                                self.cancel_jobs(job_ids);
-                                return Ok(None);
+                                self.confirmation_job = None;
+                                return Ok(());
                             }
                         };
                         let exp_root = resp.expected_merkle_root(req.txid);
@@ -397,7 +345,7 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
                                 block_hash = header.block_hash().to_string(),
                                 "Inserting anchor.",
                             );
-                            self.cache.anchors.insert(
+                            self.cache.tx_cache.anchors.insert(
                                 (req.txid, header.block_hash()),
                                 ConfirmationBlockTime {
                                     block_id: cp.block_id(),
@@ -413,219 +361,216 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
                                 expected_root = exp_root.to_string(),
                                 "Proof does not match the block we have at this height",
                             );
-                            // The server proves inclusion in whichever block *it* has at this
-                            // height, so a mismatch says our chain and the server's disagree
-                            // there — not that the transaction is absent from our block. That is
-                            // the conclusion `GetHeader` draws from the same kind of evidence,
-                            // so it gets the same treatment: drop the jobs and let the next
-                            // notification rebuild them.
-                            self.cancel_jobs(job_ids);
-                            return Ok(None);
+                            self.confirmation_job = None;
+                            return Ok(());
                         }
-                        Ok(self.advance_spk_jobs(req_queue, job_ids))
+                        self.poll_confirmation_job(req_queue)
                     }
                     JobRequest::ScriptHashSubscribe(req) => {
-                        let spk_hash = req.script_hash;
                         let spk_status = from_raw(&req, raw)?;
-
-                        let (k, i) =
-                            self.spk_tracker
-                                .index_of_spk_hash(spk_hash)
-                                .ok_or(anyhow::anyhow!(
-                            "response's request spk was never registered in the spk tracker: {}",
-                            spk_hash
-                        ))?;
-
-                        let mut last_active_indices = BTreeMap::new();
-
-                        if spk_status.is_none() {
-                            self.cache.spk_histories.remove(spk_hash);
-                        }
-
-                        if spk_status.is_some() || self.cache.spk_txids.contains_key(&spk_hash) {
-                            for script_hash in self.spk_tracker.mark_script_hash_used(&k, i) {
-                                self.coord
-                                    .queuer(req_queue, JobId::Spk(script_hash))
-                                    .enqueue(request::ScriptHashSubscribe { script_hash });
-                            }
-                            last_active_indices.insert(k, i);
-                        }
-
-                        let mut job = SpkJob::new(&self.cache, spk_hash, spk_status).advance(
-                            &mut self.coord.queuer(req_queue, JobId::Spk(spk_hash)),
-                            &self.cache,
-                            &self.cp,
-                        );
-
-                        match job.try_finish() {
-                            Some((_, tx_update)) => Ok(Some(Update {
-                                tx_update,
-                                last_active_indices,
-                                chain_update: Some(self.cp.clone()),
-                            })),
-                            None => {
-                                self.spk_jobs.insert(spk_hash, job);
-                                Ok(None)
-                            }
-                        }
+                        self.on_spk_status(req_queue, req.script_hash, spk_status)
                     }
                     JobRequest::HeadersSubscribe(req) => {
                         let resp = from_raw(&req, raw)?;
-                        self.cache
-                            .headers
-                            .insert(resp.header.block_hash(), resp.header);
-
-                        // Always replace prev job since a new notification means a new tip.
-                        self.chain_job = ChainJob::new(
-                            self.coord.queuer(req_queue, JobId::Chain),
-                            &self.cp,
-                            resp.header,
-                            resp.height,
-                        );
-                        Ok(self.try_finish_chain_job(req_queue))
+                        self.on_new_tip(req_queue, resp.height, resp.header)
                     }
                 }
             }
         }
     }
 
-    /// Apply the pending chain job to the local chain, if it has everything it needs.
-    ///
-    /// Returns the resulting update, if the job completed.
-    fn try_finish_chain_job(&mut self, req_queue: &mut ReqQueue) -> Option<Update<K>> {
-        let job = self.chain_job.take()?;
-        let prev_cp = self.cp.clone();
-        match job.try_finish(&mut self.cp) {
-            Ok(cp) => Some(self.on_chain_job_completed(req_queue, &prev_cp, cp)),
-            Err(job) => {
-                self.chain_job = Some(job);
-                None
-            }
-        }
-    }
-
-    /// React to the local chain having moved from `prev_cp` to `cp`.
-    ///
-    /// Spk jobs cannot extend the local chain, so a job whose anchor is above the local tip
-    /// waits with no request in flight. Advancing the tip is what makes such an anchor
-    /// resolvable, so every completed chain job must re-advance the stashed spk jobs.
-    ///
-    /// A chain job may also drop blocks. Any transaction we have seen at an evicted height is
-    /// anchored to a block which is no longer ours, so its anchor has to be refetched — and a
-    /// spk notification will not tell us to, since a transaction which moved to a different
-    /// block of the same height leaves the spk status untouched.
-    fn on_chain_job_completed(
+    /// React to the server announcing `header` at `height` as its tip.
+    fn on_new_tip(
         &mut self,
         req_queue: &mut ReqQueue,
-        prev_cp: &CheckPoint,
-        cp: CheckPoint,
-    ) -> Update<K> {
-        let evicted = evicted_heights(prev_cp, &cp);
-        if !evicted.is_empty() {
-            tracing::info!(
-                heights = ?evicted,
-                "Blocks evicted from the local chain. Refetching anchors."
-            );
-            // Responses to requests which are still in flight describe the chain we just left
-            // behind.
-            self.coord.bump_chain_generation();
+        height: u32,
+        header: bdk_core::bitcoin::block::Header,
+    ) -> anyhow::Result<()> {
+        // A same-height reorg is applied without fetching anything, so this announcement is the
+        // only place the replacement header is ever offered to us. Caching it here saves the
+        // anchor refetch a round-trip on the very path it exists for.
+        self.cache.headers.insert(header.block_hash(), header);
 
-            // Start each affected script the job its own notification would have started, from
-            // the status and history already cached: a script hash notification we raise
-            // ourselves, because the server will not raise one. A transaction which moved to a
-            // different block of the same height leaves the status untouched.
-            for spk_hash in self.cache.spk_histories.spk_hashes_at_heights(evicted) {
-                // A vacant entry is the whole rule: never displace a job the server's own
-                // notification built, since that one carries a status at least as new as
-                // anything we could replay, and every stashed job is re-advanced below anyway.
-                if let btree_map::Entry::Vacant(e) = self.spk_jobs.entry(spk_hash) {
-                    if let Some(status) = self.cache.spk_histories.status(spk_hash) {
-                        e.insert(SpkJob::new(&self.cache, spk_hash, Some(status)));
-                    }
+        match &mut self.confirmation_job {
+            Some(job) => {
+                if job.set_tip(height, header) {
+                    // The tip we were heading for is gone, and its requests go with it: the
+                    // replacement asks for the same heights, so a survivor would be deduplicated
+                    // against and fill the new job with the chain the server just left.
+                    self.coord.forget_job(JobId::Confirmation);
+                }
+            }
+            None => self.confirmation_job = Some(ConfirmationJob::new(height, header)),
+        }
+        self.poll_confirmation_job(req_queue)
+    }
+
+    /// React to the server reporting `spk_status` for `spk_hash`.
+    fn on_spk_status(
+        &mut self,
+        req_queue: &mut ReqQueue,
+        spk_hash: ElectrumScriptHash,
+        spk_status: Option<ElectrumScriptStatus>,
+    ) -> anyhow::Result<()> {
+        let (k, i) = self
+            .spk_tracker
+            .index_of_spk_hash(spk_hash)
+            .ok_or(anyhow::anyhow!(
+                "unexpected script hash notification: {}",
+                spk_hash
+            ))?;
+
+        if spk_status.is_none() {
+            self.cache.subscriptions.remove_spk(spk_hash);
+        }
+
+        if spk_status.is_some() || self.cache.tx_cache.spk_txids.contains_key(&spk_hash) {
+            for script_hash in self.spk_tracker.mark_script_hash_used(&k, i) {
+                self.coord
+                    .queuer(req_queue, JobId::Spk(script_hash))
+                    .enqueue(request::ScriptHashSubscribe { script_hash });
+            }
+            self.staged.last_active_indices.insert(k, i);
+        }
+
+        self.spk_jobs
+            .insert(spk_hash, SpkJob::new(&self.cache, spk_hash, spk_status));
+        self.poll_spk_jobs(req_queue, [JobId::Spk(spk_hash)])?;
+        // A notification is all that revives a cancelled job, and below the reorg window the
+        // tip never moves — so this is where an anchor the server has come back to is picked up.
+        if self.confirmation_job.is_none() {
+            match self.cache.headers.get(&self.cp.hash()) {
+                Some(&header) => {
+                    self.confirmation_job = Some(ConfirmationJob::new(self.cp.height(), header));
+                }
+                // Not expected to fire: a tip is only adopted through a notification, which
+                // caches its header. Ask for the tip rather than leave the anchors waiting on a
+                // block ten minutes out; a request already in flight absorbs this one.
+                None => {
+                    tracing::warn!(
+                        tip_height = self.cp.height(),
+                        tip_hash = self.cp.hash().to_string(),
+                        "No header for our tip, so no confirmation job can be built. Resubscribing."
+                    );
+                    self.coord
+                        .queuer(req_queue, JobId::Confirmation)
+                        .enqueue(request::HeadersSubscribe);
                 }
             }
         }
-
-        // Only heights inside `ChainJob`'s reorg window can ever be evicted, and only evicted
-        // heights are ever read back, so entries far below the tip can never be consulted
-        // again. Pruning keeps this bounded with a wide margin over that horizon.
-        self.cache.spk_histories.prune(cp.height());
-
-        let stashed_jobs = self
-            .spk_jobs
-            .keys()
-            .map(|&spk_hash| JobId::Spk(spk_hash))
-            .collect::<Vec<_>>();
-        let mut update = self
-            .advance_spk_jobs(req_queue, stashed_jobs)
-            .unwrap_or_default();
-        update.chain_update = Some(cp);
-        update
+        self.poll_confirmation_job(req_queue)
     }
 
-    fn advance_spk_jobs(
+    /// Poll the named spk jobs, staging whatever each one has finished gathering.
+    ///
+    /// Jobs are left in place when they finish: the update they contribute to is published
+    /// only once [`ConfirmationJob`] completes, and they are cleared then.
+    fn poll_spk_jobs(
         &mut self,
         req_queue: &mut ReqQueue,
         job_ids: impl IntoIterator<Item = JobId>,
-    ) -> Option<Update<K>> {
-        let mut update = Option::<Update<K>>::None;
-        let spk_hashes = job_ids.into_iter().filter_map(|jid| jid.spk_hash());
-        for spk_hash in spk_hashes {
-            if let Some(mut job) = self.spk_jobs.remove(&spk_hash) {
-                job = job.advance(
-                    &mut self.coord.queuer(req_queue, JobId::Spk(spk_hash)),
-                    &self.cache,
-                    &self.cp,
-                );
-                match job.try_finish() {
-                    Some((spk_hash, tx_update)) => {
-                        let update = update.get_or_insert(Update::default());
-                        update.tx_update.extend(tx_update);
-                        update
+    ) -> anyhow::Result<()> {
+        // Borrowed field by field so a job is polled where it sits, not lifted out and put back.
+        let Self {
+            spk_tracker,
+            coord,
+            cache,
+            spk_jobs,
+            staged,
+            ..
+        } = self;
+
+        for spk_hash in job_ids.into_iter().filter_map(JobId::spk_hash) {
+            let job = match spk_jobs.get_mut(&spk_hash) {
+                Some(job) => job,
+                None => continue,
+            };
+            loop {
+                let mut queuer = coord.queuer(req_queue, JobId::Spk(spk_hash));
+                match job.poll(&mut queuer, cache)? {
+                    SpkProgress::Continue => continue,
+                    SpkProgress::Blocked => break,
+                    SpkProgress::Done(tx_update) => {
+                        tracing::info!(
+                            elapsed_seconds = job.elapsed_seconds(),
+                            spk_hash = spk_hash.to_string(),
+                            "Spk job finished"
+                        );
+                        staged.tx_update.extend(tx_update);
+                        staged
                             .last_active_indices
-                            .extend(self.spk_tracker.index_of_spk_hash(spk_hash));
-                    }
-                    None => {
-                        self.spk_jobs.insert(spk_hash, job);
+                            .extend(spk_tracker.index_of_spk_hash(spk_hash));
+                        break;
                     }
                 }
             }
         }
-        if let Some(update) = &mut update {
-            update.chain_update = Some(self.cp.clone());
-        }
-        update
+        Ok(())
     }
 
-    fn cancel_jobs(&mut self, job_ids: impl IntoIterator<Item = JobId>) {
-        for jid in job_ids {
-            match jid {
-                JobId::Spk(spk_hash) => {
-                    self.spk_jobs.remove(&spk_hash);
-                }
-                JobId::Chain => {
-                    self.chain_job = None;
-                }
-            }
+    /// Drive the confirmation job as far as it will go.
+    ///
+    /// Held back only until every script has its history. The job works from the heights those
+    /// histories name, so a script still downloading the transactions in its own history has
+    /// already told the job everything it needs — and holding for the downloads would serialise
+    /// the header and proof fetches behind them for nothing.
+    fn poll_confirmation_job(&mut self, req_queue: &mut ReqQueue) -> anyhow::Result<()> {
+        if self
+            .spk_jobs
+            .values()
+            .any(|job| job.awaiting_history().is_some())
+        {
+            return Ok(());
         }
-    }
-}
+        let mut job = match self.confirmation_job.take() {
+            Some(job) => job,
+            None => return Ok(()),
+        };
+        // Scoped by what the server has told us about, not by which jobs happen to be live:
+        // those are cleared on every completion, so a single notification arriving between
+        // updates would narrow the next reorg's repair to that one script.
+        job.set_statuses(self.cache.subscriptions.spk_statuses());
 
-/// The heights whose block was dropped from the local chain when it went from `prev` to `next`.
-///
-/// Checkpoint chains share everything below the point at which they diverge, so walking `prev`
-/// down from its tip until `next` agrees is enough.
-fn evicted_heights(prev: &CheckPoint, next: &CheckPoint) -> BTreeSet<u32> {
-    let mut evicted = BTreeSet::new();
-    for cp in prev.iter() {
-        match next.get(cp.height()) {
-            Some(next_cp) if next_cp.hash() == cp.hash() => break,
-            _ => {
-                evicted.insert(cp.height());
+        loop {
+            let progress = {
+                let mut queuer = self.coord.queuer(req_queue, JobId::Confirmation);
+                match job.poll(&mut queuer, &self.cache, &self.cp) {
+                    Ok(progress) => progress,
+                    Err(err) => {
+                        self.confirmation_job = Some(job);
+                        return Err(err);
+                    }
+                }
+            };
+            match progress {
+                ConfirmationProgress::Continue => continue,
+                ConfirmationProgress::CheckPointUpdate { cp, evicted } => {
+                    if !evicted.is_empty() {
+                        tracing::info!(
+                            heights = ?evicted,
+                            "Blocks evicted from the local chain. Refetching anchors."
+                        );
+                        // Responses to requests which are still in flight describe the chain we
+                        // just left behind.
+                        self.coord.bump_chain_generation();
+                    }
+                    self.cp = cp.clone();
+                    self.staged.chain_update = Some(cp);
+                    continue;
+                }
+                ConfirmationProgress::AnchorUpdate(anchors) => {
+                    // Assigned, not extended: each pass re-resolves the whole set at once.
+                    self.staged.tx_update.anchors = anchors;
+                    continue;
+                }
+                // Nothing more to do this round. Whether the job owes an update is settled by
+                // `poll`, once the scripts can be checked alongside it.
+                ConfirmationProgress::Blocked | ConfirmationProgress::Done => break,
             }
         }
+        self.confirmation_job = Some(job);
+        Ok(())
     }
-    evicted
 }
 
 pub fn from_raw<R>(_req: &R, raw: serde_json::Value) -> Result<R::Response, serde_json::Error>
