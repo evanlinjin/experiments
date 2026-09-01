@@ -2077,3 +2077,55 @@ fn confirmation_job_runs_ahead_but_the_update_waits_for_the_scripts() -> anyhow:
     );
     Ok(())
 }
+
+/// A transaction is cached under the txid it was asked for, never under the one it claims.
+///
+/// Nothing downstream can catch a substitution: the prevouts of the wrong transaction resolve
+/// into `txouts` as if they were the right one's, and a caller sees inputs that were never
+/// spent. `SpkJob::poll` errors only in the narrow case where the substitute is too short to
+/// reach a spent vout, which a server picking any longer transaction sails past.
+#[test]
+fn a_transaction_that_is_not_the_one_asked_for_is_rejected() -> anyhow::Result<()> {
+    let (descriptor, _spk_hash, spk) = tracked_descriptor()?;
+    let tx = tx_paying(&spk, 50_000);
+    // Same shape, different value, so it is a perfectly valid transaction with another txid.
+    let impostor = tx_paying(&spk, 60_000);
+    assert_ne!(impostor.compute_txid(), tx.compute_txid());
+    let (genesis, header_1) = base_headers();
+
+    let mut state = new_state(Cache::default(), descriptor, genesis);
+    let mut queue = ReqQueue::new();
+    let server = Server {
+        headers: vec![genesis, header_1],
+        txs: vec![(tx, 1)],
+        merkle_proof: (Vec::new(), 0),
+    };
+
+    // Answer the initial sync honestly, except that every transaction comes back as the
+    // impostor. The subscribe response carries the status, so this drives the whole flow.
+    state.init(&mut queue);
+    let mut substituted = false;
+    let mut result = Ok(None);
+    while let Some(req) = queue.pop_front() {
+        let msg = if req.method.as_ref() == "blockchain.transaction.get" {
+            substituted = true;
+            raw_msg(json!({
+                "jsonrpc": "2.0",
+                "id": req.id,
+                "result": serialize_hex(&impostor),
+            }))
+        } else {
+            response(&req, &server)
+        };
+        result = state.poll(&mut queue, msg);
+        if result.is_err() {
+            break;
+        }
+    }
+    assert!(substituted, "the test must have answered a `GetTx`");
+    assert!(
+        result.is_err(),
+        "a transaction that is not the one asked for must not be accepted",
+    );
+    Ok(())
+}

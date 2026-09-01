@@ -281,6 +281,17 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
                     }
                     JobRequest::GetTx(get_tx) => {
                         let resp = from_raw(&get_tx, raw)?;
+                        // The cache is keyed by the txid we asked for, so a transaction that
+                        // hashes to anything else is filed under an id that is not its own, and
+                        // every prevout resolved through it comes from the wrong transaction.
+                        let txid = resp.tx.compute_txid();
+                        if txid != get_tx.txid {
+                            return Err(anyhow::anyhow!(
+                                "server answered `blockchain.transaction.get` for {} with {}",
+                                get_tx.txid,
+                                txid,
+                            ));
+                        }
                         self.cache.tx_cache.txs.insert(get_tx.txid, resp.tx.into());
                         self.poll_spk_jobs(req_queue, job_ids)?;
                         self.poll_confirmation_job(req_queue)
