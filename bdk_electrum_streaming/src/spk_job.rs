@@ -183,45 +183,47 @@ impl SpkJob {
         tip: &CheckPoint,
     ) -> (Self, bool) {
         match self.stage {
-            SpkJobStage::ProcessingHistory { status } => match cache.spk_histories.get(&status) {
-                Some(history) => {
-                    if let Some(prev_txids) = cache.spk_txids.get(&self.spk_hash) {
-                        let these_txids =
-                            history.iter().map(|tx| tx.txid()).collect::<BTreeSet<_>>();
-                        let to_evict = prev_txids
-                            .difference(&these_txids)
-                            .map(|&txid| (txid, self.start.as_secs()));
-                        self.tx_update.evicted_ats.extend(to_evict);
-                    }
-                    for tx in history {
-                        if let response::Tx::Mempool(tx) = tx {
-                            self.tx_update
-                                .seen_ats
-                                .insert((tx.txid, self.start.as_secs()));
+            SpkJobStage::ProcessingHistory { status } => {
+                match cache.spk_histories.get(self.spk_hash, status) {
+                    Some(history) => {
+                        if let Some(prev_txids) = cache.spk_txids.get(&self.spk_hash) {
+                            let these_txids =
+                                history.iter().map(|tx| tx.txid()).collect::<BTreeSet<_>>();
+                            let to_evict = prev_txids
+                                .difference(&these_txids)
+                                .map(|&txid| (txid, self.start.as_secs()));
+                            self.tx_update.evicted_ats.extend(to_evict);
                         }
-                    }
+                        for tx in history {
+                            if let response::Tx::Mempool(tx) = tx {
+                                self.tx_update
+                                    .seen_ats
+                                    .insert((tx.txid, self.start.as_secs()));
+                            }
+                        }
 
-                    let txs = TxsJobStage::from_missing_txs(history.iter().map(|tx| tx.txid()));
-                    let anchors = history
-                        .iter()
-                        .filter_map(|tx| {
-                            let height = tx.confirmation_height()?.to_consensus_u32();
-                            Some((height, tx.txid()))
-                        })
-                        .collect();
-                    self.stage = SpkJobStage::ProcessingTxsAndAnchors {
-                        txs,
-                        anchors,
-                        anchors_resolved: false,
-                    };
-                    (self, true)
+                        let txs = TxsJobStage::from_missing_txs(history.iter().map(|tx| tx.txid()));
+                        let anchors = history
+                            .iter()
+                            .filter_map(|tx| {
+                                let height = tx.confirmation_height()?.to_consensus_u32();
+                                Some((height, tx.txid()))
+                            })
+                            .collect();
+                        self.stage = SpkJobStage::ProcessingTxsAndAnchors {
+                            txs,
+                            anchors,
+                            anchors_resolved: false,
+                        };
+                        (self, true)
+                    }
+                    None => {
+                        let script_hash = self.spk_hash;
+                        queuer.enqueue(request::GetHistory { script_hash });
+                        (self, false)
+                    }
                 }
-                None => {
-                    let script_hash = self.spk_hash;
-                    queuer.enqueue(request::GetHistory { script_hash });
-                    (self, false)
-                }
-            },
+            }
             SpkJobStage::ProcessingTxsAndAnchors {
                 mut txs, anchors, ..
             } => {
