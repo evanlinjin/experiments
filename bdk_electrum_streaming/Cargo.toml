@@ -1,7 +1,7 @@
 [package]
 name = "bdk_electrum_streaming"
-version = "0.6.0"
-description = "Experimental but sane BDK electrum client by @evanlinjin."
+version = "0.7.0"
+description = "An async/blocking Electrum client for BDK, built as an explicit streaming state machine."
 license = "MIT OR Apache-2.0"
 edition = "2021"
 rust-version = "1.70"
