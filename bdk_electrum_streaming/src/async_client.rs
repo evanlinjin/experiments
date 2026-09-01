@@ -1,4 +1,4 @@
-//! Yoo
+//! Driving [`State`](crate::State) over an async transport.
 
 use anyhow::Context;
 use electrum_streaming_client::{
@@ -146,7 +146,7 @@ where
                             );
                         },
                     };
-                    if let Some(update) = state.advance(&mut req_queue, raw)? {
+                    if let Some(update) = state.poll(&mut req_queue, raw)? {
                         update_tx.unbounded_send(update).map_err(|err| anyhow::anyhow!(err.to_string()))?;
                     }
                 }

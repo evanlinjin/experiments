@@ -5,76 +5,82 @@ use std::{
 
 use bdk_core::{
     bitcoin::{OutPoint, Txid},
-    CheckPoint, ConfirmationBlockTime, TxUpdate,
+    ConfirmationBlockTime, TxUpdate,
 };
 use electrum_streaming_client::{request, response, ElectrumScriptHash, ElectrumScriptStatus};
 
 use crate::{req::ReqQueuer, Cache};
 
+/// Where a [`SpkJob`] has got to.
+///
+/// Each stage names what the job is still waiting for, so being finished is a stage of its own
+/// rather than the absence of one.
 #[derive(Debug)]
-pub enum SpkJobStage {
-    ProcessingHistory {
-        /// The status for which we are fetching.
-        status: ElectrumScriptStatus,
-    },
-    ProcessingTxsAndAnchors {
-        txs: Option<TxsJobStage>,
-        anchors: BTreeSet<(u32, Txid)>,
-    },
+pub enum SpkStage {
+    /// Waiting on the history the status stands for.
+    ProcessingHistory { status: ElectrumScriptStatus },
+    /// Waiting on the transactions that history named.
+    ProcessingTxs(BTreeSet<Txid>),
+    /// Waiting on the outputs those transactions spend.
+    ProcessingPrevouts(BTreeSet<OutPoint>),
+    /// Everything the job asked for has arrived.
+    Done,
 }
 
-impl SpkJobStage {
-    pub fn done() -> Self {
-        Self::ProcessingTxsAndAnchors {
-            txs: None,
-            anchors: BTreeSet::new(),
-        }
-    }
-
-    /// Whether it's done.
-    pub fn is_done(&self) -> bool {
-        matches!(self, SpkJobStage::ProcessingTxsAndAnchors { txs, anchors } if txs.is_none() && anchors.is_empty())
-    }
-}
-
-#[derive(Debug)]
-pub enum TxsJobStage {
-    Txs(BTreeSet<Txid>),
-    Prevouts(BTreeSet<OutPoint>),
-}
-
-impl TxsJobStage {
-    pub fn from_missing_txs(txids: impl IntoIterator<Item = Txid>) -> Option<Self> {
+impl SpkStage {
+    /// What follows a history, given every txid it named.
+    fn from_txids(txids: impl IntoIterator<Item = Txid>) -> Self {
         let txids = txids.into_iter().collect::<BTreeSet<_>>();
         if txids.is_empty() {
-            None
+            Self::Done
         } else {
-            Some(Self::Txs(txids))
+            Self::ProcessingTxs(txids)
         }
     }
 
-    pub fn from_missing_prev_txs(outpoints: impl IntoIterator<Item = OutPoint>) -> Option<Self> {
-        let prev_txs = outpoints.into_iter().collect::<BTreeSet<_>>();
-        if prev_txs.is_empty() {
-            None
+    /// What follows the transactions, given every output they spend.
+    fn from_prevouts(outpoints: impl IntoIterator<Item = OutPoint>) -> Self {
+        let prevouts = outpoints.into_iter().collect::<BTreeSet<_>>();
+        if prevouts.is_empty() {
+            Self::Done
         } else {
-            Some(Self::Prevouts(prev_txs))
+            Self::ProcessingPrevouts(prevouts)
         }
     }
+
+    pub fn is_done(&self) -> bool {
+        matches!(self, SpkStage::Done)
+    }
+}
+
+/// What one [`SpkJob::poll`] achieved.
+#[derive(Debug)]
+pub enum SpkProgress {
+    /// A stage completed; poll again.
+    Continue,
+    /// Waiting on the server.
+    Blocked,
+    /// Everything asked for has arrived. Carries what the job gathered, leaving it empty, so a
+    /// job polled again after finishing contributes nothing a second time.
+    Done(TxUpdate<ConfirmationBlockTime>),
 }
 
 /// The job to perform once we receive a script status notification.
+///
+/// Fetches the script's history, the transactions in it, and the outputs those transactions
+/// spend. Anchoring them is [`ConfirmationJob`]'s work: a transaction's anchor depends on the chain,
+/// which no single script can move, so resolving anchors per-script had every job racing a
+/// tip that only one of them could move.
+///
+/// [`ConfirmationJob`]: crate::ConfirmationJob
 #[derive(Debug)]
 pub struct SpkJob {
-    /// Time that we got this notification.
+    /// When the notification that started this job arrived.
     pub start: Duration,
-    /// Script hash of this notification.
     pub spk_hash: ElectrumScriptHash,
 
-    pub stage: SpkJobStage,
-
-    /// Staged tx update.
-    pub tx_update: TxUpdate<ConfirmationBlockTime>,
+    stage: SpkStage,
+    tx_update: TxUpdate<ConfirmationBlockTime>,
 }
 
 impl SpkJob {
@@ -87,14 +93,14 @@ impl SpkJob {
         let mut tx_update = TxUpdate::default();
 
         let stage = match spk_status {
-            Some(status) => SpkJobStage::ProcessingHistory { status },
+            Some(status) => SpkStage::ProcessingHistory { status },
             None => {
-                if let Some(prev_txids) = cache.spk_txids.get(&spk_hash) {
+                if let Some(prev_txids) = cache.tx_cache.spk_txids.get(&spk_hash) {
                     tx_update
                         .evicted_ats
                         .extend(prev_txids.iter().map(|&txid| (txid, start.as_secs())));
                 }
-                SpkJobStage::done()
+                SpkStage::Done
             }
         };
 
@@ -106,204 +112,149 @@ impl SpkJob {
         }
     }
 
-    pub fn elapsed_seconds(&self) -> String {
-        let duration = UNIX_EPOCH.elapsed().expect("must get current timestamp") - self.start;
-        let seconds = duration.as_secs();
-        let subsec = duration.subsec_millis();
-        format!("{seconds}s {subsec}ms")
-    }
-
-    /// Try fullfill all that is missing.
-    pub fn advance(mut self, queuer: &mut ReqQueuer, cache: &Cache, cp: &CheckPoint) -> Self {
-        let mut made_progress = true;
-        while made_progress {
-            (self, made_progress) = self.try_advance_once(queuer, cache, cp.clone());
-            let stage_str = match &self.stage {
-                SpkJobStage::ProcessingHistory { status } => format!("ProcessingHistory({status})"),
-                SpkJobStage::ProcessingTxsAndAnchors { txs, anchors } => {
-                    let inner_str = match txs {
-                        Some(TxsJobStage::Txs(txids)) => format!("txs = {}", txids.len()),
-                        Some(TxsJobStage::Prevouts(ops)) => format!("prevouts = {}", ops.len()),
-                        None => "tx_done".to_string(),
-                    };
-                    format!(
-                        "ProcessingTxsAndAnchors({inner_str}, anchors = {})",
-                        anchors.len()
-                    )
-                }
-            };
-            tracing::trace!(
-                elapsed_seconds = self.elapsed_seconds(),
-                spk_hash = self.spk_hash.to_string(),
-                stage = stage_str,
-                "Spk job progress"
-            );
-        }
-        self
-    }
-
-    pub fn try_finish(&mut self) -> Option<(ElectrumScriptHash, TxUpdate<ConfirmationBlockTime>)> {
-        if self.stage.is_done() {
-            tracing::trace!(
-                elapsed_seconds = self.elapsed_seconds(),
-                spk_hash = self.spk_hash.to_string(),
-                "Spk job not finished"
-            );
-            Some((self.spk_hash, core::mem::take(&mut self.tx_update)))
-        } else {
-            tracing::info!(
-                elapsed_seconds = self.elapsed_seconds(),
-                spk_hash = self.spk_hash.to_string(),
-                "Spk job finished"
-            );
-            None
-        }
-    }
-
-    /// Try fullfill all that is missing.
+    /// The status this job is still waiting on a history for.
     ///
-    /// Returns self + bool representing whether we did advance.
-    fn try_advance_once(
-        mut self,
-        queuer: &mut ReqQueuer,
-        cache: &Cache,
-        tip: CheckPoint,
-    ) -> (Self, bool) {
+    /// `None` once the history is in hand, or when the script had none to begin with.
+    pub fn awaiting_history(&self) -> Option<ElectrumScriptStatus> {
         match self.stage {
-            SpkJobStage::ProcessingHistory { status } => match cache.spk_histories.get(&status) {
-                Some(history) => {
-                    if let Some(prev_txids) = cache.spk_txids.get(&self.spk_hash) {
-                        let these_txids =
-                            history.iter().map(|tx| tx.txid()).collect::<BTreeSet<_>>();
-                        let to_evict = prev_txids
-                            .difference(&these_txids)
-                            .map(|&txid| (txid, self.start.as_secs()));
-                        self.tx_update.evicted_ats.extend(to_evict);
-                    }
-                    for tx in history {
-                        if let response::Tx::Mempool(tx) = tx {
-                            self.tx_update
-                                .seen_ats
-                                .insert((tx.txid, self.start.as_secs()));
-                        }
-                    }
+            SpkStage::ProcessingHistory { status } => Some(status),
+            _ => None,
+        }
+    }
 
-                    let txs = TxsJobStage::from_missing_txs(history.iter().map(|tx| tx.txid()));
-                    let anchors = history
-                        .iter()
-                        .filter_map(|tx| {
-                            let height = tx.confirmation_height()?.to_consensus_u32();
-                            Some((height, tx.txid()))
-                        })
-                        .collect();
-                    self.stage = SpkJobStage::ProcessingTxsAndAnchors { txs, anchors };
-                    (self, true)
-                }
-                None => {
-                    let script_hash = self.spk_hash;
-                    queuer.enqueue(request::GetHistory { script_hash });
-                    (self, false)
-                }
-            },
-            SpkJobStage::ProcessingTxsAndAnchors {
-                mut txs,
-                mut anchors,
-            } => {
-                let mut made_progress = false;
-                txs = match txs {
-                    Some(TxsJobStage::Txs(mut missing_txs)) => {
-                        missing_txs.retain(|txid| match cache.txs.get(txid) {
-                            Some(tx) => {
-                                self.tx_update.txs.push(tx.clone());
-                                false
-                            }
-                            None => {
-                                let txid = *txid;
-                                queuer.enqueue(request::GetTx { txid });
-                                true
-                            }
-                        });
-                        if missing_txs.is_empty() {
-                            made_progress = true;
-                            TxsJobStage::from_missing_prev_txs(
+    /// Whether everything this job asked for has arrived.
+    pub fn is_done(&self) -> bool {
+        self.stage.is_done()
+    }
+
+    pub fn elapsed_seconds(&self) -> String {
+        let now = UNIX_EPOCH.elapsed().expect("must get current timestamp");
+        // The system clock can step backwards, which must not bring a log line down with it.
+        let duration = now.saturating_sub(self.start);
+        format!("{}s {}ms", duration.as_secs(), duration.subsec_millis())
+    }
+
+    /// Take one step towards having everything the script's history names.
+    ///
+    /// One step per call, so the caller drives it the same way it drives [`ConfirmationJob`]: poll
+    /// until [`SpkProgress::Blocked`] or [`SpkProgress::Done`].
+    ///
+    /// Errors when the server answers with a transaction that cannot be the one asked for —
+    /// its outputs do not reach an outpoint we know is spent. That is the server's picture
+    /// disagreeing with itself, so there is nothing to retry against on this connection.
+    ///
+    /// [`ConfirmationJob`]: crate::ConfirmationJob
+    pub fn poll(&mut self, queuer: &mut ReqQueuer, cache: &Cache) -> anyhow::Result<SpkProgress> {
+        let progress = match &mut self.stage {
+            SpkStage::ProcessingHistory { status } => {
+                match cache.subscriptions.spk_history(*status) {
+                    Some(history) => {
+                        if let Some(prev_txids) = cache.tx_cache.spk_txids.get(&self.spk_hash) {
+                            let these_txids =
+                                history.iter().map(|tx| tx.txid()).collect::<BTreeSet<_>>();
+                            let to_evict = prev_txids
+                                .difference(&these_txids)
+                                .map(|&txid| (txid, self.start.as_secs()));
+                            self.tx_update.evicted_ats.extend(to_evict);
+                        }
+                        for tx in history {
+                            if let response::Tx::Mempool(tx) = tx {
                                 self.tx_update
-                                    .txs
-                                    .iter()
-                                    .filter(|tx| !tx.is_coinbase())
-                                    .flat_map(|tx| tx.input.iter())
-                                    .map(|txin| txin.previous_output),
-                            )
-                        } else {
-                            Some(TxsJobStage::Txs(missing_txs))
+                                    .seen_ats
+                                    .insert((tx.txid, self.start.as_secs()));
+                            }
                         }
+                        self.stage = SpkStage::from_txids(history.iter().map(|tx| tx.txid()));
+                        SpkProgress::Continue
                     }
-                    Some(TxsJobStage::Prevouts(mut missing_prevouts)) => {
-                        missing_prevouts.retain(|op| match cache.txs.get(&op.txid) {
-                            Some(tx) => {
-                                let txout = match tx.output.get(op.vout as usize) {
-                                    Some(txout) => txout,
-                                    None => {
-                                        debug_assert!(false, "Output must exist in tx");
-                                        unimplemented!("Handle this error");
-                                    }
-                                };
-                                self.tx_update.txouts.insert(*op, txout.clone());
-                                false
-                            }
-                            None => {
-                                let txid = op.txid;
-                                queuer.enqueue(request::GetTx { txid });
-                                true
-                            }
+                    None => {
+                        queuer.enqueue(request::GetHistory {
+                            script_hash: self.spk_hash,
                         });
-                        if missing_prevouts.is_empty() {
-                            made_progress = true;
-                            None
-                        } else {
-                            Some(TxsJobStage::Prevouts(missing_prevouts))
-                        }
+                        SpkProgress::Blocked
                     }
-                    None => None,
-                };
-
-                let anchors_start_count = anchors.len();
-                anchors.retain(|&(height, txid)| {
-                    if height > tip.height() {
-                        // Nothing to request for a block we don't know exists yet. The job is
-                        // re-advanced once a chain job advances the tip.
-                        return true;
+                }
+            }
+            SpkStage::ProcessingTxs(missing_txs) => {
+                missing_txs.retain(|txid| match cache.tx_cache.txs.get(txid) {
+                    Some(tx) => {
+                        self.tx_update.txs.push(tx.clone());
+                        false
                     }
-
-                    let blockhash = match tip.get(height) {
-                        Some(cp) if cp.height() == height => cp.hash(),
-                        _ => {
-                            queuer.enqueue(request::Header { height });
+                    None => {
+                        let txid = *txid;
+                        queuer.enqueue(request::GetTx { txid });
+                        true
+                    }
+                });
+                if missing_txs.is_empty() {
+                    self.stage = SpkStage::from_prevouts(
+                        self.tx_update
+                            .txs
+                            .iter()
+                            .filter(|tx| !tx.is_coinbase())
+                            .flat_map(|tx| tx.input.iter())
+                            .map(|txin| txin.previous_output),
+                    );
+                    SpkProgress::Continue
+                } else {
+                    SpkProgress::Blocked
+                }
+            }
+            SpkStage::ProcessingPrevouts(missing_prevouts) => {
+                // `retain` cannot fail, so a bad output is carried out and raised below.
+                let mut err = Option::<anyhow::Error>::None;
+                missing_prevouts.retain(|op| {
+                    let tx = match cache.tx_cache.txs.get(&op.txid) {
+                        Some(tx) => tx,
+                        None => {
+                            let txid = op.txid;
+                            queuer.enqueue(request::GetTx { txid });
                             return true;
                         }
                     };
-
-                    if !cache.headers.contains_key(&blockhash) {
-                        queuer.enqueue(request::Header { height });
+                    match tx.output.get(op.vout as usize) {
+                        Some(txout) => {
+                            self.tx_update.txouts.insert(*op, txout.clone());
+                        }
+                        None => {
+                            err.get_or_insert_with(|| {
+                                anyhow::anyhow!(
+                                    "tx {} has {} outputs, but is spent at vout {}",
+                                    op.txid,
+                                    tx.output.len(),
+                                    op.vout,
+                                )
+                            });
+                        }
                     }
-
-                    if let Some(anchor) = cache.anchors.get(&(txid, blockhash)) {
-                        self.tx_update.anchors.insert((*anchor, txid));
-                        return false;
-                    };
-                    if cache.failed_anchors.contains(&(txid, blockhash)) {
-                        return false;
-                    }
-
-                    queuer.enqueue(request::GetTxMerkle { txid, height });
-                    true
+                    false
                 });
-                if anchors.len() < anchors_start_count {
-                    made_progress = true;
+                if let Some(err) = err {
+                    return Err(err);
                 }
-
-                self.stage = SpkJobStage::ProcessingTxsAndAnchors { txs, anchors };
-                (self, made_progress)
+                if missing_prevouts.is_empty() {
+                    self.stage = SpkStage::Done;
+                    SpkProgress::Continue
+                } else {
+                    SpkProgress::Blocked
+                }
             }
-        }
+            SpkStage::Done => SpkProgress::Done(core::mem::take(&mut self.tx_update)),
+        };
+
+        let stage_str = match &self.stage {
+            SpkStage::ProcessingHistory { status } => format!("ProcessingHistory({status})"),
+            SpkStage::ProcessingTxs(txids) => format!("ProcessingTxs({})", txids.len()),
+            SpkStage::ProcessingPrevouts(ops) => format!("ProcessingPrevouts({})", ops.len()),
+            SpkStage::Done => "Done".to_string(),
+        };
+        tracing::trace!(
+            elapsed_seconds = self.elapsed_seconds(),
+            spk_hash = self.spk_hash.to_string(),
+            stage = stage_str,
+            "Spk job progress"
+        );
+        Ok(progress)
     }
 }
