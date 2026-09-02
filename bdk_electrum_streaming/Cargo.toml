@@ -13,8 +13,8 @@ readme = "README.md"
 futures = "0.3"
 futures-timer = "3"
 anyhow = "1"
-bdk_core = { git = "https://github.com/bitcoindevkit/bdk.git", branch = "master", features = ["serde"] }
-bdk_chain = { git = "https://github.com/bitcoindevkit/bdk.git", branch = "master" }
+bdk_core = { git = "https://github.com/bitcoindevkit/bdk.git", rev = "456f9b7bbf510eefdf3e7a164a5d6bc4cd668adb", features = ["serde"] }
+bdk_chain = { git = "https://github.com/bitcoindevkit/bdk.git", rev = "456f9b7bbf510eefdf3e7a164a5d6bc4cd668adb" }
 miniscript = { version = "13.0.0" }
 electrum_streaming_client = { version = "0.4" }
 serde = { version = "1", features = ["derive", "rc"] }
@@ -22,7 +22,7 @@ serde_json = "1"
 tracing = "0.1"
 
 [dev-dependencies]
-bdk_testenv = { git = "https://github.com/bitcoindevkit/bdk.git", branch = "master" }
+bdk_testenv = { git = "https://github.com/bitcoindevkit/bdk.git", rev = "456f9b7bbf510eefdf3e7a164a5d6bc4cd668adb" }
 tokio = { version = "1", features = ["time", "net", "rt", "macros"]}
 tokio-util = { version = "0.7.15", features = ["compat"] }
 tracing-subscriber = "0.3"
