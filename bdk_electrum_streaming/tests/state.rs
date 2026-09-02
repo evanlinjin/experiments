@@ -337,7 +337,7 @@ fn anchor_above_local_tip_is_deferred_until_tip_catches_up() -> anyhow::Result<(
     let header_2 = block_with_tx(&header_1, txid, 200, 0);
 
     let mut cache = Cache::default();
-    cache.tx_cache.txs.insert(txid, Arc::new(tx.clone()));
+    cache.txs.insert(txid, Arc::new(tx.clone()));
 
     let mut state = new_state(cache, descriptor);
     let mut queue = ReqQueue::new();
@@ -961,7 +961,7 @@ fn a_merkle_error_is_not_recorded_as_a_failed_anchor() -> anyhow::Result<()> {
         "the job must give up on the pair rather than re-ask"
     );
     assert!(
-        state.cache().tx_cache.anchors.is_empty(),
+        state.cache().anchors.is_empty(),
         "an error proves nothing, so no anchor may be recorded from it"
     );
 
@@ -1603,7 +1603,7 @@ fn a_proof_for_another_block_is_not_a_verdict_on_ours() -> anyhow::Result<()> {
         state.poll(&mut queue, response(&req, &server))?;
     }
     assert!(
-        state.cache().tx_cache.anchors.is_empty(),
+        state.cache().anchors.is_empty(),
         "a proof for a block we do not have must not anchor anything"
     );
 
@@ -1682,7 +1682,7 @@ fn a_merkle_error_below_the_reorg_window_is_recovered_by_a_script_notification(
         state.poll(&mut queue, resp)?;
     }
     assert!(
-        state.cache().tx_cache.anchors.is_empty(),
+        state.cache().anchors.is_empty(),
         "an error must not anchor anything"
     );
     assert_eq!(
@@ -2076,7 +2076,7 @@ fn an_anchor_above_the_announced_tip_does_not_spin() -> anyhow::Result<()> {
         "no tip was announced, so the chain must not have moved"
     );
     assert!(
-        state.cache().tx_cache.anchors.is_empty(),
+        state.cache().anchors.is_empty(),
         "and nothing may be anchored at a height the chain has not reached"
     );
 

@@ -258,7 +258,6 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
                         let resp_status = ElectrumScriptStatus::from_history(&resp);
                         if let Some(spk_status) = resp_status {
                             self.cache
-                                .tx_cache
                                 .spk_txids
                                 .entry(req.script_hash)
                                 .or_default()
@@ -300,7 +299,7 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
                                 txid,
                             ));
                         }
-                        self.cache.tx_cache.txs.insert(get_tx.txid, resp.tx.into());
+                        self.cache.txs.insert(get_tx.txid, resp.tx.into());
                         self.poll_spk_jobs(req_queue, job_ids)?;
                         self.poll_confirmation_job(req_queue)
                     }
@@ -343,7 +342,7 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
                                 block_hash = header.block_hash().to_string(),
                                 "Inserting anchor.",
                             );
-                            self.cache.tx_cache.anchors.insert(
+                            self.cache.anchors.insert(
                                 (req.txid, header.block_hash()),
                                 ProvenAnchor {
                                     block_id: BlockId {
@@ -382,7 +381,12 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
     }
 
     /// React to the server announcing `header` at `height` as its tip.
-    fn on_new_tip(&mut self, req_queue: &mut ReqQueue, height: u32, header: Header) -> anyhow::Result<()> {
+    fn on_new_tip(
+        &mut self,
+        req_queue: &mut ReqQueue,
+        height: u32,
+        header: Header,
+    ) -> anyhow::Result<()> {
         match &mut self.confirmation_job {
             Some(job) => {
                 if job.set_tip(height, header) {
@@ -416,7 +420,7 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
             self.cache.subscriptions.remove_spk(spk_hash);
         }
 
-        if spk_status.is_some() || self.cache.tx_cache.spk_txids.contains_key(&spk_hash) {
+        if spk_status.is_some() || self.cache.spk_txids.contains_key(&spk_hash) {
             for script_hash in self.spk_tracker.mark_script_hash_used(&k, i) {
                 self.coord
                     .queuer(req_queue, JobId::Spk(script_hash))

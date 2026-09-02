@@ -284,7 +284,7 @@ impl ConfirmationJob {
                             continue;
                         }
                     };
-                    match cache.tx_cache.anchors.get(&(txid, header.block_hash())) {
+                    match cache.anchors.get(&(txid, header.block_hash())) {
                         Some(anchor) => {
                             resolved.insert((anchor.clone(), txid));
                         }
