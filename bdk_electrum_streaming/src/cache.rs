@@ -127,7 +127,14 @@ impl Cache {
 ///
 /// A caller cannot rebuild this from wallet data alone: a status is a hash Electrum computes
 /// over the history it stands for and no wallet stores, so [`Cache::from_wallet_txs`] computes
-/// it the same way Electrum does.
+/// it the way the protocol specifies instead.
+///
+/// That reproduces a server's status exactly for confirmed history, which is ordered by height
+/// and block position — both facts about the chain that every server agrees on. Unconfirmed
+/// history is weaker: the protocol gives an ordering, but a server is free to hash its mempool
+/// entries in whatever order they come out of its own index, so a script with more than one
+/// unconfirmed transaction may still hash to something the server does not recognise. Costing
+/// only a refetch of that script's history, which is what would have happened anyway.
 ///
 /// Fields are private: a status is a hash of the history it stands for, and letting the two be
 /// set independently would reintroduce the desync the type exists to prevent.
