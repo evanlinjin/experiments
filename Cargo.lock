@@ -1054,6 +1054,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "trusted-headers-gen"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bdk_core",
+ "bdk_testenv",
+ "corepc-client",
+ "serde_json",
+]
+
+[[package]]
 name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
