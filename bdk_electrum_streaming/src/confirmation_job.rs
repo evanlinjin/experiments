@@ -205,6 +205,7 @@ impl ConfirmationJob {
     ) -> anyhow::Result<ConfirmationProgress> {
         match core::mem::take(&mut self.stage) {
             ConfirmationStage::Init => {
+                self.ensure_target_is_reachable(chain)?;
                 let runs = self.required_runs(cache, chain);
                 for (&start, &end) in &runs {
                     self.queue_gaps(queuer, start, end);
@@ -217,6 +218,14 @@ impl ConfirmationJob {
                     (start..=end).all(|h| self.fetched_headers.contains_key(&h))
                 });
                 if !complete {
+                    // Ask again for whatever is still missing. A server may answer
+                    // `blockchain.block.headers` with fewer headers than were asked for, and
+                    // nothing else would re-queue them: `Init` is only re-entered when the
+                    // target or the statuses move, which on a settled chain may be never.
+                    // Requests still in flight are deduplicated, so this cannot pile up.
+                    for (&start, &end) in &runs {
+                        self.queue_gaps(queuer, start, end);
+                    }
                     self.stage = ConfirmationStage::FetchHeaders { runs };
                     return Ok(ConfirmationProgress::Blocked);
                 }
@@ -319,6 +328,32 @@ impl ConfirmationJob {
                 Ok(ConfirmationProgress::Blocked)
             }
         }
+    }
+
+    /// Refuse a target too far below the verified tip to plan a run to.
+    ///
+    /// [`Self::required_runs`] only reaches back a [`REORG_WINDOW`](Self::REORG_WINDOW) below
+    /// the verified tip, so a target under that plans no run to it at all. Left alone the job
+    /// would find its remaining runs complete, apply nothing, and hand the caller back the
+    /// chain it already had as though the server had just confirmed it — then go on asking that
+    /// server for proofs at heights it does not have. A server that far behind cannot answer
+    /// for this wallet, whether it is mid-sync, was rolled back, or is one of several behind
+    /// one endpoint at different heights.
+    ///
+    /// Only checked once there *is* a verified tip. Before that there is no window to fall
+    /// below, and planning nothing is an ordinary waypoint rather than a fault: a target at or
+    /// under the block the chain starts at plans its backfill from the heights a history names,
+    /// which the histories have yet to arrive to name.
+    fn ensure_target_is_reachable(&self, chain: &HeaderChain) -> anyhow::Result<()> {
+        if let Some(tip) = chain.tip_height() {
+            anyhow::ensure!(
+                self.target_height >= tip.saturating_sub(Self::REORG_WINDOW),
+                "server's tip is {}, more than {} blocks below the verified tip {tip}",
+                self.target_height,
+                Self::REORG_WINDOW,
+            );
+        }
+        Ok(())
     }
 
     /// The heights carrying a transaction we have to anchor.

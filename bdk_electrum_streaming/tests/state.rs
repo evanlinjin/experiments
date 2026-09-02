@@ -2299,3 +2299,68 @@ fn a_transaction_that_is_not_the_one_asked_for_is_rejected() -> anyhow::Result<(
     );
     Ok(())
 }
+
+/// A server announcing a tip far below the one we have already verified cannot be synced from:
+/// no run is ever planned back that far, so the job would find nothing to do, apply nothing,
+/// and hand back the chain we already had as though that server had just confirmed it — then
+/// go on asking it for proofs at heights it does not have.
+///
+/// This is what an endpoint load-balancing across nodes at different heights looks like, or a
+/// node that was rolled back under us.
+#[test]
+fn a_tip_far_below_the_verified_one_stops_the_connection() -> anyhow::Result<()> {
+    let (descriptor, _spk_hash, spk) = tracked_descriptor()?;
+    let tx = tx_paying(&spk, 50_000);
+    let txid = tx.compute_txid();
+    let (genesis, header_1) = base_headers();
+    let header_2 = block_with_tx(&header_1, txid, 200, 0);
+
+    let mut chain = vec![genesis, header_1, header_2];
+    for height in 3..=30u32 {
+        let prev = *chain.last().expect("non-empty");
+        chain.push(block_with_root(
+            &prev,
+            TxMerkleNode::all_zeros(),
+            1000 + height,
+            0,
+        ));
+    }
+
+    let mut state = new_state(Cache::default(), descriptor);
+    let mut queue = ReqQueue::new();
+    let server = Server {
+        headers: chain.clone(),
+        txs: vec![(tx, 2)],
+        merkle_proof: (Vec::new(), 0),
+    };
+
+    state.start(&mut queue);
+    drain_requests(&mut state, &mut queue, &server);
+    assert_eq!(
+        state.chain().tip_height(),
+        Some(30),
+        "the chain must be verified up to the tip first"
+    );
+
+    // The server now claims a tip 25 blocks below the one we hold — past the window any run
+    // reaches back to.
+    let err = state
+        .poll(
+            &mut queue,
+            raw_msg(json!({
+                "jsonrpc": "2.0",
+                "method": "blockchain.headers.subscribe",
+                "params": [{ "hex": serialize_hex(&chain[5]), "height": 5 }],
+            })),
+        )
+        .expect_err("a tip that far below the verified one must not be accepted");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("below the verified tip"), "{msg}");
+
+    assert_eq!(
+        state.chain().tip_height(),
+        Some(30),
+        "and the verified chain must be left as it was"
+    );
+    Ok(())
+}

@@ -136,8 +136,14 @@ impl HeaderChain {
     /// Apply a contiguous, ascending run of `headers` beginning at `start`.
     ///
     /// The run may extend the tip, replace it (reorg), or sit below the current
-    /// [`base_height`](Self::base_height) to backfill history — in which case it must reach up to
-    /// the existing base.
+    /// [`base_height`](Self::base_height) to backfill history — in which case it must stop
+    /// exactly where the chain already begins, filling the gap and no more.
+    ///
+    /// A backfill is rebuilt rather than compared for work, because the blocks it adds sit
+    /// below everything already verified and displace nothing. A run that started below the
+    /// base and carried on past the tip would take that path while replacing verified blocks,
+    /// so it is refused: reorging the tip is the extend path's business, where the replacement
+    /// has to out-work what it replaces.
     ///
     /// The chain is left untouched if anything fails to verify.
     pub fn apply(&mut self, start: u32, headers: Vec<Header>) -> anyhow::Result<()> {
@@ -160,10 +166,13 @@ impl HeaderChain {
         let cp = match self.cp.clone() {
             // Backfill: rebuild as the trusted blocks, the run, then whatever sat above the run.
             Some(cp) if start < self.base => {
+                // Exactly, not merely far enough: a run that carried on past the base would
+                // replace verified blocks here, where nothing compares work.
                 ensure!(
-                    end + 1 >= self.base,
-                    "backfilled headers stop at {end}, below the chain base {}",
-                    self.base
+                    end + 1 == self.base,
+                    "a backfill must stop where the chain begins, at {}, but these headers \
+                     stop at {end}",
+                    self.base - 1,
                 );
                 let above = cp
                     .iter()
@@ -548,6 +557,29 @@ mod test {
         let mut c = chain(&headers, &[3, 8]);
         c.apply(9, headers[9..].to_vec()).unwrap();
         assert!(c.apply(4, headers[4..7].to_vec()).is_err());
+    }
+
+    /// A run starting below the base takes the backfill path, which rebuilds the chain rather
+    /// than comparing work — so a run that also reaches past the tip could swap out verified
+    /// blocks for an equal-work fork, the very thing
+    /// [`rejects_a_reorg_with_less_work`](Self::rejects_a_reorg_with_less_work) forbids on the
+    /// extend path. A backfill has to fill the gap and stop.
+    #[test]
+    fn rejects_backfill_that_overshoots_the_base() {
+        let headers = mine(&params(), 10);
+        let mut c = chain(&headers, &[3]);
+        c.apply(4, headers[4..].to_vec()).unwrap();
+        assert_eq!(c.tip_height(), Some(10));
+
+        // Real history up to the trusted block, then a fork of equal length — and so equal
+        // work — over everything above it.
+        let forked = fork(&params(), &headers, 3, 7, None);
+        let run = headers[1..=3].iter().copied().chain(forked).collect();
+
+        let err = c.apply(1, run).unwrap_err().to_string();
+        assert!(err.contains("backfill"), "{err}");
+        assert_eq!(c.header(5), Some(headers[5]), "chain is left untouched");
+        assert_eq!(c.tip_height(), Some(10));
     }
 
     #[test]
