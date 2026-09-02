@@ -1,0 +1,17 @@
+[package]
+name = "trusted-headers-gen"
+version = "0.1.0"
+description = "Fetches a trusted header from Bitcoin Core and writes it out as reviewable Rust source"
+license = "MIT OR Apache-2.0"
+edition = "2021"
+rust-version = "1.85"
+repository = "https://github.com/evanlinjin/experiments"
+
+[dependencies]
+anyhow = "1"
+bdk_core = { git = "https://github.com/bitcoindevkit/bdk.git", rev = "456f9b7bbf510eefdf3e7a164a5d6bc4cd668adb" }
+corepc-client = { version = "0.13", features = ["client-sync"] }
+serde_json = "1"
+
+[dev-dependencies]
+bdk_testenv = { git = "https://github.com/bitcoindevkit/bdk.git", rev = "456f9b7bbf510eefdf3e7a164a5d6bc4cd668adb" }

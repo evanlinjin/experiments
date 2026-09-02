@@ -5,11 +5,11 @@ use std::{
 
 use bdk_core::{
     bitcoin::{OutPoint, Txid},
-    ConfirmationBlockTime, TxUpdate,
+    TxUpdate,
 };
 use electrum_streaming_client::{request, response, ElectrumScriptHash, ElectrumScriptStatus};
 
-use crate::{req::ReqQueuer, Cache};
+use crate::{req::ReqQueuer, Cache, ProvenAnchor};
 
 /// Where a [`SpkJob`] has got to.
 ///
@@ -62,7 +62,7 @@ pub enum SpkProgress {
     Blocked,
     /// Everything asked for has arrived. Carries what the job gathered, leaving it empty, so a
     /// job polled again after finishing contributes nothing a second time.
-    Done(TxUpdate<ConfirmationBlockTime>),
+    Done(TxUpdate<ProvenAnchor>),
 }
 
 /// The job to perform once we receive a script status notification.
@@ -80,7 +80,9 @@ pub struct SpkJob {
     pub spk_hash: ElectrumScriptHash,
 
     stage: SpkStage,
-    tx_update: TxUpdate<ConfirmationBlockTime>,
+
+    /// Staged tx update.
+    tx_update: TxUpdate<ProvenAnchor>,
 }
 
 impl SpkJob {
@@ -95,7 +97,7 @@ impl SpkJob {
         let stage = match spk_status {
             Some(status) => SpkStage::ProcessingHistory { status },
             None => {
-                if let Some(prev_txids) = cache.tx_cache.spk_txids.get(&spk_hash) {
+                if let Some(prev_txids) = cache.spk_txids.get(&spk_hash) {
                     tx_update
                         .evicted_ats
                         .extend(prev_txids.iter().map(|&txid| (txid, start.as_secs())));
@@ -149,7 +151,7 @@ impl SpkJob {
             SpkStage::ProcessingHistory { status } => {
                 match cache.subscriptions.spk_history(*status) {
                     Some(history) => {
-                        if let Some(prev_txids) = cache.tx_cache.spk_txids.get(&self.spk_hash) {
+                        if let Some(prev_txids) = cache.spk_txids.get(&self.spk_hash) {
                             let these_txids =
                                 history.iter().map(|tx| tx.txid()).collect::<BTreeSet<_>>();
                             let to_evict = prev_txids
@@ -176,7 +178,7 @@ impl SpkJob {
                 }
             }
             SpkStage::ProcessingTxs(missing_txs) => {
-                missing_txs.retain(|txid| match cache.tx_cache.txs.get(txid) {
+                missing_txs.retain(|txid| match cache.txs.get(txid) {
                     Some(tx) => {
                         self.tx_update.txs.push(tx.clone());
                         false
@@ -205,7 +207,7 @@ impl SpkJob {
                 // `retain` cannot fail, so a bad output is carried out and raised below.
                 let mut err = Option::<anyhow::Error>::None;
                 missing_prevouts.retain(|op| {
-                    let tx = match cache.tx_cache.txs.get(&op.txid) {
+                    let tx = match cache.txs.get(&op.txid) {
                         Some(tx) => tx,
                         None => {
                             let txid = op.txid;
