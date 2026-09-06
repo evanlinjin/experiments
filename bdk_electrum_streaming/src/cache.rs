@@ -3,42 +3,21 @@ use std::{
     sync::Arc,
 };
 
-use bdk_core::{
-    bitcoin::{self, block::Header, BlockHash, Transaction, Txid},
-    ConfirmationBlockTime,
-};
-use electrum_streaming_client::{request, response, ElectrumScriptHash, ElectrumScriptStatus};
+use bdk_core::bitcoin::{BlockHash, ScriptBuf, Transaction, Txid};
+use electrum_streaming_client::{response, ElectrumScriptHash, ElectrumScriptStatus};
 
-/// Everything learned from the server, kept so a reconnect need not ask again.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+use crate::ProvenAnchor;
+
+/// Everything learned from the server, so a job knows what it need not ask for again.
+///
+/// Not persisted: every part of it is already in the caller's wallet — rebuild all of it with
+/// [`Cache::from_wallet_txs`] — and a stored copy would only give the two something to disagree
+/// about.
+#[derive(Debug, Clone, Default)]
 pub struct Cache {
     /// The server's per-script histories.
     pub subscriptions: Subscriptions,
 
-    /// What we already hold, so a job knows what it need not ask for.
-    ///
-    /// Not persisted: every part of it is in the caller's wallet already, and a second copy
-    /// would only give the two something to disagree about. Seed it from wallet data instead.
-    #[serde(skip)]
-    pub tx_cache: TxCache,
-
-    /// This can be removed once we can place `Header`s in `CheckPoint`s.
-    pub headers: HashMap<BlockHash, bitcoin::block::Header>,
-}
-
-/// The transaction data a job consults before asking the server for anything.
-///
-/// Separate from the rest of [`Cache`] because a caller can rebuild all of it from their own
-/// wallet: the transactions are in their graph, the anchors with them, and which transactions
-/// paid a script is what their spk index is for. So none of it is persisted alongside
-/// [`Subscriptions`], which nothing can reconstruct.
-///
-/// Starting empty is always correct, only expensive: a job asks the server for whatever it
-/// cannot find here, so an empty one re-downloads every transaction and reproves every anchor.
-/// It is not a mirror of the wallet, though — whatever a job fetches lands here too, so it
-/// answers "do we already have this" whoever supplied it.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
-pub struct TxCache {
     /// Every txid ever seen for each script hash.
     ///
     /// This is monotonically growing so that we can detect evictions.
@@ -46,48 +25,116 @@ pub struct TxCache {
 
     pub txs: HashMap<Txid, Arc<Transaction>>,
 
-    /// Written as a sequence: a `(Txid, BlockHash)` key is not a string, so a map would be
-    /// unserializable in JSON and every other format that requires string keys.
-    #[serde(with = "persist::anchors_as_seq")]
-    pub anchors: HashMap<(Txid, BlockHash), ConfirmationBlockTime>,
+    pub anchors: HashMap<(Txid, BlockHash), ProvenAnchor>,
+}
+
+/// A transaction's chain position, as a wallet already tracks it — enough to describe the
+/// history a script had, without asking the server.
+#[derive(Debug, Clone)]
+pub enum TxConfirmationStatus {
+    /// Confirmed, with the proof a job would otherwise have to ask the server for again.
+    ///
+    /// `anchor.pos` plays no part in the status hash itself — only `txid` and `height` are
+    /// hashed — but a server orders a history by height *and then block position* (per the
+    /// [protocol]), so two transactions confirmed in the same block hash to a different status
+    /// if their order is wrong.
+    ///
+    /// [protocol]: https://electrum-protocol.readthedocs.io/en/latest/protocol-basics.html#status
+    Confirmed(ProvenAnchor),
+    Mempool {
+        confirmed_inputs: bool,
+    },
 }
 
 impl Cache {
-    pub fn resolve_headers_query(
-        &mut self,
-        req: request::Headers,
-        resp: response::HeadersResp,
-    ) -> impl Iterator<Item = (u32, Header)> {
-        self.headers
-            .extend(resp.headers.iter().map(|&h| (h.block_hash(), h)));
-        (req.start_height..).zip(resp.headers)
-    }
+    /// Rebuild everything from what a wallet already knows: [`subscriptions`](Self::subscriptions),
+    /// `spk_txids`, `txs` and `anchors`. A reconnect need not download every script's history,
+    /// refetch its transactions, or reprove its anchors — only whatever actually changed.
+    ///
+    /// No `bdk_chain` dependency needed: `txs` is whatever a wallet's tx graph or index already
+    /// hands over as `(tx, status, relevant_scripts)` — one entry per transaction, not one per
+    /// script it pays, since that is how a wallet holds them.
+    pub fn from_wallet_txs<Tx, Spks>(
+        txs: impl IntoIterator<Item = (Tx, TxConfirmationStatus, Spks)>,
+    ) -> Self
+    where
+        Tx: Into<Arc<Transaction>>,
+        Spks: IntoIterator<Item = ScriptBuf>,
+    {
+        let mut cache = Cache::default();
 
-    pub fn resolve_history_query(
-        &mut self,
-        req: request::GetHistory,
-        resp: Vec<response::Tx>,
-    ) -> Option<ElectrumScriptStatus> {
-        let status_opt = ElectrumScriptStatus::from_history(&resp);
-        if let Some(status) = status_opt {
-            self.tx_cache
-                .spk_txids
-                .entry(req.script_hash)
-                .or_default()
-                .extend(resp.iter().map(|tx| tx.txid()));
-            self.subscriptions.insert_spk(req.script_hash, status, resp);
-        } else {
-            self.subscriptions.remove_spk(req.script_hash);
+        // Sorted on later, by (height, block position) — carried alongside the response `Tx`
+        // since the wire type itself has nowhere to put it.
+        let mut by_spk_hash = HashMap::<ElectrumScriptHash, Vec<(response::Tx, usize)>>::new();
+        for (tx, status, relevant_scripts) in txs {
+            let tx = tx.into();
+            let txid = tx.compute_txid();
+            let (history_tx, sort_pos) = match status {
+                TxConfirmationStatus::Confirmed(anchor) => {
+                    let history_tx = response::Tx::Confirmed(response::ConfirmedTx {
+                        txid,
+                        height: bdk_core::bitcoin::absolute::Height::from_consensus(
+                            anchor.block_id.height,
+                        )
+                        .expect("confirmed tx must have a valid height"),
+                    });
+                    let pos = anchor.pos;
+                    cache.anchors.insert((txid, anchor.block_id.hash), anchor);
+                    (history_tx, pos)
+                }
+                TxConfirmationStatus::Mempool { confirmed_inputs } => (
+                    response::Tx::Mempool(response::MempoolTx {
+                        txid,
+                        fee: bdk_core::bitcoin::Amount::ZERO,
+                        confirmed_inputs,
+                    }),
+                    0,
+                ),
+            };
+            cache.txs.insert(txid, tx);
+            for spk in relevant_scripts {
+                by_spk_hash
+                    .entry(ElectrumScriptHash::new(&spk))
+                    .or_default()
+                    .push((history_tx.clone(), sort_pos));
+            }
         }
-        status_opt
+
+        for (spk_hash, mut entries) in by_spk_hash {
+            // The order a server reports a history in, and the order its status hash is
+            // computed over: confirmed ascending by height then block position, then mempool
+            // ordered by confirmed-inputs before not, each tied by txid.
+            entries.sort_by_key(|(tx, pos)| match tx {
+                response::Tx::Confirmed(tx) => (0u8, tx.height.to_consensus_u32(), *pos, tx.txid),
+                response::Tx::Mempool(tx) if tx.confirmed_inputs => (1, 0, 0, tx.txid),
+                response::Tx::Mempool(tx) => (2, 0, 0, tx.txid),
+            });
+            let history = entries.into_iter().map(|(tx, _)| tx).collect::<Vec<_>>();
+            cache
+                .spk_txids
+                .entry(spk_hash)
+                .or_default()
+                .extend(history.iter().map(response::Tx::txid));
+            if let Some(status) = ElectrumScriptStatus::from_history(&history) {
+                cache.subscriptions.insert_spk(spk_hash, status, history);
+            }
+        }
+        cache
     }
 }
 
 /// The last history the server reported for each script hash.
 ///
-/// Unlike [`TxCache`], a caller cannot rebuild this from wallet data: a status is a hash Electrum
-/// computes over the history it stands for and no wallet stores, and the server reports a history
-/// as it stands now, never again mentioning a transaction it has dropped.
+/// A caller cannot rebuild this from wallet data alone: a status is a hash Electrum computes
+/// over the history it stands for and no wallet stores, so [`Cache::from_wallet_txs`] computes
+/// it the way the protocol specifies instead.
+///
+/// That reproduces a server's status exactly for confirmed history, which is ordered by height
+/// and block position — both facts about the chain that every server agrees on. Unconfirmed
+/// history is weaker: the protocol gives an ordering, but a server is free to hash its mempool
+/// entries in whatever order they come out of its own index, so a script with more than one
+/// unconfirmed transaction may still hash to something the server does not recognise. Costing
+/// only a refetch of that script's history, which is what would have happened anyway.
 ///
 /// Fields are private: a status is a hash of the history it stands for, and letting the two be
 /// set independently would reintroduce the desync the type exists to prevent.
@@ -180,136 +227,10 @@ impl Subscriptions {
     }
 }
 
-/// Types and impls that exist only so [`Cache`] can be stored and loaded.
-///
-/// Kept apart from the cache itself because [`HistoryTx`] mirrors [`response::Tx`] and the two
-/// are easy to mistake for each other at a glance.
-mod persist {
-    use super::*;
-
-    /// A history entry in the shape we can write back out.
-    ///
-    /// [`response::Tx`] derives `Deserialize` only, so histories round-trip through this instead.
-    #[derive(serde::Serialize, serde::Deserialize)]
-    enum HistoryTx {
-        Mempool {
-            txid: Txid,
-            fee_sats: u64,
-            confirmed_inputs: bool,
-        },
-        Confirmed {
-            txid: Txid,
-            height: u32,
-        },
-    }
-
-    impl From<&response::Tx> for HistoryTx {
-        fn from(tx: &response::Tx) -> Self {
-            match tx {
-                response::Tx::Mempool(tx) => Self::Mempool {
-                    txid: tx.txid,
-                    fee_sats: tx.fee.to_sat(),
-                    confirmed_inputs: tx.confirmed_inputs,
-                },
-                response::Tx::Confirmed(tx) => Self::Confirmed {
-                    txid: tx.txid,
-                    height: tx.height.to_consensus_u32(),
-                },
-            }
-        }
-    }
-
-    impl TryFrom<HistoryTx> for response::Tx {
-        type Error = bitcoin::absolute::ConversionError;
-
-        fn try_from(tx: HistoryTx) -> Result<Self, Self::Error> {
-            Ok(match tx {
-                HistoryTx::Mempool {
-                    txid,
-                    fee_sats,
-                    confirmed_inputs,
-                } => Self::Mempool(response::MempoolTx {
-                    txid,
-                    fee: bitcoin::Amount::from_sat(fee_sats),
-                    confirmed_inputs,
-                }),
-                HistoryTx::Confirmed { txid, height } => Self::Confirmed(response::ConfirmedTx {
-                    txid,
-                    height: bitcoin::absolute::Height::from_consensus(height)?,
-                }),
-            })
-        }
-    }
-
-    /// Written as `spk_hash -> (status, history)`, which is what rebuilds both maps on the way
-    /// back in.
-    impl serde::Serialize for Subscriptions {
-        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-            serializer.collect_map(self.spk_hash_to_status.iter().map(|(&spk_hash, &status)| {
-                let history = self
-                    .spk_status_to_history
-                    .get(&status)
-                    .map(|history| history.iter().map(HistoryTx::from).collect::<Vec<_>>())
-                    .unwrap_or_default();
-                (spk_hash, (status, history))
-            }))
-        }
-    }
-
-    impl<'de> serde::Deserialize<'de> for Subscriptions {
-        fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-            use serde::de::Error;
-            let stored =
-                HashMap::<ElectrumScriptHash, (ElectrumScriptStatus, Vec<HistoryTx>)>::deserialize(
-                    deserializer,
-                )?;
-            let mut spk_histories = Self::default();
-            for (spk_hash, (status, history)) in stored {
-                let history = history
-                    .into_iter()
-                    .map(response::Tx::try_from)
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(D::Error::custom)?;
-                spk_histories.insert_spk(spk_hash, status, history);
-            }
-            Ok(spk_histories)
-        }
-    }
-
-    pub(super) mod anchors_as_seq {
-        use super::*;
-        use serde::{Deserialize, Deserializer, Serializer};
-
-        type Anchors = HashMap<(Txid, BlockHash), ConfirmationBlockTime>;
-
-        pub fn serialize<S: Serializer>(
-            anchors: &Anchors,
-            serializer: S,
-        ) -> Result<S::Ok, S::Error> {
-            serializer.collect_seq(
-                anchors
-                    .iter()
-                    .map(|(&(txid, block_hash), anchor)| (txid, block_hash, anchor)),
-            )
-        }
-
-        pub fn deserialize<'de, D: Deserializer<'de>>(
-            deserializer: D,
-        ) -> Result<Anchors, D::Error> {
-            Ok(
-                Vec::<(Txid, BlockHash, ConfirmationBlockTime)>::deserialize(deserializer)?
-                    .into_iter()
-                    .map(|(txid, block_hash, anchor)| ((txid, block_hash), anchor))
-                    .collect(),
-            )
-        }
-    }
-}
-
 #[cfg(test)]
 mod test {
     use super::*;
-    use bitcoin::hashes::Hash;
+    use bdk_core::bitcoin::{self, hashes::Hash};
 
     fn txid(byte: u8) -> Txid {
         Txid::from_byte_array([byte; 32])
@@ -319,35 +240,25 @@ mod test {
         ElectrumScriptHash::from_byte_array([byte; 32])
     }
 
-    /// `response::Tx` derives `Deserialize` only, so histories round-trip through `HistoryTx`.
-    /// Both of its variants have to survive the trip intact.
-    #[test]
-    fn spk_histories_round_trip() {
-        let history = vec![
-            response::Tx::Confirmed(response::ConfirmedTx {
-                txid: txid(1),
-                height: bitcoin::absolute::Height::from_consensus(700_000).unwrap(),
-            }),
-            response::Tx::Mempool(response::MempoolTx {
-                txid: txid(2),
-                fee: bitcoin::Amount::from_sat(1234),
-                confirmed_inputs: false,
-            }),
-        ];
-        let status = ElectrumScriptStatus::from_history(&history).expect("history is not empty");
+    /// A transaction whose txid varies with `unique`, so distinct calls yield distinct txids.
+    fn transaction(unique: u32) -> Transaction {
+        Transaction {
+            version: bitcoin::transaction::Version::ONE,
+            lock_time: bitcoin::absolute::LockTime::from_consensus(unique),
+            input: Vec::new(),
+            output: Vec::new(),
+        }
+    }
 
-        let mut before = Subscriptions::default();
-        before.insert_spk(spk_hash(9), status, history);
-
-        let json = serde_json::to_string(&before).expect("must serialize");
-        let after: Subscriptions = serde_json::from_str(&json).expect("must deserialize");
-
-        assert_eq!(
-            after.spk_history(status).map(<[_]>::len),
-            Some(2),
-            "the history must survive, and still answer to its status"
-        );
-        assert_eq!(after.spk_status(spk_hash(9)), Some(status));
+    fn anchor(height: u32, pos: usize) -> ProvenAnchor {
+        ProvenAnchor {
+            block_id: bdk_core::BlockId {
+                height,
+                hash: BlockHash::from_byte_array([height as u8; 32]),
+            },
+            pos,
+            merkle: Vec::new(),
+        }
     }
 
     /// Two scripts paid by the same transaction, and nothing else, have identical histories —
@@ -386,42 +297,157 @@ mod test {
         );
     }
 
-    /// `anchors` is keyed by a tuple, which JSON cannot use as a map key. A caller who chooses
-    /// to persist a [`TxCache`] rather than rebuild it must still be able to.
+    /// A caller's wallet knows which spk each of its transactions paid, the transaction itself,
+    /// and whether it is confirmed (with its anchor) or still in the mempool — enough to
+    /// rebuild the transaction cache and compute the same status an Electrum server would,
+    /// without ever asking it.
     #[test]
-    fn tx_cache_round_trips_through_json() {
-        let anchor = (txid(1), bitcoin::BlockHash::from_byte_array([2; 32]));
-        let mut before = TxCache::default();
-        before
-            .anchors
-            .insert(anchor, ConfirmationBlockTime::default());
+    fn from_wallet_txs_rebuilds_a_status_the_server_would_recognise() {
+        let spk = ScriptBuf::from_hex("0014000000000000000000000000000000000000000a").unwrap();
+        let spk_hash = ElectrumScriptHash::new(&spk);
+        let confirmed_tx = transaction(1);
+        let mempool_tx = transaction(2);
+        let confirmed_txid = confirmed_tx.compute_txid();
+        let mempool_txid = mempool_tx.compute_txid();
+        let confirmed_anchor = anchor(100, 0);
 
-        let json = serde_json::to_string(&before).expect("must serialize");
-        let after: TxCache = serde_json::from_str(&json).expect("must deserialize");
+        let cache = Cache::from_wallet_txs([
+            (
+                confirmed_tx,
+                TxConfirmationStatus::Confirmed(confirmed_anchor.clone()),
+                vec![spk.clone()],
+            ),
+            (
+                mempool_tx,
+                TxConfirmationStatus::Mempool {
+                    confirmed_inputs: true,
+                },
+                vec![spk],
+            ),
+        ]);
 
-        assert_eq!(after.anchors.get(&anchor), before.anchors.get(&anchor));
+        assert_eq!(
+            cache.spk_txids.get(&spk_hash).map(BTreeSet::len),
+            Some(2),
+            "both txids must be recorded against the spk"
+        );
+        assert_eq!(
+            cache.txs.keys().copied().collect::<BTreeSet<_>>(),
+            BTreeSet::from([confirmed_txid, mempool_txid]),
+            "the transactions themselves must be cached too"
+        );
+        assert_eq!(
+            cache
+                .anchors
+                .get(&(confirmed_txid, confirmed_anchor.block_id.hash)),
+            Some(&confirmed_anchor),
+            "the confirmed transaction's anchor must be cached, needing no reproof"
+        );
+
+        let expected = ElectrumScriptStatus::from_history(&[
+            response::Tx::Confirmed(response::ConfirmedTx {
+                txid: confirmed_txid,
+                height: bitcoin::absolute::Height::from_consensus(100).unwrap(),
+            }),
+            response::Tx::Mempool(response::MempoolTx {
+                txid: mempool_txid,
+                fee: bitcoin::Amount::ZERO,
+                confirmed_inputs: true,
+            }),
+        ])
+        .expect("history is not empty");
+        assert_eq!(
+            cache.subscriptions.spk_status(spk_hash),
+            Some(expected),
+            "the rebuilt status must match what a server hashing the same history would report"
+        );
     }
 
-    /// A `Cache` carries none of it, so persisting one cannot go stale against the wallet.
+    /// The status hash itself only ever mixes in `txid:height:` — never a block position — so
+    /// two transactions confirmed in the same block only get the right status if `pos` orders
+    /// them the way the block does. Get it backwards and the computed status is simply wrong.
     #[test]
-    fn cache_does_not_persist_the_tx_cache() {
-        let mut before = Cache::default();
-        before.tx_cache.txs.insert(
-            txid(1),
-            Arc::new(bitcoin::Transaction {
-                version: bitcoin::transaction::Version::ONE,
-                lock_time: bitcoin::absolute::LockTime::ZERO,
-                input: Vec::new(),
-                output: Vec::new(),
+    fn same_block_transactions_are_ordered_by_block_position() {
+        let spk = ScriptBuf::from_hex("0014000000000000000000000000000000000000000a").unwrap();
+        let spk_hash = ElectrumScriptHash::new(&spk);
+        let (first_tx, second_tx) = (transaction(1), transaction(2));
+        let (first, second) = (first_tx.compute_txid(), second_tx.compute_txid());
+        let height = bitcoin::absolute::Height::from_consensus(100).unwrap();
+
+        let cache = Cache::from_wallet_txs([
+            (
+                first_tx,
+                TxConfirmationStatus::Confirmed(anchor(100, 0)),
+                vec![spk.clone()],
+            ),
+            (
+                second_tx,
+                TxConfirmationStatus::Confirmed(anchor(100, 1)),
+                vec![spk],
+            ),
+        ]);
+
+        let in_block_order = ElectrumScriptStatus::from_history(&[
+            response::Tx::Confirmed(response::ConfirmedTx {
+                txid: first,
+                height,
             }),
+            response::Tx::Confirmed(response::ConfirmedTx {
+                txid: second,
+                height,
+            }),
+        ])
+        .expect("history is not empty");
+        let reversed = ElectrumScriptStatus::from_history(&[
+            response::Tx::Confirmed(response::ConfirmedTx {
+                txid: second,
+                height,
+            }),
+            response::Tx::Confirmed(response::ConfirmedTx {
+                txid: first,
+                height,
+            }),
+        ])
+        .expect("history is not empty");
+        assert_ne!(
+            in_block_order, reversed,
+            "the hash must actually be order-sensitive, or this test proves nothing"
         );
 
-        let json = serde_json::to_string(&before).expect("must serialize");
-        assert!(
-            !json.contains(&txid(1).to_string()),
-            "the wallet's own data must not be written here: {json}"
+        assert_eq!(
+            cache.subscriptions.spk_status(spk_hash),
+            Some(in_block_order),
+            "same-height entries must be ordered by their position in the block, not insertion \
+             order, or the rebuilt status will not match what a server reports"
         );
-        let after: Cache = serde_json::from_str(&json).expect("must deserialize");
-        assert!(after.tx_cache.txs.is_empty());
+    }
+
+    /// A wallet holds each of its transactions once, not once per script it happens to pay — a
+    /// single entry naming every relevant script must still update every one of them.
+    #[test]
+    fn one_transaction_can_update_more_than_one_script() {
+        let spk_a = ScriptBuf::from_hex("0014000000000000000000000000000000000000000a").unwrap();
+        let spk_b = ScriptBuf::from_hex("0014000000000000000000000000000000000000000b").unwrap();
+        let tx = transaction(1);
+        let txid = tx.compute_txid();
+
+        let cache = Cache::from_wallet_txs([(
+            tx,
+            TxConfirmationStatus::Confirmed(anchor(100, 0)),
+            vec![spk_a.clone(), spk_b.clone()],
+        )]);
+
+        for spk in [spk_a, spk_b] {
+            let spk_hash = ElectrumScriptHash::new(&spk);
+            assert_eq!(
+                cache.spk_txids.get(&spk_hash),
+                Some(&BTreeSet::from([txid])),
+                "the tx must be recorded against every script it pays"
+            );
+            assert!(
+                cache.subscriptions.spk_status(spk_hash).is_some(),
+                "and every script must get a status to subscribe with"
+            );
+        }
     }
 }
