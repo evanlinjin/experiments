@@ -25,6 +25,9 @@ use bdk_core::{
 /// block is included in the [`CheckPoint`] handed out by [`tip`](Self::tip), so it can always be
 /// connected to a `LocalChain`. Between the trusted blocks and the sync start there are gaps.
 ///
+/// A non-empty set of trusted headers has to include genesis, so that it declares which network
+/// it belongs to. See [`new`](Self::new).
+///
 /// # Difficulty
 ///
 /// (3) is what makes (4) mean anything: without it a server could claim a trivial difficulty and
@@ -53,7 +56,9 @@ impl HeaderChain {
     /// the sync start to be verified later, when a transaction turns out to be confirmed down
     /// there; they can be at any height.
     ///
-    /// Genesis is added automatically; an entry at height `0` must agree with `params`.
+    /// A non-empty set must include genesis, and it must agree with `params` — that entry is
+    /// what says which network the set was built for, and without it a set from another chain is
+    /// accepted in full. An empty set means "sync from genesis".
     pub fn new(
         params: impl Into<Params>,
         trusted: impl IntoIterator<Item = (u32, Header)>,
@@ -61,14 +66,27 @@ impl HeaderChain {
         let params = params.into();
         let genesis = genesis_block(&params).header;
         let mut trusted = trusted.into_iter().collect::<BTreeMap<u32, Header>>();
-        if let Some(header) = trusted.insert(0, genesis) {
-            ensure!(
+        // A non-empty set must name the chain it came from by including genesis. Nothing below
+        // can catch a set built for another network: on a network with the difficulty rules off
+        // and a high target limit, another chain's real headers link, hash and verify perfectly.
+        // Genesis is the one block whose hash is fixed by `params`, so it is the only thing the
+        // set can be held against. An empty set has nothing to mismatch.
+        match trusted.insert(0, genesis) {
+            Some(header) => ensure!(
                 header.block_hash() == genesis.block_hash(),
                 "trusted block at height 0 is {}, but {} has genesis {}",
                 header.block_hash(),
                 params.network,
                 genesis.block_hash(),
-            );
+            ),
+            // `trusted` now holds the genesis just inserted, so a length of one means it came in
+            // empty.
+            None => ensure!(
+                trusted.len() == 1,
+                "a trusted set must include the genesis block at height 0, so that it says which \
+                 network it is for; this one starts at height {}",
+                trusted.keys().nth(1).expect("more than one entry"),
+            ),
         }
         let anchor = *trusted
             .keys()
@@ -405,10 +423,15 @@ mod test {
         forked[from as usize + 1..].to_vec()
     }
 
+    /// A [`HeaderChain`] trusting `trusted_heights` of `headers`, plus genesis, which every
+    /// non-empty trusted set has to carry.
     fn chain(headers: &[Header], trusted_heights: &[u32]) -> HeaderChain {
         HeaderChain::new(
             params(),
-            trusted_heights.iter().map(|&h| (h, headers[h as usize])),
+            trusted_heights
+                .iter()
+                .chain(&[0])
+                .map(|&h| (h, headers[h as usize])),
         )
         .unwrap()
     }
@@ -486,7 +509,11 @@ mod test {
         // chain it replaces without tripping the difficulty rule.
         let params = Params::REGTEST;
         let headers = mine(&params, 10);
-        let mut c = HeaderChain::new(params.clone(), [(3, headers[3]), (8, headers[8])]).unwrap();
+        let mut c = HeaderChain::new(
+            params.clone(),
+            [(0, headers[0]), (3, headers[3]), (8, headers[8])],
+        )
+        .unwrap();
         c.apply(9, headers[9..].to_vec()).unwrap();
         c.apply(4, headers[4..9].to_vec()).unwrap();
         assert_eq!(c.base_height(), 4);
@@ -582,11 +609,29 @@ mod test {
         assert_eq!(c.tip_height(), Some(10));
     }
 
+    /// A set built for another network is not caught by anything else: here the headers are
+    /// real, so they link and hash correctly, and the difficulty rules are off on this network.
+    /// Genesis is the only block whose hash `params` fixes, so requiring it is what makes the
+    /// mismatch visible.
+    #[test]
+    fn rejects_a_trusted_set_without_genesis() {
+        let headers = mine(&params(), 6);
+        let err = HeaderChain::new(params(), [(5, headers[5])])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("must include the genesis block"), "{err}");
+        assert!(err.contains("starts at height 5"), "{err}");
+
+        // Empty is still fine: it means "sync from genesis", and has nothing to mismatch.
+        let c = HeaderChain::new(params(), []).unwrap();
+        assert_eq!(c.base_height(), 1);
+    }
+
     #[test]
     fn rejects_a_trusted_anchor_off_the_retarget_boundary() {
         let params = retarget_params();
         let headers = mine(&params, 12);
-        let err = HeaderChain::new(params, [(11, headers[11])])
+        let err = HeaderChain::new(params, [(0, headers[0]), (11, headers[11])])
             .unwrap_err()
             .to_string();
         assert!(err.contains("difficulty-adjustment boundary"), "{err}");
@@ -601,7 +646,7 @@ mod test {
             "difficulty must actually move for this test to mean anything"
         );
 
-        let mut c = HeaderChain::new(params.clone(), [(10, headers[10])]).unwrap();
+        let mut c = HeaderChain::new(params.clone(), [(0, headers[0]), (10, headers[10])]).unwrap();
         assert_eq!(c.base_height(), 11);
         c.apply(11, headers[11..].to_vec()).unwrap();
         assert_eq!(c.tip_height(), Some(25));
@@ -609,7 +654,7 @@ mod test {
         // The retarget at 20 is recomputed from the trusted header at 10 — no gap on faith.
         let mut faked = headers.clone();
         faked[20].bits = headers[19].bits;
-        let mut c = HeaderChain::new(params, [(10, headers[10])]).unwrap();
+        let mut c = HeaderChain::new(params, [(0, headers[0]), (10, headers[10])]).unwrap();
         let err = c.apply(11, faked[11..].to_vec()).unwrap_err().to_string();
         assert!(err.contains("height 20"), "{err}");
         assert!(err.contains("consensus requires"), "{err}");

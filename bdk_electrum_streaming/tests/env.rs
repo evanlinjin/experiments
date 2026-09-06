@@ -249,7 +249,10 @@ async fn backfills_history_below_the_sync_start() -> anyhow::Result<()> {
         ReqCoord::default(),
         Cache::default(),
         spk_tracker,
-        HeaderChain::new(Network::Regtest, [(trusted_height, trusted_header)])?,
+        HeaderChain::new(
+            Network::Regtest,
+            [(0, genesis_header()), (trusted_height, trusted_header)],
+        )?,
     );
     assert_eq!(
         state.chain().base_height(),

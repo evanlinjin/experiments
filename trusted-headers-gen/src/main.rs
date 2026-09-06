@@ -35,7 +35,13 @@ use std::{
     str::FromStr,
 };
 
-use bdk_core::bitcoin::{block::Header, consensus::encode::deserialize_hex, BlockHash, Network};
+use bdk_core::bitcoin::{
+    block::Header,
+    consensus::encode::{deserialize_hex, serialize_hex},
+    constants::genesis_block,
+    params::Params,
+    BlockHash, Network,
+};
 use corepc_client::client_sync::{v17::Client, Auth};
 
 /// Per-network state: trusted heights and the raw header hex at each. Rebuilt from the existing
@@ -148,10 +154,9 @@ fn main() -> anyhow::Result<()> {
     let (height, hash, header_hex) = fetch_trusted_header(&client, args.network, args.height)?;
 
     let mut state = parse_existing(&args.out);
-    state
-        .entry(args.network)
-        .or_default()
-        .insert(height, header_hex);
+    let section = state.entry(args.network).or_default();
+    section.insert(height, header_hex);
+    section.insert(0, genesis_hex(args.network));
     fs::write(&args.out, render_file(&state))?;
     let _ = std::process::Command::new("rustfmt")
         .arg(&args.out)
@@ -163,6 +168,19 @@ fn main() -> anyhow::Result<()> {
         args.out.display(),
     );
     Ok(())
+}
+
+/// This network's genesis header, hex-encoded.
+///
+/// Every section carries one, so the file says which chain each of its headers came from.
+/// `HeaderChain::new` refuses a trusted set that has no genesis, and checks the one it has
+/// against the params it was handed — without that, a set built for one network can be handed to
+/// another's params and pass every later check, because the headers themselves are real.
+///
+/// Derived rather than fetched: it is a constant of the network, and the node has already been
+/// held to that network by the time we get here.
+fn genesis_hex(network: Network) -> String {
+    serialize_hex(&genesis_block(Params::from(network)).header)
 }
 
 /// Blocks between difficulty adjustments.

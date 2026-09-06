@@ -296,7 +296,11 @@ fn new_state_trusting(
 ) -> BlockingState {
     let mut spk_tracker = DerivedSpkTracker::new(0);
     spk_tracker.insert_descriptor("external", descriptor, 0);
-    let chain = HeaderChain::new(Network::Regtest, trusted).expect("must build header chain");
+    // Genesis goes in here rather than at every call site: a non-empty trusted set has to carry
+    // it, and an empty one is unchanged by it.
+    let genesis = constants::genesis_block(Network::Regtest).header;
+    let chain = HeaderChain::new(Network::Regtest, trusted.into_iter().chain([(0, genesis)]))
+        .expect("must build header chain");
     BlockingState::new(ReqCoord::default(), cache, spk_tracker, chain)
 }
 
