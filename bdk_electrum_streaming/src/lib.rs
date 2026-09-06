@@ -6,6 +6,9 @@ use bdk_core::{
     bitcoin::{block::Header, Txid},
     spk_client::FullScanResponse,
 };
+/// Re-export, so callers can inspect the errors this crate returns without matching its
+/// `anyhow` version themselves.
+pub use anyhow;
 /// Re-export.
 pub use electrum_streaming_client;
 
