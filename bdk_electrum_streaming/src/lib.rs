@@ -2,7 +2,10 @@
 
 use std::collections::BTreeSet;
 
-use bdk_core::{bitcoin::Txid, spk_client::FullScanResponse};
+use bdk_core::{
+    bitcoin::{ScriptBuf, Txid},
+    spk_client::FullScanResponse,
+};
 pub use electrum_streaming_client;
 
 use bdk_core::ConfirmationBlockTime;
@@ -39,6 +42,11 @@ pub enum ClientAction<K, PReq: PendingRequest> {
         keychain: K,
         descriptor: Box<Descriptor<DescriptorPublicKey>>,
         next_index: u32,
+        /// The eviction baseline of the spks this registers, in the shape
+        /// [`DerivedSpkTracker::insert_descriptor`] takes it.
+        ///
+        /// [`DerivedSpkTracker::insert_descriptor`]: crate::DerivedSpkTracker::insert_descriptor
+        expected_spk_txids: Vec<(ScriptBuf, Txid)>,
     },
     Stop,
 }

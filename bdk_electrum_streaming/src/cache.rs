@@ -29,21 +29,19 @@ pub struct Cache {
 /// The transaction data a job consults before asking the server for anything.
 ///
 /// Separate from the rest of [`Cache`] because a caller can rebuild all of it from their own
-/// wallet: the transactions are in their graph, the anchors with them, and which transactions
-/// paid a script is what their spk index is for. So none of it is persisted alongside
-/// [`Subscriptions`], which nothing can reconstruct.
+/// wallet: the transactions are in their graph and the anchors with them. So none of it is
+/// persisted alongside [`Subscriptions`], which nothing can reconstruct.
 ///
 /// Starting empty is always correct, only expensive: a job asks the server for whatever it
 /// cannot find here, so an empty one re-downloads every transaction and reproves every anchor.
+/// Nothing here changes what an update reports, only what it costs to produce — which is why
+/// the eviction baseline lives on [`DerivedSpkTracker`](crate::DerivedSpkTracker) instead, where
+/// leaving it out is not something a caller can do by accident.
+///
 /// It is not a mirror of the wallet, though — whatever a job fetches lands here too, so it
 /// answers "do we already have this" whoever supplied it.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct TxCache {
-    /// Every txid ever seen for each script hash.
-    ///
-    /// This is monotonically growing so that we can detect evictions.
-    pub spk_txids: HashMap<ElectrumScriptHash, BTreeSet<Txid>>,
-
     pub txs: HashMap<Txid, Arc<Transaction>>,
 
     /// Written as a sequence: a `(Txid, BlockHash)` key is not a string, so a map would be
@@ -70,11 +68,6 @@ impl Cache {
     ) -> Option<ElectrumScriptStatus> {
         let status_opt = ElectrumScriptStatus::from_history(&resp);
         if let Some(status) = status_opt {
-            self.tx_cache
-                .spk_txids
-                .entry(req.script_hash)
-                .or_default()
-                .extend(resp.iter().map(|tx| tx.txid()));
             self.subscriptions.insert_spk(req.script_hash, status, resp);
         } else {
             self.subscriptions.remove_spk(req.script_hash);
