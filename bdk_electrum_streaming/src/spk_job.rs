@@ -60,9 +60,10 @@ pub enum SpkProgress {
     Continue,
     /// Waiting on the server.
     Blocked,
-    /// Everything asked for has arrived. Carries what the job gathered, leaving it empty, so a
-    /// job polled again after finishing contributes nothing a second time.
-    Done(TxUpdate<ConfirmationBlockTime>),
+    /// Something to stage; poll again.
+    TxUpdate(TxUpdate<ConfirmationBlockTime>),
+    /// Everything asked for has arrived.
+    Done,
 }
 
 /// The job to perform once we receive a script status notification.
@@ -81,11 +82,17 @@ pub struct SpkJob {
 
     stage: SpkStage,
     tx_update: TxUpdate<ConfirmationBlockTime>,
+
+    /// What we expected the server to report for this spk when the job started, replaced by what
+    /// it actually reported once the history is in. Snapshotted rather than read as the job runs,
+    /// so the difference cannot be taken against a set the same response has already been folded
+    /// into.
+    expected_txids: BTreeSet<Txid>,
 }
 
 impl SpkJob {
     pub fn new(
-        cache: &Cache,
+        mut expected_txids: BTreeSet<Txid>,
         spk_hash: ElectrumScriptHash,
         spk_status: Option<ElectrumScriptStatus>,
     ) -> Self {
@@ -95,11 +102,12 @@ impl SpkJob {
         let stage = match spk_status {
             Some(status) => SpkStage::ProcessingHistory { status },
             None => {
-                if let Some(prev_txids) = cache.tx_cache.spk_txids.get(&spk_hash) {
-                    tx_update
-                        .evicted_ats
-                        .extend(prev_txids.iter().map(|&txid| (txid, start.as_secs())));
-                }
+                // An absent status is the server stating this spk has no history at all, so
+                // everything we expected under it is gone.
+                tx_update
+                    .evicted_ats
+                    .extend(expected_txids.iter().map(|&txid| (txid, start.as_secs())));
+                expected_txids.clear();
                 SpkStage::Done
             }
         };
@@ -109,7 +117,14 @@ impl SpkJob {
             spk_hash,
             stage,
             tx_update,
+            expected_txids,
         }
+    }
+
+    /// What we now expect the server to report for this spk, for the caller to commit back to the
+    /// tracker so the next job starts from it.
+    pub fn expected_txids(&self) -> &BTreeSet<Txid> {
+        &self.expected_txids
     }
 
     /// The status this job is still waiting on a history for.
@@ -137,7 +152,8 @@ impl SpkJob {
     /// Take one step towards having everything the script's history names.
     ///
     /// One step per call, so the caller drives it the same way it drives [`ConfirmationJob`]: poll
-    /// until [`SpkProgress::Blocked`] or [`SpkProgress::Done`].
+    /// until [`SpkProgress::Blocked`] or [`SpkProgress::Done`], staging every
+    /// [`SpkProgress::TxUpdate`] on the way.
     ///
     /// Errors when the server answers with a transaction that cannot be the one asked for —
     /// its outputs do not reach an outpoint we know is spent. That is the server's picture
@@ -149,23 +165,22 @@ impl SpkJob {
             SpkStage::ProcessingHistory { status } => {
                 match cache.subscriptions.spk_history(*status) {
                     Some(history) => {
-                        if let Some(prev_txids) = cache.tx_cache.spk_txids.get(&self.spk_hash) {
-                            let these_txids =
-                                history.iter().map(|tx| tx.txid()).collect::<BTreeSet<_>>();
-                            let to_evict = prev_txids
+                        let these_txids =
+                            history.iter().map(|tx| tx.txid()).collect::<BTreeSet<_>>();
+                        let mut update = TxUpdate::default();
+                        update.evicted_ats.extend(
+                            self.expected_txids
                                 .difference(&these_txids)
-                                .map(|&txid| (txid, self.start.as_secs()));
-                            self.tx_update.evicted_ats.extend(to_evict);
-                        }
+                                .map(|&txid| (txid, self.start.as_secs())),
+                        );
+                        self.expected_txids = these_txids;
                         for tx in history {
                             if let response::Tx::Mempool(tx) = tx {
-                                self.tx_update
-                                    .seen_ats
-                                    .insert((tx.txid, self.start.as_secs()));
+                                update.seen_ats.insert((tx.txid, self.start.as_secs()));
                             }
                         }
                         self.stage = SpkStage::from_txids(history.iter().map(|tx| tx.txid()));
-                        SpkProgress::Continue
+                        SpkProgress::TxUpdate(update)
                     }
                     None => {
                         queuer.enqueue(request::GetHistory {
@@ -240,7 +255,10 @@ impl SpkJob {
                     SpkProgress::Blocked
                 }
             }
-            SpkStage::Done => SpkProgress::Done(core::mem::take(&mut self.tx_update)),
+            SpkStage::Done if !self.tx_update.is_empty() => {
+                SpkProgress::TxUpdate(core::mem::take(&mut self.tx_update))
+            }
+            SpkStage::Done => SpkProgress::Done,
         };
 
         let stage_str = match &self.stage {
