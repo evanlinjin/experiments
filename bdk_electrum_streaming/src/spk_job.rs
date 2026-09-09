@@ -81,11 +81,17 @@ pub struct SpkJob {
 
     stage: SpkStage,
     tx_update: TxUpdate<ConfirmationBlockTime>,
+
+    /// What we expected the server to report for this spk when the job started, replaced by what
+    /// it actually reported once the history is in. Snapshotted rather than read as the job runs,
+    /// so the difference cannot be taken against a set the same response has already been folded
+    /// into.
+    expected_txids: BTreeSet<Txid>,
 }
 
 impl SpkJob {
     pub fn new(
-        cache: &Cache,
+        mut expected_txids: BTreeSet<Txid>,
         spk_hash: ElectrumScriptHash,
         spk_status: Option<ElectrumScriptStatus>,
     ) -> Self {
@@ -95,11 +101,12 @@ impl SpkJob {
         let stage = match spk_status {
             Some(status) => SpkStage::ProcessingHistory { status },
             None => {
-                if let Some(prev_txids) = cache.tx_cache.spk_txids.get(&spk_hash) {
-                    tx_update
-                        .evicted_ats
-                        .extend(prev_txids.iter().map(|&txid| (txid, start.as_secs())));
-                }
+                // An absent status is the server stating this spk has no history at all, so
+                // everything we expected under it is gone.
+                tx_update
+                    .evicted_ats
+                    .extend(expected_txids.iter().map(|&txid| (txid, start.as_secs())));
+                expected_txids.clear();
                 SpkStage::Done
             }
         };
@@ -109,7 +116,14 @@ impl SpkJob {
             spk_hash,
             stage,
             tx_update,
+            expected_txids,
         }
+    }
+
+    /// What we now expect the server to report for this spk, for the caller to commit back to the
+    /// tracker so the next job starts from it.
+    pub fn expected_txids(&self) -> &BTreeSet<Txid> {
+        &self.expected_txids
     }
 
     /// The status this job is still waiting on a history for.
@@ -149,14 +163,14 @@ impl SpkJob {
             SpkStage::ProcessingHistory { status } => {
                 match cache.subscriptions.spk_history(*status) {
                     Some(history) => {
-                        if let Some(prev_txids) = cache.tx_cache.spk_txids.get(&self.spk_hash) {
-                            let these_txids =
-                                history.iter().map(|tx| tx.txid()).collect::<BTreeSet<_>>();
-                            let to_evict = prev_txids
-                                .difference(&these_txids)
-                                .map(|&txid| (txid, self.start.as_secs()));
-                            self.tx_update.evicted_ats.extend(to_evict);
-                        }
+                        let these_txids =
+                            history.iter().map(|tx| tx.txid()).collect::<BTreeSet<_>>();
+                        let to_evict = self
+                            .expected_txids
+                            .difference(&these_txids)
+                            .map(|&txid| (txid, self.start.as_secs()));
+                        self.tx_update.evicted_ats.extend(to_evict);
+                        self.expected_txids = these_txids;
                         for tx in history {
                             if let response::Tx::Mempool(tx) = tx {
                                 self.tx_update

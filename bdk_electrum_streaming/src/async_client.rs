@@ -1,6 +1,7 @@
 //! Driving [`State`](crate::State) over an async transport.
 
 use anyhow::Context;
+use bdk_core::bitcoin::{ScriptBuf, Txid};
 use electrum_streaming_client::{
     AsyncBatchRequest, AsyncPendingRequest, AsyncPendingRequestTuple, RawNotificationOrResponse,
     RawRequest,
@@ -50,11 +51,16 @@ impl<K: Sync + Send + 'static> AsyncClient<K> {
         Ok(resp_rx.await?)
     }
 
+    /// Track `descriptor` under `keychain` through `next_index` plus lookahead.
+    ///
+    /// `expected_spk_txids` seeds the eviction baseline of the spks this registers; see
+    /// [`DerivedSpkTracker::insert_descriptor`](crate::DerivedSpkTracker::insert_descriptor).
     pub fn track_descriptor<D>(
         &self,
         keychain: K,
         descriptor: D,
         next_index: u32,
+        expected_spk_txids: impl IntoIterator<Item = (ScriptBuf, Txid)>,
     ) -> anyhow::Result<()>
     where
         D: Into<Box<Descriptor<DescriptorPublicKey>>>,
@@ -65,6 +71,7 @@ impl<K: Sync + Send + 'static> AsyncClient<K> {
                 keychain,
                 descriptor: descriptor.into(),
                 next_index,
+                expected_spk_txids: expected_spk_txids.into_iter().collect(),
             })?)
     }
 
@@ -158,8 +165,8 @@ where
                         crate::ClientAction::Request(batch) => {
                             state.user_request(&mut req_queue, batch);
                         },
-                        crate::ClientAction::AddDescriptor { keychain, descriptor, next_index } => {
-                            state.insert_descriptor(&mut req_queue, keychain, *descriptor, next_index);
+                        crate::ClientAction::AddDescriptor { keychain, descriptor, next_index, expected_spk_txids } => {
+                            state.insert_descriptor(&mut req_queue, keychain, *descriptor, next_index, expected_spk_txids);
                         },
                         crate::ClientAction::Stop => {
                             tracing::info!("Client sent stop signal");                           

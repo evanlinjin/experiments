@@ -1,18 +1,24 @@
-use std::{sync::atomic::AtomicBool, time::Duration};
+use std::{collections::HashMap, sync::atomic::AtomicBool, time::Duration};
 
 use bdk_chain::{
     keychain_txout::KeychainTxOutIndex, local_chain::LocalChain, CanonicalizationParams,
     ChainPosition, IndexedTxGraph,
 };
 use bdk_core::{
-    bitcoin::{key::Secp256k1, params::REGTEST, Address, Amount, BlockHash, Txid},
+    bitcoin::{
+        key::Secp256k1, params::REGTEST, Address, Amount, BlockHash, OutPoint, ScriptBuf, Txid,
+    },
     ConfirmationBlockTime,
 };
 use bdk_electrum_streaming::{
     run_async, run_blocking, AsyncClient, AsyncState, BlockingClient, BlockingState, Cache,
     DerivedSpkTracker, ReqCoord, Update,
 };
-use bdk_testenv::{bitcoincore_rpc::RpcApi, utils::DESCRIPTORS, TestEnv};
+use bdk_testenv::{
+    bitcoincore_rpc::{json::CreateRawTransactionInput, RpcApi},
+    utils::DESCRIPTORS,
+    TestEnv,
+};
 use futures::{channel::mpsc, pin_mut, FutureExt, StreamExt};
 use miniscript::Descriptor;
 use tokio::net::TcpStream;
@@ -28,6 +34,24 @@ fn init() {
         .with_test_writer()
         .with_max_level(Level::TRACE)
         .try_init();
+}
+
+/// The eviction baseline the client needs for `keychain`: every txid the wallet's canonical view
+/// says the chain source should still be reporting under one of that keychain's spks. This is the
+/// whole integration -- the client cannot derive it, because a transaction cancelled while the
+/// client was not running left no trace in anything the client can see.
+fn expected_spk_txids(
+    chain: &LocalChain,
+    graph: &Graph,
+    keychain: &'static str,
+) -> Vec<(ScriptBuf, Txid)> {
+    graph
+        .list_expected_spk_txids(
+            chain,
+            chain.tip().block_id(),
+            (keychain, u32::MIN)..=(keychain, u32::MAX),
+        )
+        .collect()
 }
 
 fn apply_update(
@@ -67,8 +91,8 @@ fn blocking_env() -> anyhow::Result<()> {
     let (mut chain, _cs) = LocalChain::from_genesis_hash(env.genesis_hash()?);
 
     let mut spk_tracker = DerivedSpkTracker::<&'static str>::new(LOOKAHEAD);
-    spk_tracker.insert_descriptor(EXTERNAL, external, 0);
-    spk_tracker.insert_descriptor(INTERNAL, internal, 0);
+    spk_tracker.insert_descriptor(EXTERNAL, external, 0, []);
+    spk_tracker.insert_descriptor(INTERNAL, internal, 0, []);
 
     let mut state = BlockingState::new(
         ReqCoord::default(),
@@ -152,8 +176,8 @@ async fn env() -> anyhow::Result<()> {
     let (mut chain, _cs) = LocalChain::from_genesis_hash(env.genesis_hash()?);
 
     let mut spk_tracker = DerivedSpkTracker::<&'static str>::new(LOOKAHEAD);
-    spk_tracker.insert_descriptor(EXTERNAL, external, 0);
-    spk_tracker.insert_descriptor(INTERNAL, internal, 0);
+    spk_tracker.insert_descriptor(EXTERNAL, external, 0, []);
+    spk_tracker.insert_descriptor(INTERNAL, internal, 0, []);
 
     let mut state = AsyncState::new(
         ReqCoord::default(),
@@ -250,8 +274,8 @@ async fn new_block_confirmation_is_anchored_live() -> anyhow::Result<()> {
     let (mut chain, _cs) = LocalChain::from_genesis_hash(env.genesis_hash()?);
 
     let mut spk_tracker = DerivedSpkTracker::<&'static str>::new(LOOKAHEAD);
-    spk_tracker.insert_descriptor(EXTERNAL, external, 0);
-    spk_tracker.insert_descriptor(INTERNAL, internal, 0);
+    spk_tracker.insert_descriptor(EXTERNAL, external, 0, []);
+    spk_tracker.insert_descriptor(INTERNAL, internal, 0, []);
 
     let mut state = AsyncState::new(
         ReqCoord::default(),
@@ -411,8 +435,8 @@ impl LiveWallet {
         let (mut chain, _cs) = LocalChain::from_genesis_hash(env.genesis_hash()?);
 
         let mut spk_tracker = DerivedSpkTracker::<&'static str>::new(LOOKAHEAD);
-        spk_tracker.insert_descriptor(EXTERNAL, external, 0);
-        spk_tracker.insert_descriptor(INTERNAL, internal, 0);
+        spk_tracker.insert_descriptor(EXTERNAL, external, 0, []);
+        spk_tracker.insert_descriptor(INTERNAL, internal, 0, []);
 
         let mut state = AsyncState::new(
             ReqCoord::default(),
@@ -595,4 +619,263 @@ async fn reorg_unconfirming_a_tx_keeps_the_connection_alive() -> anyhow::Result<
     );
 
     w.stop().await
+}
+
+/// A payment can be replaced out of the mempool while nothing is connected. Nothing the client can
+/// observe records that disappearance -- the spk it arrived on simply has no history any more --
+/// so a client that assembles its own eviction baseline from the responses of the session it is in
+/// can never report it. Restart against a wallet that still holds the payment and it must be
+/// reported evicted.
+#[tokio::test]
+async fn payment_replaced_while_disconnected_is_evicted_on_restart() -> anyhow::Result<()> {
+    init();
+
+    let secp = Secp256k1::new();
+    let env = TestEnv::new()?;
+    let electrum_url = env.electrsd.electrum_url.clone();
+    let rpc = env.rpc_client();
+
+    let (external, _external_keys) = Descriptor::parse_descriptor(&secp, DESCRIPTORS[0])?;
+    let (internal, _internal_keys) = Descriptor::parse_descriptor(&secp, DESCRIPTORS[1])?;
+
+    let mut graph = IndexedTxGraph::<ConfirmationBlockTime, _>::new({
+        let mut indexer = KeychainTxOutIndex::<&'static str>::new(LOOKAHEAD, false);
+        indexer.insert_descriptor(EXTERNAL, external.clone())?;
+        indexer.insert_descriptor(INTERNAL, internal.clone())?;
+        indexer
+    });
+    let (mut chain, _cs) = LocalChain::from_genesis_hash(env.genesis_hash()?);
+
+    env.mine_blocks(101, None)?;
+    let premine_height = rpc.get_block_count()? as u32;
+
+    // -- Session one: the payment arrives while the client is connected. -----------------------
+    let (mut update_rx, client, run_handle) = spawn_session(
+        &electrum_url,
+        &chain,
+        &graph,
+        external.clone(),
+        internal.clone(),
+    )?;
+
+    let timeout = tokio::time::sleep(Duration::from_secs(150)).fuse();
+    pin_mut!(timeout);
+    while chain.tip().height() < premine_height {
+        futures::select! {
+            _ = timeout => return Err(anyhow::anyhow!("Timed-out waiting for chain sync.")),
+            update = update_rx.next() => {
+                apply_update(&mut chain, &mut graph, update.expect("Must have next update"))?;
+            },
+        }
+    }
+
+    let ((_, spk), _) = graph
+        .index
+        .next_unused_spk(EXTERNAL)
+        .expect("must derive spk");
+    let (txid_a, spent, spent_value) =
+        send_replaceable(&env, &Address::from_script(&spk, &REGTEST)?)?;
+
+    let timeout = tokio::time::sleep(Duration::from_secs(150)).fuse();
+    pin_mut!(timeout);
+    loop {
+        futures::select! {
+            _ = timeout => return Err(anyhow::anyhow!("Timed-out waiting for the payment.")),
+            update = update_rx.next() => {
+                let update = update.expect("Must have next update");
+                let has_tx = update.tx_update.txs.iter().any(|tx| tx.compute_txid() == txid_a);
+                apply_update(&mut chain, &mut graph, update)?;
+                if has_tx {
+                    break;
+                }
+            },
+        }
+    }
+    assert!(
+        is_canonical(&chain, &graph, txid_a),
+        "the wallet must hold the payment before it goes away",
+    );
+
+    client.stop().await?;
+    run_handle.await??;
+
+    // -- Nothing is connected. The payment is replaced by one that does not pay us. ------------
+    let txid_b = replace(&env, spent, spent_value)?;
+    env.wait_until_electrum_sees_txid(txid_b, Duration::from_secs(30))?;
+    assert!(
+        !rpc.get_raw_mempool()?.contains(&txid_a),
+        "the payment must be gone from the mempool",
+    );
+    // `last_evicted` only outranks `last_seen` when it is strictly greater, and both are whole
+    // seconds, so an eviction reported inside the same second as the sighting does not stick.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    // -- Session two: a new client, told what the wallet still expects. -------------------------
+    let (mut update_rx, client, run_handle) =
+        spawn_session(&electrum_url, &chain, &graph, external, internal)?;
+
+    // A payment to a second script, made after the relaunch. It proves the new client is really
+    // syncing rather than merely quiet -- and it is also what hands the update over at all: an
+    // update is only released while the confirmation job owes one, and that job is re-armed by
+    // the set of script statuses changing. An eviction that empties the wallet's only history
+    // leaves that set as it found it (empty), so on its own it stages an update that is never
+    // released. See the report accompanying this change.
+    let ((_, probe_spk), _) = graph
+        .index
+        .next_unused_spk(EXTERNAL)
+        .expect("must derive spk");
+    env.send(
+        &Address::from_script(&probe_spk, &REGTEST)?,
+        Amount::ONE_BTC,
+    )?;
+
+    let timeout = tokio::time::sleep(Duration::from_secs(150)).fuse();
+    pin_mut!(timeout);
+    let mut reported = false;
+    while !reported || is_canonical(&chain, &graph, txid_a) {
+        futures::select! {
+            _ = timeout => return Err(anyhow::anyhow!(
+                "Timed-out waiting for the eviction of {txid_a}: reported={reported}",
+            )),
+            update = update_rx.next() => {
+                let update = update.expect("Must have next update");
+                reported |= update.tx_update.evicted_ats.iter().any(|&(t, _)| t == txid_a);
+                apply_update(&mut chain, &mut graph, update)?;
+            },
+        }
+    }
+
+    client.stop().await?;
+    run_handle.await??;
+    Ok(())
+}
+
+type Session = (
+    mpsc::UnboundedReceiver<Update<&'static str>>,
+    AsyncClient<&'static str>,
+    tokio::task::JoinHandle<anyhow::Result<()>>,
+);
+
+/// Connect a client that has never seen this wallet before, handing it the baseline the wallet
+/// currently holds.
+fn spawn_session(
+    electrum_url: &str,
+    chain: &LocalChain,
+    graph: &Graph,
+    external: Descriptor<miniscript::DescriptorPublicKey>,
+    internal: Descriptor<miniscript::DescriptorPublicKey>,
+) -> anyhow::Result<Session> {
+    let mut spk_tracker = DerivedSpkTracker::<&'static str>::new(LOOKAHEAD);
+    let next_index = |keychain| {
+        graph
+            .index
+            .last_revealed_index(keychain)
+            .map_or(0, |last| last + 1)
+    };
+    spk_tracker.insert_descriptor(
+        EXTERNAL,
+        external,
+        next_index(EXTERNAL),
+        expected_spk_txids(chain, graph, EXTERNAL),
+    );
+    spk_tracker.insert_descriptor(
+        INTERNAL,
+        internal,
+        next_index(INTERNAL),
+        expected_spk_txids(chain, graph, INTERNAL),
+    );
+
+    let mut state = AsyncState::new(
+        ReqCoord::default(),
+        Cache::default(),
+        spk_tracker,
+        chain.tip(),
+    );
+    let (mut update_tx, update_rx) = mpsc::unbounded::<Update<&'static str>>();
+    let (client, mut client_rx) = AsyncClient::new();
+    let electrum_url = electrum_url.to_string();
+
+    let run_handle = tokio::spawn(async move {
+        let mut conn = TcpStream::connect(&electrum_url).await?;
+        let (read, write) = conn.split();
+        run_async(
+            &mut state,
+            &mut update_tx,
+            &mut client_rx,
+            read.compat(),
+            write.compat_write(),
+        )
+        .await?;
+        anyhow::Ok(())
+    });
+    Ok((update_rx, client, run_handle))
+}
+
+fn is_canonical(chain: &LocalChain, graph: &Graph, txid: Txid) -> bool {
+    graph
+        .graph()
+        .list_canonical_txs(
+            chain,
+            chain.tip().block_id(),
+            CanonicalizationParams::default(),
+        )
+        .any(|c_tx| c_tx.tx_node.txid == txid)
+}
+
+/// Pay `address` with a BIP125-replaceable transaction, returning it and the outpoint it spends so
+/// that [`replace`] can conflict with it.
+fn send_replaceable(env: &TestEnv, address: &Address) -> anyhow::Result<(Txid, OutPoint, Amount)> {
+    let rpc = env.rpc_client();
+    let utxo = rpc
+        .list_unspent(Some(1), None, None, None, None)?
+        .into_iter()
+        .find(|u| u.amount > Amount::from_btc(2.0).expect("valid amount"))
+        .expect("the premine must leave a spendable output");
+    let spent = OutPoint::new(utxo.txid, utxo.vout);
+
+    let mut outs = HashMap::new();
+    outs.insert(address.to_string(), Amount::ONE_BTC);
+    outs.insert(
+        rpc.get_new_address(None, None)?
+            .assume_checked()
+            .to_string(),
+        utxo.amount - Amount::ONE_BTC - Amount::from_sat(100_000),
+    );
+    Ok((broadcast(env, spent, outs)?, spent, utxo.amount))
+}
+
+/// Replace whatever spends `spent` with a transaction that pays us nothing, so the spk the
+/// original paid to is left with no history at all. Paying a far larger fee than the original
+/// satisfies the replacement rules without having to measure either transaction.
+fn replace(env: &TestEnv, spent: OutPoint, value: Amount) -> anyhow::Result<Txid> {
+    let rpc = env.rpc_client();
+    let mut outs = HashMap::new();
+    outs.insert(
+        rpc.get_new_address(None, None)?
+            .assume_checked()
+            .to_string(),
+        value - Amount::from_sat(1_000_000),
+    );
+    broadcast(env, spent, outs)
+}
+
+fn broadcast(
+    env: &TestEnv,
+    spent: OutPoint,
+    outs: HashMap<String, Amount>,
+) -> anyhow::Result<Txid> {
+    let rpc = env.rpc_client();
+    let raw = rpc.create_raw_transaction(
+        &[CreateRawTransactionInput {
+            txid: spent.txid,
+            vout: spent.vout,
+            sequence: None,
+        }],
+        &outs,
+        None,
+        Some(true),
+    )?;
+    let signed = rpc.sign_raw_transaction_with_wallet(&raw, None, None)?;
+    assert!(signed.complete, "the premine wallet must be able to sign");
+    Ok(rpc.send_raw_transaction(&signed.hex)?)
 }

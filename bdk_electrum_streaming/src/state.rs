@@ -1,7 +1,10 @@
 use std::collections::BTreeMap;
 
 use anyhow::Context;
-use bdk_core::{CheckPoint, ConfirmationBlockTime};
+use bdk_core::{
+    bitcoin::{ScriptBuf, Txid},
+    CheckPoint, ConfirmationBlockTime,
+};
 use electrum_streaming_client::{
     notification::Notification, request, AsyncPendingRequest, BlockingPendingRequest,
     ElectrumScriptHash, ElectrumScriptStatus, MaybeBatch, PendingRequest,
@@ -84,16 +87,22 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
     }
 
     /// Insert a descriptor and queue outgoing requests (if needed).
+    /// `expected_spk_txids` seeds the eviction baseline of the spks this registers; see
+    /// [`DerivedSpkTracker::insert_descriptor`].
     pub fn insert_descriptor(
         &mut self,
         req_queue: &mut ReqQueue,
         keychain: K,
         descriptor: Descriptor<DescriptorPublicKey>,
         next_index: u32,
+        expected_spk_txids: impl IntoIterator<Item = (ScriptBuf, Txid)>,
     ) {
-        let new_script_hashes = self
-            .spk_tracker
-            .insert_descriptor(keychain, descriptor, next_index);
+        let new_script_hashes = self.spk_tracker.insert_descriptor(
+            keychain,
+            descriptor,
+            next_index,
+            expected_spk_txids,
+        );
         for script_hash in new_script_hashes {
             let mut queuer = self.coord.queuer(req_queue, JobId::Spk(script_hash));
             queuer.enqueue(request::ScriptHashSubscribe { script_hash });
@@ -429,7 +438,13 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
             self.cache.subscriptions.remove_spk(spk_hash);
         }
 
-        if spk_status.is_some() || self.cache.tx_cache.spk_txids.contains_key(&spk_hash) {
+        let expected_txids = self
+            .spk_tracker
+            .expected_txids(spk_hash)
+            .cloned()
+            .unwrap_or_default();
+
+        if spk_status.is_some() || !expected_txids.is_empty() {
             for script_hash in self.spk_tracker.mark_script_hash_used(&k, i) {
                 self.coord
                     .queuer(req_queue, JobId::Spk(script_hash))
@@ -447,7 +462,7 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
         }
 
         self.spk_jobs
-            .insert(spk_hash, SpkJob::new(&self.cache, spk_hash, spk_status));
+            .insert(spk_hash, SpkJob::new(expected_txids, spk_hash, spk_status));
         self.poll_spk_jobs(req_queue, [JobId::Spk(spk_hash)])?;
         // A notification is all that revives a cancelled job, and below the reorg window the
         // tip never moves — so this is where an anchor the server has come back to is picked up.
@@ -488,6 +503,7 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
             coord,
             cache,
             spk_jobs,
+            spk_tracker,
             staged,
             ..
         } = self;
@@ -499,7 +515,11 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
             };
             loop {
                 let mut queuer = coord.queuer(req_queue, JobId::Spk(spk_hash));
-                match job.poll(&mut queuer, cache)? {
+                let progress = job.poll(&mut queuer, cache)?;
+                // Only the server retracts an expectation, so whatever the job now holds is what
+                // the next one must start from.
+                spk_tracker.set_expected_txids(spk_hash, job.expected_txids().iter().copied());
+                match progress {
                     SpkProgress::Continue => continue,
                     SpkProgress::Blocked => break,
                     SpkProgress::Done(tx_update) => {

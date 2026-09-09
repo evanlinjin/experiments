@@ -7,6 +7,7 @@ use std::{
 };
 
 use anyhow::Context;
+use bdk_core::bitcoin::{ScriptBuf, Txid};
 use electrum_streaming_client::{
     BlockingBatchRequest, BlockingPendingRequest, BlockingPendingRequestTuple,
     RawNotificationOrResponse, RawRequest,
@@ -52,17 +53,23 @@ impl<K: Sync + Send + 'static> BlockingClient<K> {
             .map_err(|_| anyhow::anyhow!("request got cancelled by the state machine"))??)
     }
 
+    /// Track `descriptor` under `keychain` through `next_index` plus lookahead.
+    ///
+    /// `expected_spk_txids` seeds the eviction baseline of the spks this registers; see
+    /// [`DerivedSpkTracker::insert_descriptor`](crate::DerivedSpkTracker::insert_descriptor).
     pub fn track_descriptor(
         &self,
         keychain: K,
         descriptor: Descriptor<DescriptorPublicKey>,
         next_index: u32,
+        expected_spk_txids: impl IntoIterator<Item = (ScriptBuf, Txid)>,
     ) -> anyhow::Result<()> {
         let descriptor = Box::new(descriptor);
         Ok(self.client_tx.send(BlockingClientAction::AddDescriptor {
             keychain,
             descriptor,
             next_index,
+            expected_spk_txids: expected_spk_txids.into_iter().collect(),
         })?)
     }
 
@@ -213,8 +220,15 @@ where
                         keychain,
                         descriptor,
                         next_index,
+                        expected_spk_txids,
                     }) => {
-                        state.insert_descriptor(&mut req_queue, keychain, *descriptor, next_index);
+                        state.insert_descriptor(
+                            &mut req_queue,
+                            keychain,
+                            *descriptor,
+                            next_index,
+                            expected_spk_txids,
+                        );
                     }
                     StateAction::FromClient(BlockingClientAction::Stop) => {
                         drop(write_tx);

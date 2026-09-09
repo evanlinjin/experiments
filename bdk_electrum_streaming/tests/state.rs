@@ -279,8 +279,42 @@ fn new_state_with_cp(
     cp: CheckPoint,
 ) -> BlockingState {
     let mut spk_tracker = DerivedSpkTracker::new(0);
-    spk_tracker.insert_descriptor("external", descriptor, 0);
+    spk_tracker.insert_descriptor("external", descriptor, 0, []);
     BlockingState::new(ReqCoord::default(), cache, spk_tracker, cp)
+}
+
+/// A [`new_state`] whose tracked script carries an eviction baseline.
+fn new_state_expecting(
+    descriptor: Descriptor<DescriptorPublicKey>,
+    genesis: block::Header,
+    expected: impl IntoIterator<Item = (ScriptBuf, Txid)>,
+) -> BlockingState {
+    let mut spk_tracker = DerivedSpkTracker::new(0);
+    spk_tracker.insert_descriptor("external", descriptor, 0, expected);
+    BlockingState::new(
+        ReqCoord::default(),
+        Cache::default(),
+        spk_tracker,
+        CheckPoint::new(BlockId {
+            height: 0,
+            hash: genesis.block_hash(),
+        }),
+    )
+}
+
+/// A txid no server in these tests has, standing for one the wallet still believes in.
+fn absent_txid(byte: u8) -> Txid {
+    Txid::from_byte_array([byte; 32])
+}
+
+fn evicted(updates: &[Update<&'static str>]) -> Vec<Txid> {
+    let mut txids = updates
+        .iter()
+        .flat_map(|u| u.tx_update.evicted_ats.iter().map(|&(txid, _)| txid))
+        .collect::<Vec<_>>();
+    txids.sort();
+    txids.dedup();
+    txids
 }
 
 /// The anchor a tx confirmed in `header` at `height` must be given.
@@ -388,7 +422,7 @@ fn descriptor_inserted_mid_connection_is_subscribed() -> anyhow::Result<()> {
     state.start(&mut queue);
     queue.clear();
 
-    state.insert_descriptor(&mut queue, "external", descriptor, 0);
+    state.insert_descriptor(&mut queue, "external", descriptor, 0, []);
     assert!(
         queue
             .iter()
@@ -417,7 +451,7 @@ fn last_active_index_is_index_of_active_spk() -> anyhow::Result<()> {
     let header_2 = block_with_tx(&header_1, txid, 200, 0);
 
     let mut spk_tracker = DerivedSpkTracker::new(LOOKAHEAD);
-    spk_tracker.insert_descriptor("external", descriptor, 0);
+    spk_tracker.insert_descriptor("external", descriptor, 0, []);
     let mut state = BlockingState::new(
         ReqCoord::default(),
         Cache::default(),
@@ -475,7 +509,7 @@ fn last_active_index_is_highest_regardless_of_notification_order() -> anyhow::Re
     let header_3 = block_with_tx(&header_2, txid_4, 300, 0);
 
     let mut spk_tracker = DerivedSpkTracker::new(LOOKAHEAD);
-    spk_tracker.insert_descriptor("external", descriptor, 0);
+    spk_tracker.insert_descriptor("external", descriptor, 0, []);
     let mut state = BlockingState::new(
         ReqCoord::default(),
         Cache::default(),
@@ -2265,5 +2299,126 @@ fn a_transaction_that_is_not_the_one_asked_for_is_rejected() -> anyhow::Result<(
         result.is_err(),
         "a transaction that is not the one asked for must not be accepted",
     );
+    Ok(())
+}
+
+/// The defect this input exists to kill. A payment can be cancelled while nothing is connected,
+/// and the first thing a fresh client hears about that script is an empty history. Detecting the
+/// eviction is a set difference, and a client that builds its own left-hand side out of the
+/// responses of the session it is in starts that session with an empty one: it is told the truth
+/// and has nothing to subtract it from.
+#[test]
+fn expected_txid_absent_at_cold_start_is_evicted() -> anyhow::Result<()> {
+    let (descriptor, _spk_hash, spk) = tracked_descriptor()?;
+    let cancelled = absent_txid(1);
+    let (genesis, header_1) = base_headers();
+
+    let header_2 = block_with_root(&header_1, TxMerkleNode::all_zeros(), 200, 0);
+
+    let mut state = new_state_expecting(descriptor, genesis, [(spk, cancelled)]);
+    let mut queue = ReqQueue::new();
+    let server = Server {
+        headers: vec![genesis, header_1, header_2],
+        txs: Vec::new(),
+        merkle_proof: (Vec::new(), 0),
+    };
+
+    state.start(&mut queue);
+    let updates = drain_requests(&mut state, &mut queue, &server);
+
+    assert_eq!(
+        evicted(&updates),
+        vec![cancelled],
+        "a txid the caller expects but the server does not report is evicted",
+    );
+    Ok(())
+}
+
+/// Only the server retracts. Once a history response has said which txids are there, that is what
+/// the client expects from then on — otherwise the same eviction is re-reported against every
+/// later response, and a transaction the server has since reported goes unwatched.
+#[test]
+fn history_response_replaces_the_baseline() -> anyhow::Result<()> {
+    let (descriptor, spk_hash, spk) = tracked_descriptor()?;
+    let cancelled = absent_txid(1);
+    let tx = tx_paying(&spk, 50_000);
+    let replacement = tx.compute_txid();
+    let (genesis, header_1) = base_headers();
+    let header_2 = block_with_tx(&header_1, replacement, 200, 0);
+
+    let mut state = new_state_expecting(descriptor, genesis, [(spk, cancelled)]);
+    let mut queue = ReqQueue::new();
+    let mut server = Server {
+        headers: vec![genesis, header_1, header_2],
+        txs: vec![(tx, 2)],
+        merkle_proof: (Vec::new(), 0),
+    };
+
+    state.start(&mut queue);
+    let updates = drain_requests(&mut state, &mut queue, &server);
+    assert_eq!(
+        evicted(&updates),
+        vec![cancelled],
+        "only the expected txid is missing from the history the server reported",
+    );
+
+    // Everything the script had is now gone, so the server reports no history at all. A block
+    // follows it, because an update is only handed over while the confirmation job owes one.
+    server.txs.clear();
+    let header_3 = block_with_root(&header_2, TxMerkleNode::all_zeros(), 300, 0);
+    server.headers.push(header_3);
+    let mut updates = Vec::new();
+    updates.extend(state.poll(
+        &mut queue,
+        raw_msg(json!({
+            "jsonrpc": "2.0",
+            "method": "blockchain.scripthash.subscribe",
+            "params": [spk_hash.to_string(), serde_json::Value::Null],
+        })),
+    )?);
+    updates.extend(state.poll(
+        &mut queue,
+        raw_msg(json!({
+            "jsonrpc": "2.0",
+            "method": "blockchain.headers.subscribe",
+            "params": [{ "hex": serialize_hex(&header_3), "height": 3 }],
+        })),
+    )?);
+    updates.extend(drain_requests(&mut state, &mut queue, &server));
+
+    assert_eq!(
+        evicted(&updates),
+        vec![replacement],
+        "the baseline follows the server's last report, so only that is evicted a second time",
+    );
+    Ok(())
+}
+
+/// A reconnect — or a swap to another server — is the cold start in miniature: the resubscribe is
+/// answered with a fresh status, and the baseline is what makes that answer mean anything, so it
+/// has to outlive the connection it was told to.
+#[test]
+fn baseline_survives_a_reconnect() -> anyhow::Result<()> {
+    let (descriptor, _spk_hash, spk) = tracked_descriptor()?;
+    let cancelled = absent_txid(1);
+    let (genesis, header_1) = base_headers();
+
+    let header_2 = block_with_root(&header_1, TxMerkleNode::all_zeros(), 200, 0);
+
+    let mut state = new_state_expecting(descriptor, genesis, [(spk, cancelled)]);
+    let mut queue = ReqQueue::new();
+    let server = Server {
+        headers: vec![genesis, header_1, header_2],
+        txs: Vec::new(),
+        merkle_proof: (Vec::new(), 0),
+    };
+
+    // Connect, then lose the connection before a single answer arrives.
+    state.start(&mut queue);
+    queue.clear();
+    state.start(&mut queue);
+
+    let updates = drain_requests(&mut state, &mut queue, &server);
+    assert_eq!(evicted(&updates), vec![cancelled]);
     Ok(())
 }
