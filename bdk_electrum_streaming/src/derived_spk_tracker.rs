@@ -42,6 +42,8 @@ impl<K: std::fmt::Debug> std::error::Error for InsertDescriptorError<K> {}
 ///   `KeychainTxOutIndex` is not up-to-date.
 ///
 /// A txid we expect under a spk but missing from that spk's history has been evicted.
+///
+/// Changing a keychain's descriptor discards the expectations of the spks it stops tracking.
 #[derive(Debug, Clone)]
 pub struct DerivedSpkTracker<K> {
     lookahead: u32,
