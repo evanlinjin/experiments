@@ -18,7 +18,7 @@ use crate::{
     confirmation_job::{ConfirmationJob, ConfirmationProgress},
     req::{JobRequest, PoppedRequest, ReqCoord, ReqQueue},
     spk_job::{SpkJob, SpkProgress},
-    DerivedSpkTracker, Update,
+    DerivedSpkTracker, InsertDescriptorError, Update,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -88,7 +88,8 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
 
     /// Insert a descriptor and queue outgoing requests (if needed).
     /// `expected_spk_txids` are the txids we expect the server to report for the spks this
-    /// registers; see [`DerivedSpkTracker::insert_descriptor`].
+    /// registers; see [`DerivedSpkTracker::insert_descriptor`], which also documents when this
+    /// errors.
     pub fn insert_descriptor(
         &mut self,
         req_queue: &mut ReqQueue,
@@ -96,17 +97,18 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
         descriptor: Descriptor<DescriptorPublicKey>,
         next_index: u32,
         expected_spk_txids: impl IntoIterator<Item = (ScriptBuf, Txid)>,
-    ) {
+    ) -> Result<(), InsertDescriptorError<K>> {
         let new_script_hashes = self.spk_tracker.insert_descriptor(
             keychain,
             descriptor,
             next_index,
             expected_spk_txids,
-        );
+        )?;
         for script_hash in new_script_hashes {
             let mut queuer = self.coord.queuer(req_queue, JobId::Spk(script_hash));
             queuer.enqueue(request::ScriptHashSubscribe { script_hash });
         }
+        Ok(())
     }
 
     /// Start (or restart) the state machine on a fresh connection.

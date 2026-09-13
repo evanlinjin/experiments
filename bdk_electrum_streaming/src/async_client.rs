@@ -167,7 +167,9 @@ where
                             state.user_request(&mut req_queue, batch);
                         },
                         crate::ClientAction::AddDescriptor { keychain, descriptor, next_index, expected_spk_txids } => {
-                            state.insert_descriptor(&mut req_queue, keychain, *descriptor, next_index, expected_spk_txids);
+                            if let Err(err) = state.insert_descriptor(&mut req_queue, keychain, *descriptor, next_index, expected_spk_txids) {
+                                tracing::warn!(err = %err, "Rejected descriptor");
+                            }
                         },
                         crate::ClientAction::Stop => {
                             tracing::info!("Client sent stop signal");                           

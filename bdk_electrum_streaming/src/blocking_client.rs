@@ -223,13 +223,15 @@ where
                         next_index,
                         expected_spk_txids,
                     }) => {
-                        state.insert_descriptor(
+                        if let Err(err) = state.insert_descriptor(
                             &mut req_queue,
                             keychain,
                             *descriptor,
                             next_index,
                             expected_spk_txids,
-                        );
+                        ) {
+                            tracing::warn!(err = %err, "Rejected descriptor");
+                        }
                     }
                     StateAction::FromClient(BlockingClientAction::Stop) => {
                         drop(write_tx);

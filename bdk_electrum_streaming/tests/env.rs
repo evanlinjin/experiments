@@ -89,8 +89,8 @@ fn blocking_env() -> anyhow::Result<()> {
     let (mut chain, _cs) = LocalChain::from_genesis_hash(env.genesis_hash()?);
 
     let mut spk_tracker = DerivedSpkTracker::<&'static str>::new(LOOKAHEAD);
-    spk_tracker.insert_descriptor(EXTERNAL, external, 0, []);
-    spk_tracker.insert_descriptor(INTERNAL, internal, 0, []);
+    spk_tracker.insert_descriptor(EXTERNAL, external, 0, [])?;
+    spk_tracker.insert_descriptor(INTERNAL, internal, 0, [])?;
 
     let mut state = BlockingState::new(
         ReqCoord::default(),
@@ -175,8 +175,8 @@ async fn env() -> anyhow::Result<()> {
     let (mut chain, _cs) = LocalChain::from_genesis_hash(env.genesis_hash()?);
 
     let mut spk_tracker = DerivedSpkTracker::<&'static str>::new(LOOKAHEAD);
-    spk_tracker.insert_descriptor(EXTERNAL, external, 0, []);
-    spk_tracker.insert_descriptor(INTERNAL, internal, 0, []);
+    spk_tracker.insert_descriptor(EXTERNAL, external, 0, [])?;
+    spk_tracker.insert_descriptor(INTERNAL, internal, 0, [])?;
 
     let mut state = AsyncState::new(
         ReqCoord::default(),
@@ -273,8 +273,8 @@ async fn new_block_confirmation_is_anchored_live() -> anyhow::Result<()> {
     let (mut chain, _cs) = LocalChain::from_genesis_hash(env.genesis_hash()?);
 
     let mut spk_tracker = DerivedSpkTracker::<&'static str>::new(LOOKAHEAD);
-    spk_tracker.insert_descriptor(EXTERNAL, external, 0, []);
-    spk_tracker.insert_descriptor(INTERNAL, internal, 0, []);
+    spk_tracker.insert_descriptor(EXTERNAL, external, 0, [])?;
+    spk_tracker.insert_descriptor(INTERNAL, internal, 0, [])?;
 
     let mut state = AsyncState::new(
         ReqCoord::default(),
@@ -434,8 +434,8 @@ impl LiveWallet {
         let (mut chain, _cs) = LocalChain::from_genesis_hash(env.genesis_hash()?);
 
         let mut spk_tracker = DerivedSpkTracker::<&'static str>::new(LOOKAHEAD);
-        spk_tracker.insert_descriptor(EXTERNAL, external, 0, []);
-        spk_tracker.insert_descriptor(INTERNAL, internal, 0, []);
+        spk_tracker.insert_descriptor(EXTERNAL, external, 0, [])?;
+        spk_tracker.insert_descriptor(INTERNAL, internal, 0, [])?;
 
         let mut state = AsyncState::new(
             ReqCoord::default(),
@@ -759,13 +759,13 @@ fn spawn_session(
         external,
         next_index(EXTERNAL),
         expected_spk_txids(chain, graph, EXTERNAL),
-    );
+    )?;
     spk_tracker.insert_descriptor(
         INTERNAL,
         internal,
         next_index(INTERNAL),
         expected_spk_txids(chain, graph, INTERNAL),
-    );
+    )?;
 
     let mut state = AsyncState::new(
         ReqCoord::default(),

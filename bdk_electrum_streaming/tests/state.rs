@@ -279,7 +279,9 @@ fn new_state_with_cp(
     cp: CheckPoint,
 ) -> BlockingState {
     let mut spk_tracker = DerivedSpkTracker::new(0);
-    spk_tracker.insert_descriptor("external", descriptor, 0, []);
+    spk_tracker
+        .insert_descriptor("external", descriptor, 0, [])
+        .expect("must insert descriptor");
     BlockingState::new(ReqCoord::default(), cache, spk_tracker, cp)
 }
 
@@ -290,7 +292,9 @@ fn new_state_expecting(
     expected: impl IntoIterator<Item = (ScriptBuf, Txid)>,
 ) -> BlockingState {
     let mut spk_tracker = DerivedSpkTracker::new(0);
-    spk_tracker.insert_descriptor("external", descriptor, 0, expected);
+    spk_tracker
+        .insert_descriptor("external", descriptor, 0, expected)
+        .expect("must insert descriptor");
     BlockingState::new(
         ReqCoord::default(),
         Cache::default(),
@@ -422,7 +426,7 @@ fn descriptor_inserted_mid_connection_is_subscribed() -> anyhow::Result<()> {
     state.start(&mut queue);
     queue.clear();
 
-    state.insert_descriptor(&mut queue, "external", descriptor, 0, []);
+    state.insert_descriptor(&mut queue, "external", descriptor, 0, [])?;
     assert!(
         queue
             .iter()
@@ -451,7 +455,9 @@ fn last_active_index_is_index_of_active_spk() -> anyhow::Result<()> {
     let header_2 = block_with_tx(&header_1, txid, 200, 0);
 
     let mut spk_tracker = DerivedSpkTracker::new(LOOKAHEAD);
-    spk_tracker.insert_descriptor("external", descriptor, 0, []);
+    spk_tracker
+        .insert_descriptor("external", descriptor, 0, [])
+        .expect("must insert descriptor");
     let mut state = BlockingState::new(
         ReqCoord::default(),
         Cache::default(),
@@ -509,7 +515,9 @@ fn last_active_index_is_highest_regardless_of_notification_order() -> anyhow::Re
     let header_3 = block_with_tx(&header_2, txid_4, 300, 0);
 
     let mut spk_tracker = DerivedSpkTracker::new(LOOKAHEAD);
-    spk_tracker.insert_descriptor("external", descriptor, 0, []);
+    spk_tracker
+        .insert_descriptor("external", descriptor, 0, [])
+        .expect("must insert descriptor");
     let mut state = BlockingState::new(
         ReqCoord::default(),
         Cache::default(),
