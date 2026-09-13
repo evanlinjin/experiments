@@ -82,17 +82,12 @@ pub struct SpkJob {
 
     stage: SpkStage,
     tx_update: TxUpdate<ConfirmationBlockTime>,
-
-    /// What we expected the server to report for this spk when the job started, replaced by what
-    /// it actually reported once the history is in. Snapshotted rather than read as the job runs,
-    /// so the difference cannot be taken against a set the same response has already been folded
-    /// into.
-    expected_txids: BTreeSet<Txid>,
 }
 
 impl SpkJob {
+    /// `expected_txids` is what we expect under this spk. An absent status empties it.
     pub fn new(
-        mut expected_txids: BTreeSet<Txid>,
+        expected_txids: &mut BTreeSet<Txid>,
         spk_hash: ElectrumScriptHash,
         spk_status: Option<ElectrumScriptStatus>,
     ) -> Self {
@@ -117,14 +112,7 @@ impl SpkJob {
             spk_hash,
             stage,
             tx_update,
-            expected_txids,
         }
-    }
-
-    /// What we now expect the server to report for this spk, for the caller to commit back to the
-    /// tracker so the next job starts from it.
-    pub fn expected_txids(&self) -> &BTreeSet<Txid> {
-        &self.expected_txids
     }
 
     /// The status this job is still waiting on a history for.
@@ -159,8 +147,16 @@ impl SpkJob {
     /// its outputs do not reach an outpoint we know is spent. That is the server's picture
     /// disagreeing with itself, so there is nothing to retry against on this connection.
     ///
+    /// `expected_txids` is what we expect under this spk as of this call. Once the history is in,
+    /// anything expected but absent from it is evicted, and it is replaced by the history.
+    ///
     /// [`ConfirmationJob`]: crate::ConfirmationJob
-    pub fn poll(&mut self, queuer: &mut ReqQueuer, cache: &Cache) -> anyhow::Result<SpkProgress> {
+    pub fn poll(
+        &mut self,
+        queuer: &mut ReqQueuer,
+        cache: &Cache,
+        expected_txids: &mut BTreeSet<Txid>,
+    ) -> anyhow::Result<SpkProgress> {
         let progress = match &mut self.stage {
             SpkStage::ProcessingHistory { status } => {
                 match cache.subscriptions.spk_history(*status) {
@@ -169,11 +165,11 @@ impl SpkJob {
                             history.iter().map(|tx| tx.txid()).collect::<BTreeSet<_>>();
                         let mut update = TxUpdate::default();
                         update.evicted_ats.extend(
-                            self.expected_txids
+                            expected_txids
                                 .difference(&these_txids)
                                 .map(|&txid| (txid, self.start.as_secs())),
                         );
-                        self.expected_txids = these_txids;
+                        *expected_txids = these_txids;
                         for tx in history {
                             if let response::Tx::Mempool(tx) = tx {
                                 update.seen_ats.insert((tx.txid, self.start.as_secs()));

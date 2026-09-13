@@ -438,13 +438,7 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
             self.cache.subscriptions.remove_spk(spk_hash);
         }
 
-        let expected_txids = self
-            .spk_tracker
-            .expected_txids(spk_hash)
-            .cloned()
-            .unwrap_or_default();
-
-        if spk_status.is_some() || !expected_txids.is_empty() {
+        if spk_status.is_some() || self.spk_tracker.has_expected_txids(spk_hash) {
             for script_hash in self.spk_tracker.mark_script_hash_used(&k, i) {
                 self.coord
                     .queuer(req_queue, JobId::Spk(script_hash))
@@ -461,8 +455,12 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
                 .or_insert(i);
         }
 
-        self.spk_jobs
-            .insert(spk_hash, SpkJob::new(expected_txids, spk_hash, spk_status));
+        let job = SpkJob::new(
+            self.spk_tracker.expected_txids(spk_hash),
+            spk_hash,
+            spk_status,
+        );
+        self.spk_jobs.insert(spk_hash, job);
         self.poll_spk_jobs(req_queue, [JobId::Spk(spk_hash)])?;
         // A notification is all that revives a cancelled job, and below the reorg window the
         // tip never moves — so this is where an anchor the server has come back to is picked up.
@@ -515,10 +513,10 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
             };
             loop {
                 let mut queuer = coord.queuer(req_queue, JobId::Spk(spk_hash));
-                let progress = job.poll(&mut queuer, cache)?;
-                // Only the server retracts an expectation, so whatever the job now holds is what
-                // the next one must start from.
-                spk_tracker.set_expected_txids(spk_hash, job.expected_txids().iter().copied());
+                // The tracker's own set, so the job never holds a copy that a `track_descriptor`
+                // arriving mid-job could fall behind.
+                let expected_txids = spk_tracker.expected_txids(spk_hash);
+                let progress = job.poll(&mut queuer, cache, expected_txids)?;
                 match progress {
                     SpkProgress::Continue => continue,
                     SpkProgress::Blocked => break,

@@ -115,28 +115,18 @@ impl<K: Ord + Clone> DerivedSpkTracker<K> {
         new_script_hashes
     }
 
-    /// The txids we expect the server to report in `script_hash`'s history.
-    pub fn expected_txids(&self, script_hash: ElectrumScriptHash) -> Option<&BTreeSet<Txid>> {
-        self.expected_txids.get(&script_hash)
+    /// Whether we expect any txids in `script_hash`'s history.
+    pub fn has_expected_txids(&self, script_hash: ElectrumScriptHash) -> bool {
+        self.expected_txids
+            .get(&script_hash)
+            .is_some_and(|txids| !txids.is_empty())
     }
 
-    /// Replace what we expect for `script_hash` with what the server has just reported for it.
+    /// The txids we expect in `script_hash`'s history.
     ///
-    /// Ignored for an untracked spk.
-    pub fn set_expected_txids(
-        &mut self,
-        script_hash: ElectrumScriptHash,
-        txids: impl IntoIterator<Item = Txid>,
-    ) {
-        if !self.derived_spks_rev.contains_key(&script_hash) {
-            return;
-        }
-        let txids = txids.into_iter().collect::<BTreeSet<_>>();
-        if txids.is_empty() {
-            self.expected_txids.remove(&script_hash);
-        } else {
-            self.expected_txids.insert(script_hash, txids);
-        }
+    /// Only replace it with a history the server reported: the caller's view may lag behind.
+    pub fn expected_txids(&mut self, script_hash: ElectrumScriptHash) -> &mut BTreeSet<Txid> {
+        self.expected_txids.entry(script_hash).or_default()
     }
 
     pub fn mark_script_hash_used(&mut self, keychain: &K, index: u32) -> Vec<ElectrumScriptHash> {
@@ -279,30 +269,27 @@ mod test {
         let hash = ElectrumScriptHash::new(spk(&desc, 0));
 
         tracker.insert_descriptor("keychain", desc.clone(), 0, [(spk(&desc, 0), txid(1))]);
-        assert_eq!(tracker.expected_txids(hash), Some(&[txid(1)].into()));
+        assert_eq!(*tracker.expected_txids(hash), BTreeSet::from([txid(1)]));
 
         // A caller whose view has not caught up must not drop what it has not heard about yet.
         tracker.insert_descriptor("keychain", desc.clone(), 0, [(spk(&desc, 0), txid(2))]);
         assert_eq!(
-            tracker.expected_txids(hash),
-            Some(&[txid(1), txid(2)].into()),
+            *tracker.expected_txids(hash),
+            BTreeSet::from([txid(1), txid(2)]),
         );
         tracker.insert_descriptor("keychain", desc.clone(), 0, []);
         assert_eq!(
-            tracker.expected_txids(hash),
-            Some(&[txid(1), txid(2)].into()),
+            *tracker.expected_txids(hash),
+            BTreeSet::from([txid(1), txid(2)]),
             "an empty caller view must not retract",
         );
 
-        tracker.set_expected_txids(hash, [txid(2)]);
+        *tracker.expected_txids(hash) = [txid(2)].into();
         assert_eq!(
-            tracker.expected_txids(hash),
-            Some(&[txid(2)].into()),
+            *tracker.expected_txids(hash),
+            BTreeSet::from([txid(2)]),
             "the server's report replaces what we expect",
         );
-
-        tracker.set_expected_txids(hash, []);
-        assert_eq!(tracker.expected_txids(hash), None);
     }
 
     #[test]
@@ -322,7 +309,7 @@ mod test {
 
         tracker.insert_descriptor("keychain", desc.clone(), outside, []);
         assert_eq!(tracker.index_of_spk_hash(hash), Some(("keychain", outside)));
-        assert_eq!(tracker.expected_txids(hash), Some(&[txid(1)].into()));
+        assert_eq!(*tracker.expected_txids(hash), BTreeSet::from([txid(1)]));
     }
 
     #[test]
@@ -338,9 +325,9 @@ mod test {
             0,
             [(spk(&old_desc, 0), txid(1))],
         );
-        assert!(tracker.expected_txids(old_hash).is_some());
+        assert!(tracker.has_expected_txids(old_hash));
 
         tracker.insert_descriptor("keychain", new_desc, 0, []);
-        assert_eq!(tracker.expected_txids(old_hash), None);
+        assert!(!tracker.has_expected_txids(old_hash));
     }
 }
