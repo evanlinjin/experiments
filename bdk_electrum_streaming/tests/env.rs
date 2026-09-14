@@ -65,8 +65,6 @@ fn apply_update(
     let _ = graph.apply_update(update.tx_update);
     if let Some(cp) = update.chain_update {
         chain.apply_update(cp)?;
-    } else {
-        panic!("NO CHAIN UPDATE!");
     }
     Ok(())
 }
@@ -128,21 +126,22 @@ fn blocking_env() -> anyhow::Result<()> {
     env.mine_blocks(101, Some(Address::from_script(&spk, &REGTEST)?))?;
     std::thread::sleep(Duration::from_secs(3));
 
-    while let Ok(update) = update_rx.recv() {
-        let has_tx_update = !update.tx_update.txs.is_empty();
+    // Updates are handed over as each job finishes, so the one carrying the coinbase can arrive
+    // before its anchor. Keep applying until the graph counts it.
+    let balance = loop {
+        let update = update_rx.recv().expect("Must have next update");
         apply_update(&mut chain, &mut graph, update)?;
-        if has_tx_update {
-            break;
+        let balance = graph.graph().balance(
+            &chain,
+            chain.tip().block_id(),
+            CanonicalizationParams::default(),
+            graph.index.outpoints().clone(),
+            |(k, _), _| *k == INTERNAL,
+        );
+        if balance.total() > Amount::ZERO {
+            break balance;
         }
-    }
-
-    let balance = graph.graph().balance(
-        &chain,
-        chain.tip().block_id(),
-        CanonicalizationParams::default(),
-        graph.index.outpoints().clone(),
-        |(k, _), _| *k == INTERNAL,
-    );
+    };
     for cp in chain.iter_checkpoints() {
         println!("height={}, hash={}", cp.height(), cp.hash());
     }
@@ -711,21 +710,6 @@ async fn payment_replaced_while_disconnected_is_evicted_on_restart() -> anyhow::
     // -- Session two: a new client, told what the wallet still expects. -------------------------
     let (mut update_rx, client, run_handle) =
         spawn_session(&electrum_url, &chain, &graph, external, internal)?;
-
-    // A payment to a second script, made after the relaunch. It proves the new client is really
-    // syncing rather than merely quiet -- and it is also what hands the update over at all: an
-    // update is only released while the confirmation job owes one, and that job is re-armed by
-    // the set of script statuses changing. An eviction that empties the wallet's only history
-    // leaves that set as it found it (empty), so on its own it stages an update that is never
-    // released. See the report accompanying this change.
-    let ((_, probe_spk), _) = graph
-        .index
-        .next_unused_spk(EXTERNAL)
-        .expect("must derive spk");
-    env.send(
-        &Address::from_script(&probe_spk, &REGTEST)?,
-        Amount::ONE_BTC,
-    )?;
 
     let timeout = tokio::time::sleep(Duration::from_secs(150)).fuse();
     pin_mut!(timeout);

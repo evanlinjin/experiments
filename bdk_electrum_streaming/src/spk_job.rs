@@ -47,10 +47,6 @@ impl SpkStage {
             Self::ProcessingPrevouts(prevouts)
         }
     }
-
-    pub fn is_done(&self) -> bool {
-        matches!(self, SpkStage::Done)
-    }
 }
 
 /// What one [`SpkJob::poll`] achieved.
@@ -123,11 +119,6 @@ impl SpkJob {
             SpkStage::ProcessingHistory { status } => Some(status),
             _ => None,
         }
-    }
-
-    /// Whether everything this job asked for has arrived.
-    pub fn is_done(&self) -> bool {
-        self.stage.is_done()
     }
 
     pub fn elapsed_seconds(&self) -> String {

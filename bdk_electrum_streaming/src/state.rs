@@ -50,10 +50,10 @@ pub struct State<PReq: PendingRequest, K = &'static str> {
     spk_jobs: BTreeMap<ElectrumScriptHash, SpkJob>,
     confirmation_job: Option<ConfirmationJob>,
 
-    /// The update being built up.
+    /// What the jobs have gathered since the last update was handed over.
     ///
-    /// Both job kinds write here as they progress, and it is handed to the caller whole when all
-    /// pending jobs complete.
+    /// Both job kinds write here as they progress, and [`poll`](Self::poll) hands it to the caller
+    /// whenever it is not empty.
     staged: Update<K>,
 
     user_state: electrum_streaming_client::State<PReq>,
@@ -158,24 +158,18 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
     ) -> anyhow::Result<Option<Update<K>>> {
         self.handle(req_queue, raw)?;
 
-        // Any path through `handle` may have been the one that finished a job, so the update is
-        // handed over here rather than in each of them. Both job kinds have to be done.
-        let job = match &mut self.confirmation_job {
-            Some(job) => job,
-            None => return Ok(None),
-        };
-        if !job.is_done() || !self.spk_jobs.values().all(SpkJob::is_done) {
+        // Any path through `handle` may have been the one that staged something, so the update is
+        // handed over here rather than in each of them. Each job stages its part as soon as it
+        // has it, so an update can carry a chain whose anchors are still being proven.
+        if self.staged.is_empty() {
             return Ok(None);
         }
-        job.set_idle();
-        // The scripts have been anchored, so their jobs have served their purpose.
-        self.spk_jobs.clear();
         let update = core::mem::take(&mut self.staged);
         tracing::info!(
             tip_height = self.cp.height(),
             anchors = update.tx_update.anchors.len(),
             txs = update.tx_update.txs.len(),
-            "Confirmation job finished"
+            "Handing over update"
         );
         Ok(Some(update))
     }
@@ -487,10 +481,8 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
         self.poll_confirmation_job(req_queue)
     }
 
-    /// Poll the named spk jobs, staging whatever each one has finished gathering.
-    ///
-    /// Jobs are left in place when they finish: the update they contribute to is published
-    /// only once [`ConfirmationJob`] completes, and they are cleared then.
+    /// Poll the named spk jobs, staging whatever each one has finished gathering and dropping the
+    /// jobs that finish.
     fn poll_spk_jobs(
         &mut self,
         req_queue: &mut ReqQueue,
@@ -537,6 +529,7 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
                         // initial subscribe or a later notification) resolves to a finished job,
                         // so deriving the index from mere completion would tag every unused
                         // look-ahead spk as active too.
+                        spk_jobs.remove(&spk_hash);
                         break;
                     }
                 }
@@ -600,9 +593,7 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
                     self.staged.tx_update.anchors = anchors;
                     continue;
                 }
-                // Nothing more to do this round. Whether the job owes an update is settled by
-                // `poll`, once the scripts can be checked alongside it.
-                ConfirmationProgress::Blocked | ConfirmationProgress::Done => break,
+                ConfirmationProgress::Blocked => break,
             }
         }
         self.confirmation_job = Some(job);

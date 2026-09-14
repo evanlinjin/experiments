@@ -540,32 +540,35 @@ fn last_active_index_is_highest_regardless_of_notification_order() -> anyhow::Re
             .expect("history is not empty");
 
     // The higher derivation index is notified first.
-    state.poll(
+    let mut updates = Vec::new();
+    updates.extend(state.poll(
         &mut queue,
         raw_msg(json!({
             "jsonrpc": "2.0",
             "method": "blockchain.scripthash.subscribe",
             "params": [spk_hash_4.to_string(), status_4.to_string()],
         })),
-    )?;
-    state.poll(
+    )?);
+    updates.extend(state.poll(
         &mut queue,
         raw_msg(json!({
             "jsonrpc": "2.0",
             "method": "blockchain.scripthash.subscribe",
             "params": [spk_hash_3.to_string(), status_3.to_string()],
         })),
-    )?;
+    )?);
+    updates.extend(drain_requests(&mut state, &mut queue, &server));
 
-    let updates = drain_requests(&mut state, &mut queue, &server);
-    let emitted = updates
+    // Updates are handed over as they are staged, and revealing is monotonic, so what matters is
+    // that the highest index is reported.
+    let highest = updates
         .iter()
         .flat_map(|update| &update.last_active_indices)
         .map(|(&k, &i)| (k, i))
-        .collect::<Vec<_>>();
+        .max_by_key(|&(_, i)| i);
     assert_eq!(
-        emitted,
-        vec![("external", 4)],
+        highest,
+        Some(("external", 4)),
         "the highest active index must survive being notified before the lower one"
     );
     Ok(())
@@ -2111,12 +2114,8 @@ fn a_history_that_cannot_match_the_job_is_not_re_asked() -> anyhow::Result<()> {
 ///
 /// The tip's own header arrives with the notification, so the one height here needs no header
 /// request; reaching the proof is the proof that the job ran.
-///
-/// Running ahead is not publishing ahead. The transactions a script is still downloading belong
-/// in the same update as their anchors, so the finished job holds it until every script is done
-/// — otherwise a caller sees an anchor for a transaction it was never given.
 #[test]
-fn confirmation_job_runs_ahead_but_the_update_waits_for_the_scripts() -> anyhow::Result<()> {
+fn confirmation_job_runs_ahead_of_the_scripts() -> anyhow::Result<()> {
     let (descriptor, spk_hash, spk) = tracked_descriptor()?;
     let tx = tx_paying(&spk, 50_000);
     let txid = tx.compute_txid();
@@ -2184,51 +2183,25 @@ fn confirmation_job_runs_ahead_but_the_update_waits_for_the_scripts() -> anyhow:
         "the confirmation job must reach proof fetching without waiting for that transaction",
     );
 
-    // Let the confirmation job finish: answer everything, still except the transaction.
+    // Answer everything else. In whatever order the updates arrive, between them they carry the
+    // transaction and its anchor.
     let mut updates = Vec::new();
-    let mut tx_reqs = Vec::<RawRequest>::new();
-    let mut pending = deferred;
-    while let Some(req) = pending.pop() {
-        if req.method.as_ref() == "blockchain.transaction.get" {
-            tx_reqs.push(req);
-            continue;
-        }
-        if let Some(update) = state.poll(&mut queue, response(&req, &server))? {
-            updates.push(update);
-        }
-        pending.extend(queue.drain(..));
-    }
-    assert!(
-        updates.is_empty(),
-        "nothing may be published while a script is still downloading its transactions",
-    );
-
-    // The transaction finally arrives, and with it the whole update.
-    for req in tx_reqs {
-        if let Some(update) = state.poll(&mut queue, response(&req, &server))? {
-            updates.push(update);
-        }
+    for req in deferred {
+        updates.extend(state.poll(&mut queue, response(&req, &server))?);
     }
     updates.extend(drain_requests(&mut state, &mut queue, &server));
-
-    let update = match updates.as_slice() {
-        [update] => update,
-        other => panic!("exactly one update must be published, got {}", other.len()),
-    };
     assert!(
-        update
-            .tx_update
-            .txs
+        updates
             .iter()
-            .any(|t| t.compute_txid() == txid),
-        "the update must carry the transaction",
+            .any(|u| u.tx_update.txs.iter().any(|t| t.compute_txid() == txid)),
+        "the transaction must be handed over",
     );
     assert!(
-        update
+        updates.iter().any(|u| u
             .tx_update
             .anchors
-            .contains(&(anchor_of(&header_2, 2), txid)),
-        "the update must carry its anchor alongside it",
+            .contains(&(anchor_of(&header_2, 2), txid))),
+        "its anchor must be handed over",
     );
 
     // A finished job must hand its update over once, not on every poll that reaches it. The
@@ -2359,11 +2332,8 @@ fn history_response_replaces_the_expected_txids() -> anyhow::Result<()> {
         "only the expected txid is missing from the history the server reported",
     );
 
-    // Everything the script had is now gone, so the server reports no history at all. A block
-    // follows it, because an update is only handed over while the confirmation job owes one.
+    // Everything the script had is now gone, so the server reports no history at all.
     server.txs.clear();
-    let header_3 = block_with_root(&header_2, TxMerkleNode::all_zeros(), 300, 0);
-    server.headers.push(header_3);
     let mut updates = Vec::new();
     updates.extend(state.poll(
         &mut queue,
@@ -2371,14 +2341,6 @@ fn history_response_replaces_the_expected_txids() -> anyhow::Result<()> {
             "jsonrpc": "2.0",
             "method": "blockchain.scripthash.subscribe",
             "params": [spk_hash.to_string(), serde_json::Value::Null],
-        })),
-    )?);
-    updates.extend(state.poll(
-        &mut queue,
-        raw_msg(json!({
-            "jsonrpc": "2.0",
-            "method": "blockchain.headers.subscribe",
-            "params": [{ "hex": serialize_hex(&header_3), "height": 3 }],
         })),
     )?);
     updates.extend(drain_requests(&mut state, &mut queue, &server));
