@@ -65,9 +65,7 @@ pub enum SpkProgress {
 /// The job to perform once we receive a script status notification.
 ///
 /// Fetches the script's history, the transactions in it, and the outputs those transactions
-/// spend. Anchoring them is [`ConfirmationJob`]'s work: a transaction's anchor depends on the chain,
-/// which no single script can move, so resolving anchors per-script had every job racing a
-/// tip that only one of them could move.
+/// spend. Anchoring them is [`ConfirmationJob`]'s work.
 ///
 /// [`ConfirmationJob`]: crate::ConfirmationJob
 #[derive(Debug)]

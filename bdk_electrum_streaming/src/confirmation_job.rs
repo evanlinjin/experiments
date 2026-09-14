@@ -70,8 +70,7 @@ pub enum ConfirmationProgress {
 /// Runs once every [`SpkJob`] has its history — the heights those histories name are all it
 /// reads, so a script still downloading its own transactions has already told it every block it
 /// needs. Owning the chain and the anchors together is what lets a whole set of anchors be
-/// resolved against one chain: resolved per-script, each job raced a tip only this one can
-/// move.
+/// resolved against one chain.
 ///
 /// Responses from an abandoned chain must not reach it. [`Self::set_tip`] reports when the
 /// target moved off the chain it was heading for so the caller can forget those requests.

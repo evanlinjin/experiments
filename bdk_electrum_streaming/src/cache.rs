@@ -31,8 +31,7 @@ pub struct Cache {
 /// Separate from the rest of [`Cache`] because a caller can rebuild all of it from their own
 /// wallet.
 ///
-/// Starting empty is always correct, only expensive: a job asks the server for whatever it
-/// cannot find here, so an empty one re-downloads every transaction and reproves every anchor.
+/// Starting empty is always correct, only expensive.
 ///
 /// It is not a mirror of the wallet, though — whatever a job fetches lands here too, so it
 /// answers "do we already have this" whoever supplied it.
@@ -161,9 +160,8 @@ impl Subscriptions {
 
     /// The last status reported for every script that still has a history.
     ///
-    /// This, rather than whichever jobs are currently in flight, is the set of scripts an
-    /// update has to anchor: a reorg moves transactions the server will never mention again,
-    /// because one that keeps its height keeps its status.
+    /// This is the set of scripts an update has to anchor: a reorg moves transactions the server
+    /// will never mention again, because one that keeps its height keeps its status.
     pub fn spk_statuses(&self) -> impl Iterator<Item = ElectrumScriptStatus> + '_ {
         self.spk_hash_to_status.values().copied()
     }

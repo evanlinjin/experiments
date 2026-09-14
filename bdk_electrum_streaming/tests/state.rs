@@ -2108,9 +2108,7 @@ fn a_history_that_cannot_match_the_job_is_not_re_asked() -> anyhow::Result<()> {
 /// The confirmation job must not wait on transactions it never reads.
 ///
 /// It works from the heights a history names, so once every script has its history it already
-/// knows every block it needs. Holding it until the scripts finish downloading the transactions
-/// in those histories serialises the header and proof fetches behind those downloads for
-/// nothing — on a wallet with many scripts that is the whole sync sitting idle.
+/// knows every block it needs.
 ///
 /// The tip's own header arrives with the notification, so the one height here needs no header
 /// request; reaching the proof is the proof that the job ran.

@@ -542,8 +542,7 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
     ///
     /// Held back only until every script has its history. The job works from the heights those
     /// histories name, so a script still downloading the transactions in its own history has
-    /// already told the job everything it needs — and holding for the downloads would serialise
-    /// the header and proof fetches behind them for nothing.
+    /// already told the job everything it needs.
     fn poll_confirmation_job(&mut self, req_queue: &mut ReqQueue) -> anyhow::Result<()> {
         if self
             .spk_jobs
@@ -556,9 +555,7 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
             Some(job) => job,
             None => return Ok(()),
         };
-        // Scoped by what the server has told us about, not by which jobs happen to be live:
-        // those are cleared on every completion, so a single notification arriving between
-        // updates would narrow the next reorg's repair to that one script.
+        // Scoped by what the server has told us about.
         job.set_statuses(self.cache.subscriptions.spk_statuses());
 
         loop {
