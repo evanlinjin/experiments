@@ -1,8 +1,11 @@
-use std::collections::{btree_map, BTreeMap, BTreeSet, HashMap};
+use std::collections::{btree_map, hash_map, BTreeMap, BTreeSet, HashMap};
 
 use bdk_core::bitcoin::{ScriptBuf, Txid};
 use electrum_streaming_client::ElectrumScriptHash;
 use miniscript::{Descriptor, DescriptorPublicKey};
+
+/// A derivation index is a BIP32 child number, so the top bit is never available.
+const BIP32_MAX_INDEX: u32 = (1 << 31) - 1;
 
 /// Keeps track of spks, and of the txids we expect the server to report for each of them.
 ///
@@ -19,7 +22,8 @@ pub struct DerivedSpkTracker<K> {
     lookahead: u32,
     descriptors: BTreeMap<K, Descriptor<DescriptorPublicKey>>,
     derived_spks: BTreeMap<(K, u32), ElectrumScriptHash>,
-    derived_spks_rev: HashMap<ElectrumScriptHash, (K, u32)>,
+    /// Keychains may derive the same spk, so one spk can have many `(K, u32)`s.
+    derived_spks_rev: HashMap<ElectrumScriptHash, BTreeSet<(K, u32)>>,
     expected_txids: HashMap<ElectrumScriptHash, BTreeSet<Txid>>,
 }
 
@@ -38,8 +42,16 @@ impl<K: Ord + Clone> DerivedSpkTracker<K> {
         self.derived_spks.values().copied()
     }
 
-    pub fn index_of_spk_hash(&self, spk_hash: ElectrumScriptHash) -> Option<(K, u32)> {
-        self.derived_spks_rev.get(&spk_hash).cloned()
+    /// Every `(K, u32)` that derives `spk_hash`.
+    pub fn indices_of_spk_hash(
+        &self,
+        spk_hash: ElectrumScriptHash,
+    ) -> impl Iterator<Item = (K, u32)> + '_ {
+        self.derived_spks_rev
+            .get(&spk_hash)
+            .into_iter()
+            .flatten()
+            .cloned()
     }
 
     fn _add_derived_spk(&mut self, keychain: K, index: u32) -> Option<ElectrumScriptHash> {
@@ -50,19 +62,31 @@ impl<K: Ord + Clone> DerivedSpkTracker<K> {
                 .descriptors
                 .get(&keychain)
                 .expect("keychain must have associated descriptor");
+            // A descriptor without a wildcard derives the same spk at every index, so only
+            // index 0 is tracked. Deriving more would widen the window without end.
+            if index > 0 && !descriptor.has_wildcard() {
+                return None;
+            }
             let spk = descriptor
                 .at_derivation_index(index)
                 .expect("descriptor must derive")
                 .script_pubkey();
             let script_hash = ElectrumScriptHash::new(&spk);
             spk_hash_entry.insert(script_hash);
-            assert!(self
-                .derived_spks_rev
-                .insert(script_hash, (keychain, index))
-                .is_none());
+            self.derived_spks_rev
+                .entry(script_hash)
+                .or_default()
+                .insert((keychain, index));
             return Some(script_hash);
         }
         None
+    }
+
+    /// The highest index a window reaching `next_index` derives at.
+    fn _window_top(&self, next_index: u32) -> u32 {
+        next_index
+            .saturating_add(self.lookahead.saturating_add(1))
+            .min(BIP32_MAX_INDEX)
     }
 
     fn _clear_tracked_spks_of_keychain(&mut self, keychain: K) {
@@ -72,9 +96,16 @@ impl<K: Ord + Clone> DerivedSpkTracker<K> {
             self.derived_spks.extend(to_add_back);
             split
         };
-        for script_hash in split.into_values() {
-            self.derived_spks_rev.remove(&script_hash);
-            self.expected_txids.remove(&script_hash);
+        for (index, script_hash) in split {
+            let hash_map::Entry::Occupied(mut indices) = self.derived_spks_rev.entry(script_hash)
+            else {
+                continue;
+            };
+            indices.get_mut().remove(&index);
+            if indices.get().is_empty() {
+                indices.remove();
+                self.expected_txids.remove(&script_hash);
+            }
         }
     }
 
@@ -83,7 +114,8 @@ impl<K: Ord + Clone> DerivedSpkTracker<K> {
     /// The derivation window is a per-keychain high-water mark: re-inserting the same descriptor
     /// with a larger `next_index` widens the window and returns only the script hashes derived by
     /// the widening, while an equal or smaller `next_index` is a no-op. Inserting a different
-    /// descriptor discards the keychain's tracked spks and rebuilds the window from scratch.
+    /// descriptor discards the keychain's tracked spks and rebuilds the window from scratch. A
+    /// descriptor without a wildcard derives one spk, so it is tracked at index 0 only.
     ///
     /// `expected_spk_txids` are the `(spk, txid)` pairs we expect the server to report, as
     /// produced by `TxGraph::list_expected_spk_txids`. Only these txids can be reported as
@@ -103,7 +135,7 @@ impl<K: Ord + Clone> DerivedSpkTracker<K> {
                 self._clear_tracked_spks_of_keychain(keychain.clone());
             }
         }
-        let new_script_hashes = (0_u32..=next_index + self.lookahead + 1)
+        let new_script_hashes = (0_u32..=self._window_top(next_index))
             .filter_map(|index| self._add_derived_spk(keychain.clone(), index))
             .collect();
         for (spk, txid) in expected_spk_txids {
@@ -130,12 +162,12 @@ impl<K: Ord + Clone> DerivedSpkTracker<K> {
     }
 
     pub fn mark_script_hash_used(&mut self, keychain: &K, index: u32) -> Vec<ElectrumScriptHash> {
-        let next_index = index + 1;
+        let next_index = index.saturating_add(1);
 
         let mut spk_hashes = Vec::new();
         // We iterate the derivation indices backwards so that we return script hashes that starts
         // with the latest spk, since we want to send request for later spks first.
-        for index in (next_index..=next_index + 1 + self.lookahead).rev() {
+        for index in (next_index..=self._window_top(next_index)).rev() {
             match self._add_derived_spk(keychain.clone(), index) {
                 Some(spk_hash) => spk_hashes.push(spk_hash),
                 None => break,
@@ -203,8 +235,8 @@ mod test {
 
         let top_hash = *widened.last().expect("must have widened");
         assert_eq!(
-            tracker.index_of_spk_hash(top_hash),
-            Some(("keychain", 10 + LOOKAHEAD + 1)),
+            tracker.indices_of_spk_hash(top_hash).collect::<Vec<_>>(),
+            [("keychain", 10 + LOOKAHEAD + 1)],
         );
     }
 
@@ -236,7 +268,7 @@ mod test {
 
         assert_eq!(new_hashes, spk_hashes(&new_desc, 0..=LOOKAHEAD + 1));
         for old_hash in old_hashes {
-            assert_eq!(tracker.index_of_spk_hash(old_hash), None);
+            assert_eq!(tracker.indices_of_spk_hash(old_hash).next(), None);
         }
         assert_eq!(tracker.all_spk_hashes().collect::<Vec<_>>(), new_hashes);
     }
@@ -305,10 +337,13 @@ mod test {
             0,
             [(spk(&desc, outside), txid(1))],
         );
-        assert_eq!(tracker.index_of_spk_hash(hash), None);
+        assert_eq!(tracker.indices_of_spk_hash(hash).next(), None);
 
         tracker.insert_descriptor("keychain", desc.clone(), outside, []);
-        assert_eq!(tracker.index_of_spk_hash(hash), Some(("keychain", outside)));
+        assert_eq!(
+            tracker.indices_of_spk_hash(hash).collect::<Vec<_>>(),
+            [("keychain", outside)],
+        );
         assert_eq!(*tracker.expected_txids(hash), BTreeSet::from([txid(1)]));
     }
 
@@ -329,5 +364,37 @@ mod test {
 
         tracker.insert_descriptor("keychain", new_desc, 0, []);
         assert!(!tracker.has_expected_txids(old_hash));
+    }
+
+    #[test]
+    fn descriptor_without_wildcard_derives_index_zero_only() {
+        let desc = Descriptor::from_str(&format!("wpkh({XPUB}/0/0)")).expect("must parse");
+        let mut tracker = DerivedSpkTracker::<&str>::new(LOOKAHEAD);
+
+        let hashes = tracker.insert_descriptor("keychain", desc.clone(), 10, []);
+        assert_eq!(hashes, spk_hashes(&desc, 0..=0));
+        assert!(tracker.mark_script_hash_used(&"keychain", 0).is_empty());
+        assert_eq!(tracker.all_spk_hashes().collect::<Vec<_>>(), hashes);
+    }
+
+    #[test]
+    fn keychains_can_share_a_descriptor() {
+        let desc = descriptor("0");
+        let mut tracker = DerivedSpkTracker::<&str>::new(LOOKAHEAD);
+        let hash = ElectrumScriptHash::new(spk(&desc, 0));
+
+        tracker.insert_descriptor("a", desc.clone(), 0, [(spk(&desc, 0), txid(1))]);
+        tracker.insert_descriptor("b", desc.clone(), 0, []);
+        assert_eq!(
+            tracker.indices_of_spk_hash(hash).collect::<Vec<_>>(),
+            [("a", 0), ("b", 0)],
+        );
+
+        tracker.insert_descriptor("a", descriptor("1"), 0, []);
+        assert_eq!(
+            tracker.indices_of_spk_hash(hash).collect::<Vec<_>>(),
+            [("b", 0)],
+        );
+        assert!(tracker.has_expected_txids(hash));
     }
 }
