@@ -19,19 +19,11 @@ pub enum ConfirmationStage {
     FetchAnchors {
         to_fetch: BTreeSet<(u32, Txid)>,
     },
-    /// Everything the job set out to get has arrived, and the update has not been taken yet.
-    ///
-    /// Kept until [`ConfirmationJob::set_idle`], so a caller not ready to publish can come back
-    /// for the update on a later poll.
-    Done,
     /// Nothing left to do until the target tip or the statuses move.
     ///
-    /// The update was taken, or the job was abandoned on inconsistent headers. Distinct from
-    /// [`Done`], which still owes one — a single stage for both would hand the same update over
-    /// twice, and hand one over for an abandoned job.
-    ///
-    /// [`Done`]: Self::Done
-    Idle,
+    /// Reached once the anchors are handed over, or when the job is abandoned on inconsistent
+    /// headers.
+    Waiting,
 }
 
 impl ConfirmationStage {
@@ -69,10 +61,8 @@ pub enum ConfirmationProgress {
     AnchorUpdate(AnchorUpdate),
     /// Something changed; poll again.
     Continue,
-    /// Waiting on the server.
+    /// Waiting on the server, or on the target tip or statuses to move.
     Blocked,
-    /// Finished, and the update is there to be taken. Reported on every poll until it is.
-    Done,
 }
 
 /// The single job that moves the local chain and anchors what the scripts found.
@@ -80,8 +70,7 @@ pub enum ConfirmationProgress {
 /// Runs once every [`SpkJob`] has its history — the heights those histories name are all it
 /// reads, so a script still downloading its own transactions has already told it every block it
 /// needs. Owning the chain and the anchors together is what lets a whole set of anchors be
-/// resolved against one chain: resolved per-script, each job raced a tip only this one can
-/// move.
+/// resolved against one chain.
 ///
 /// Responses from an abandoned chain must not reach it. [`Self::set_tip`] reports when the
 /// target moved off the chain it was heading for so the caller can forget those requests.
@@ -175,22 +164,6 @@ impl ConfirmationJob {
         }
     }
 
-    /// Whether the job has finished and its update has not been taken yet.
-    ///
-    /// False again after [`Self::set_idle`], so the same update is never handed over twice, and
-    /// false for a job abandoned mid-fetch.
-    pub fn is_done(&self) -> bool {
-        matches!(self.stage, ConfirmationStage::Done)
-    }
-
-    /// Park the job until the target tip or the statuses move.
-    ///
-    /// Call this once the update it was offering has been taken; until then it keeps reporting
-    /// [`ConfirmationProgress::Done`].
-    pub fn set_idle(&mut self) {
-        self.stage = ConfirmationStage::Idle;
-    }
-
     /// Answer the heights the job asked for.
     pub fn resolve_blocks(&mut self, blocks: impl IntoIterator<Item = (u32, Header)>) {
         self.fetched_headers.extend(blocks);
@@ -266,7 +239,7 @@ impl ConfirmationJob {
                                 "Fetched headers are inconsistent. Reorg? Abandoning."
                             );
                             self.reset_headers();
-                            self.stage = ConfirmationStage::Idle;
+                            self.stage = ConfirmationStage::Waiting;
                             return Ok(ConfirmationProgress::Blocked);
                         }
                     }
@@ -360,17 +333,12 @@ impl ConfirmationJob {
                     self.stage = ConfirmationStage::FetchAnchors { to_fetch };
                     return Ok(ConfirmationProgress::Blocked);
                 }
-                self.stage = ConfirmationStage::Done;
+                self.stage = ConfirmationStage::Waiting;
                 Ok(ConfirmationProgress::AnchorUpdate(resolved))
             }
-            // `poll` took the stage, so both terminal stages have to put themselves back.
-            // `Done` still owes an update and keeps offering it until it is taken.
-            ConfirmationStage::Done => {
-                self.stage = ConfirmationStage::Done;
-                Ok(ConfirmationProgress::Done)
-            }
-            ConfirmationStage::Idle => {
-                self.stage = ConfirmationStage::Idle;
+            // `poll` took the stage, so the terminal stage has to put itself back.
+            ConfirmationStage::Waiting => {
+                self.stage = ConfirmationStage::Waiting;
                 Ok(ConfirmationProgress::Blocked)
             }
         }

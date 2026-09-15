@@ -279,8 +279,42 @@ fn new_state_with_cp(
     cp: CheckPoint,
 ) -> BlockingState {
     let mut spk_tracker = DerivedSpkTracker::new(0);
-    spk_tracker.insert_descriptor("external", descriptor, 0);
+    spk_tracker.insert_descriptor("external", descriptor, 0, []);
     BlockingState::new(ReqCoord::default(), cache, spk_tracker, cp)
+}
+
+/// A [`new_state`] whose tracked script has expected txids.
+fn new_state_expecting(
+    descriptor: Descriptor<DescriptorPublicKey>,
+    genesis: block::Header,
+    expected: impl IntoIterator<Item = (ScriptBuf, Txid)>,
+) -> BlockingState {
+    let mut spk_tracker = DerivedSpkTracker::new(0);
+    spk_tracker.insert_descriptor("external", descriptor, 0, expected);
+    BlockingState::new(
+        ReqCoord::default(),
+        Cache::default(),
+        spk_tracker,
+        CheckPoint::new(BlockId {
+            height: 0,
+            hash: genesis.block_hash(),
+        }),
+    )
+}
+
+/// A txid no server in these tests has, standing for one the wallet still believes in.
+fn absent_txid(byte: u8) -> Txid {
+    Txid::from_byte_array([byte; 32])
+}
+
+fn evicted(updates: &[Update<&'static str>]) -> Vec<Txid> {
+    let mut txids = updates
+        .iter()
+        .flat_map(|u| u.tx_update.evicted_ats.iter().map(|&(txid, _)| txid))
+        .collect::<Vec<_>>();
+    txids.sort();
+    txids.dedup();
+    txids
 }
 
 /// The anchor a tx confirmed in `header` at `height` must be given.
@@ -388,7 +422,7 @@ fn descriptor_inserted_mid_connection_is_subscribed() -> anyhow::Result<()> {
     state.start(&mut queue);
     queue.clear();
 
-    state.insert_descriptor(&mut queue, "external", descriptor, 0);
+    state.insert_descriptor(&mut queue, "external", descriptor, 0, []);
     assert!(
         queue
             .iter()
@@ -417,7 +451,7 @@ fn last_active_index_is_index_of_active_spk() -> anyhow::Result<()> {
     let header_2 = block_with_tx(&header_1, txid, 200, 0);
 
     let mut spk_tracker = DerivedSpkTracker::new(LOOKAHEAD);
-    spk_tracker.insert_descriptor("external", descriptor, 0);
+    spk_tracker.insert_descriptor("external", descriptor, 0, []);
     let mut state = BlockingState::new(
         ReqCoord::default(),
         Cache::default(),
@@ -475,7 +509,7 @@ fn last_active_index_is_highest_regardless_of_notification_order() -> anyhow::Re
     let header_3 = block_with_tx(&header_2, txid_4, 300, 0);
 
     let mut spk_tracker = DerivedSpkTracker::new(LOOKAHEAD);
-    spk_tracker.insert_descriptor("external", descriptor, 0);
+    spk_tracker.insert_descriptor("external", descriptor, 0, []);
     let mut state = BlockingState::new(
         ReqCoord::default(),
         Cache::default(),
@@ -506,32 +540,35 @@ fn last_active_index_is_highest_regardless_of_notification_order() -> anyhow::Re
             .expect("history is not empty");
 
     // The higher derivation index is notified first.
-    state.poll(
+    let mut updates = Vec::new();
+    updates.extend(state.poll(
         &mut queue,
         raw_msg(json!({
             "jsonrpc": "2.0",
             "method": "blockchain.scripthash.subscribe",
             "params": [spk_hash_4.to_string(), status_4.to_string()],
         })),
-    )?;
-    state.poll(
+    )?);
+    updates.extend(state.poll(
         &mut queue,
         raw_msg(json!({
             "jsonrpc": "2.0",
             "method": "blockchain.scripthash.subscribe",
             "params": [spk_hash_3.to_string(), status_3.to_string()],
         })),
-    )?;
+    )?);
+    updates.extend(drain_requests(&mut state, &mut queue, &server));
 
-    let updates = drain_requests(&mut state, &mut queue, &server);
-    let emitted = updates
+    // Updates are handed over as they are staged, and revealing is monotonic, so what matters is
+    // that the highest index is reported.
+    let highest = updates
         .iter()
         .flat_map(|update| &update.last_active_indices)
         .map(|(&k, &i)| (k, i))
-        .collect::<Vec<_>>();
+        .max_by_key(|&(_, i)| i);
     assert_eq!(
-        emitted,
-        vec![("external", 4)],
+        highest,
+        Some(("external", 4)),
         "the highest active index must survive being notified before the lower one"
     );
     Ok(())
@@ -2071,18 +2108,12 @@ fn a_history_that_cannot_match_the_job_is_not_re_asked() -> anyhow::Result<()> {
 /// The confirmation job must not wait on transactions it never reads.
 ///
 /// It works from the heights a history names, so once every script has its history it already
-/// knows every block it needs. Holding it until the scripts finish downloading the transactions
-/// in those histories serialises the header and proof fetches behind those downloads for
-/// nothing — on a wallet with many scripts that is the whole sync sitting idle.
+/// knows every block it needs.
 ///
 /// The tip's own header arrives with the notification, so the one height here needs no header
 /// request; reaching the proof is the proof that the job ran.
-///
-/// Running ahead is not publishing ahead. The transactions a script is still downloading belong
-/// in the same update as their anchors, so the finished job holds it until every script is done
-/// — otherwise a caller sees an anchor for a transaction it was never given.
 #[test]
-fn confirmation_job_runs_ahead_but_the_update_waits_for_the_scripts() -> anyhow::Result<()> {
+fn confirmation_job_runs_ahead_of_the_scripts() -> anyhow::Result<()> {
     let (descriptor, spk_hash, spk) = tracked_descriptor()?;
     let tx = tx_paying(&spk, 50_000);
     let txid = tx.compute_txid();
@@ -2150,51 +2181,25 @@ fn confirmation_job_runs_ahead_but_the_update_waits_for_the_scripts() -> anyhow:
         "the confirmation job must reach proof fetching without waiting for that transaction",
     );
 
-    // Let the confirmation job finish: answer everything, still except the transaction.
+    // Answer everything else. In whatever order the updates arrive, between them they carry the
+    // transaction and its anchor.
     let mut updates = Vec::new();
-    let mut tx_reqs = Vec::<RawRequest>::new();
-    let mut pending = deferred;
-    while let Some(req) = pending.pop() {
-        if req.method.as_ref() == "blockchain.transaction.get" {
-            tx_reqs.push(req);
-            continue;
-        }
-        if let Some(update) = state.poll(&mut queue, response(&req, &server))? {
-            updates.push(update);
-        }
-        pending.extend(queue.drain(..));
-    }
-    assert!(
-        updates.is_empty(),
-        "nothing may be published while a script is still downloading its transactions",
-    );
-
-    // The transaction finally arrives, and with it the whole update.
-    for req in tx_reqs {
-        if let Some(update) = state.poll(&mut queue, response(&req, &server))? {
-            updates.push(update);
-        }
+    for req in deferred {
+        updates.extend(state.poll(&mut queue, response(&req, &server))?);
     }
     updates.extend(drain_requests(&mut state, &mut queue, &server));
-
-    let update = match updates.as_slice() {
-        [update] => update,
-        other => panic!("exactly one update must be published, got {}", other.len()),
-    };
     assert!(
-        update
-            .tx_update
-            .txs
+        updates
             .iter()
-            .any(|t| t.compute_txid() == txid),
-        "the update must carry the transaction",
+            .any(|u| u.tx_update.txs.iter().any(|t| t.compute_txid() == txid)),
+        "the transaction must be handed over",
     );
     assert!(
-        update
+        updates.iter().any(|u| u
             .tx_update
             .anchors
-            .contains(&(anchor_of(&header_2, 2), txid)),
-        "the update must carry its anchor alongside it",
+            .contains(&(anchor_of(&header_2, 2), txid))),
+        "its anchor must be handed over",
     );
 
     // A finished job must hand its update over once, not on every poll that reaches it. The
@@ -2265,5 +2270,167 @@ fn a_transaction_that_is_not_the_one_asked_for_is_rejected() -> anyhow::Result<(
         result.is_err(),
         "a transaction that is not the one asked for must not be accepted",
     );
+    Ok(())
+}
+
+/// A payment can be cancelled while nothing is connected, and the first thing a fresh client hears
+/// about that script is an empty history. The txid the caller expects must be reported evicted.
+#[test]
+fn expected_txid_absent_at_cold_start_is_evicted() -> anyhow::Result<()> {
+    let (descriptor, _spk_hash, spk) = tracked_descriptor()?;
+    let cancelled = absent_txid(1);
+    let (genesis, header_1) = base_headers();
+
+    let header_2 = block_with_root(&header_1, TxMerkleNode::all_zeros(), 200, 0);
+
+    let mut state = new_state_expecting(descriptor, genesis, [(spk, cancelled)]);
+    let mut queue = ReqQueue::new();
+    let server = Server {
+        headers: vec![genesis, header_1, header_2],
+        txs: Vec::new(),
+        merkle_proof: (Vec::new(), 0),
+    };
+
+    state.start(&mut queue);
+    let updates = drain_requests(&mut state, &mut queue, &server);
+
+    assert_eq!(
+        evicted(&updates),
+        vec![cancelled],
+        "a txid the caller expects but the server does not report is evicted",
+    );
+    Ok(())
+}
+
+/// Only the server retracts. Once a history response has said which txids are there, that is what
+/// the client expects from then on — otherwise the same eviction is re-reported against every
+/// later response, and a transaction the server has since reported goes unwatched.
+#[test]
+fn history_response_replaces_the_expected_txids() -> anyhow::Result<()> {
+    let (descriptor, spk_hash, spk) = tracked_descriptor()?;
+    let cancelled = absent_txid(1);
+    let tx = tx_paying(&spk, 50_000);
+    let replacement = tx.compute_txid();
+    let (genesis, header_1) = base_headers();
+    let header_2 = block_with_tx(&header_1, replacement, 200, 0);
+
+    let mut state = new_state_expecting(descriptor, genesis, [(spk, cancelled)]);
+    let mut queue = ReqQueue::new();
+    let mut server = Server {
+        headers: vec![genesis, header_1, header_2],
+        txs: vec![(tx, 2)],
+        merkle_proof: (Vec::new(), 0),
+    };
+
+    state.start(&mut queue);
+    let updates = drain_requests(&mut state, &mut queue, &server);
+    assert_eq!(
+        evicted(&updates),
+        vec![cancelled],
+        "only the expected txid is missing from the history the server reported",
+    );
+
+    // Everything the script had is now gone, so the server reports no history at all.
+    server.txs.clear();
+    let mut updates = Vec::new();
+    updates.extend(state.poll(
+        &mut queue,
+        raw_msg(json!({
+            "jsonrpc": "2.0",
+            "method": "blockchain.scripthash.subscribe",
+            "params": [spk_hash.to_string(), serde_json::Value::Null],
+        })),
+    )?);
+    updates.extend(drain_requests(&mut state, &mut queue, &server));
+
+    assert_eq!(
+        evicted(&updates),
+        vec![replacement],
+        "the expected txids follow the server's last report, so only that is evicted a second time",
+    );
+    Ok(())
+}
+
+/// A job replaced while it still waits on a transaction must not lose the evictions its history
+/// already showed.
+#[test]
+fn eviction_survives_its_job_being_replaced() -> anyhow::Result<()> {
+    let (descriptor, spk_hash, spk) = tracked_descriptor()?;
+    let cancelled = absent_txid(1);
+    let tx = tx_paying(&spk, 50_000);
+    let txid = tx.compute_txid();
+    let (genesis, header_1) = base_headers();
+    let header_2 = block_with_tx(&header_1, txid, 200, 0);
+
+    let mut state = new_state_expecting(descriptor, genesis, [(spk, cancelled)]);
+    let mut queue = ReqQueue::new();
+    let server = Server {
+        headers: vec![genesis, header_1, header_2],
+        txs: vec![(tx, 2)],
+        merkle_proof: (Vec::new(), 0),
+    };
+
+    // Answer everything but the transaction, so the job has its history and nothing after it.
+    state.start(&mut queue);
+    let mut updates = Vec::new();
+    let mut deferred = Vec::<RawRequest>::new();
+    while let Some(req) = queue.pop_front() {
+        if req.method.as_ref() == "blockchain.transaction.get" {
+            deferred.push(req);
+        } else {
+            updates.extend(state.poll(&mut queue, response(&req, &server))?);
+        }
+    }
+    assert!(
+        !deferred.is_empty(),
+        "the job must still be waiting on its transaction"
+    );
+
+    // The server announces the same status again, which replaces the job.
+    let status = ElectrumScriptStatus::from_history(&server.history(&json!(spk_hash.to_string())))
+        .expect("history is not empty");
+    updates.extend(state.poll(
+        &mut queue,
+        raw_msg(json!({
+            "jsonrpc": "2.0",
+            "method": "blockchain.scripthash.subscribe",
+            "params": [spk_hash.to_string(), status.to_string()],
+        })),
+    )?);
+    for req in deferred {
+        updates.extend(state.poll(&mut queue, response(&req, &server))?);
+    }
+    updates.extend(drain_requests(&mut state, &mut queue, &server));
+
+    assert_eq!(evicted(&updates), vec![cancelled]);
+    Ok(())
+}
+
+/// A reconnect — or a swap to another server — is the cold start in miniature: the resubscribe is
+/// answered with a fresh status, and the expected txids are what make that answer mean anything,
+/// so they have to outlive the connection they were given to.
+#[test]
+fn expected_txids_survive_a_reconnect() -> anyhow::Result<()> {
+    let (descriptor, _spk_hash, spk) = tracked_descriptor()?;
+    let cancelled = absent_txid(1);
+    let (genesis, header_1) = base_headers();
+
+    let header_2 = block_with_root(&header_1, TxMerkleNode::all_zeros(), 200, 0);
+
+    let mut state = new_state_expecting(descriptor, genesis, [(spk, cancelled)]);
+    let mut queue = ReqQueue::new();
+    let server = Server {
+        headers: vec![genesis, header_1, header_2],
+        txs: Vec::new(),
+        merkle_proof: (Vec::new(), 0),
+    };
+
+    // Connect, then lose the connection before a single answer arrives.
+    state.start(&mut queue);
+    queue.clear();
+    state.start(&mut queue);
+
+    let updates = drain_requests(&mut state, &mut queue, &server);
+    assert_eq!(evicted(&updates), vec![cancelled]);
     Ok(())
 }

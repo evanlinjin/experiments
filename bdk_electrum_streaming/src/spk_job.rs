@@ -47,10 +47,6 @@ impl SpkStage {
             Self::ProcessingPrevouts(prevouts)
         }
     }
-
-    pub fn is_done(&self) -> bool {
-        matches!(self, SpkStage::Done)
-    }
 }
 
 /// What one [`SpkJob::poll`] achieved.
@@ -60,17 +56,16 @@ pub enum SpkProgress {
     Continue,
     /// Waiting on the server.
     Blocked,
-    /// Everything asked for has arrived. Carries what the job gathered, leaving it empty, so a
-    /// job polled again after finishing contributes nothing a second time.
-    Done(TxUpdate<ConfirmationBlockTime>),
+    /// Something to stage; poll again.
+    TxUpdate(TxUpdate<ConfirmationBlockTime>),
+    /// Everything asked for has arrived.
+    Done,
 }
 
 /// The job to perform once we receive a script status notification.
 ///
 /// Fetches the script's history, the transactions in it, and the outputs those transactions
-/// spend. Anchoring them is [`ConfirmationJob`]'s work: a transaction's anchor depends on the chain,
-/// which no single script can move, so resolving anchors per-script had every job racing a
-/// tip that only one of them could move.
+/// spend. Anchoring them is [`ConfirmationJob`]'s work.
 ///
 /// [`ConfirmationJob`]: crate::ConfirmationJob
 #[derive(Debug)]
@@ -84,8 +79,9 @@ pub struct SpkJob {
 }
 
 impl SpkJob {
+    /// `expected_txids` is what we expect under this spk. An absent status empties it.
     pub fn new(
-        cache: &Cache,
+        expected_txids: &mut BTreeSet<Txid>,
         spk_hash: ElectrumScriptHash,
         spk_status: Option<ElectrumScriptStatus>,
     ) -> Self {
@@ -95,11 +91,12 @@ impl SpkJob {
         let stage = match spk_status {
             Some(status) => SpkStage::ProcessingHistory { status },
             None => {
-                if let Some(prev_txids) = cache.tx_cache.spk_txids.get(&spk_hash) {
-                    tx_update
-                        .evicted_ats
-                        .extend(prev_txids.iter().map(|&txid| (txid, start.as_secs())));
-                }
+                // An absent status is the server stating this spk has no history at all, so
+                // everything we expected under it is gone.
+                tx_update
+                    .evicted_ats
+                    .extend(expected_txids.iter().map(|&txid| (txid, start.as_secs())));
+                expected_txids.clear();
                 SpkStage::Done
             }
         };
@@ -122,11 +119,6 @@ impl SpkJob {
         }
     }
 
-    /// Whether everything this job asked for has arrived.
-    pub fn is_done(&self) -> bool {
-        self.stage.is_done()
-    }
-
     pub fn elapsed_seconds(&self) -> String {
         let now = UNIX_EPOCH.elapsed().expect("must get current timestamp");
         // The system clock can step backwards, which must not bring a log line down with it.
@@ -137,35 +129,43 @@ impl SpkJob {
     /// Take one step towards having everything the script's history names.
     ///
     /// One step per call, so the caller drives it the same way it drives [`ConfirmationJob`]: poll
-    /// until [`SpkProgress::Blocked`] or [`SpkProgress::Done`].
+    /// until [`SpkProgress::Blocked`] or [`SpkProgress::Done`], staging every
+    /// [`SpkProgress::TxUpdate`] on the way.
     ///
     /// Errors when the server answers with a transaction that cannot be the one asked for —
     /// its outputs do not reach an outpoint we know is spent. That is the server's picture
     /// disagreeing with itself, so there is nothing to retry against on this connection.
     ///
+    /// `expected_txids` is what we expect under this spk as of this call. Once the history is in,
+    /// anything expected but absent from it is evicted, and it is replaced by the history.
+    ///
     /// [`ConfirmationJob`]: crate::ConfirmationJob
-    pub fn poll(&mut self, queuer: &mut ReqQueuer, cache: &Cache) -> anyhow::Result<SpkProgress> {
+    pub fn poll(
+        &mut self,
+        queuer: &mut ReqQueuer,
+        cache: &Cache,
+        expected_txids: &mut BTreeSet<Txid>,
+    ) -> anyhow::Result<SpkProgress> {
         let progress = match &mut self.stage {
             SpkStage::ProcessingHistory { status } => {
                 match cache.subscriptions.spk_history(*status) {
                     Some(history) => {
-                        if let Some(prev_txids) = cache.tx_cache.spk_txids.get(&self.spk_hash) {
-                            let these_txids =
-                                history.iter().map(|tx| tx.txid()).collect::<BTreeSet<_>>();
-                            let to_evict = prev_txids
+                        let these_txids =
+                            history.iter().map(|tx| tx.txid()).collect::<BTreeSet<_>>();
+                        let mut update = TxUpdate::default();
+                        update.evicted_ats.extend(
+                            expected_txids
                                 .difference(&these_txids)
-                                .map(|&txid| (txid, self.start.as_secs()));
-                            self.tx_update.evicted_ats.extend(to_evict);
-                        }
+                                .map(|&txid| (txid, self.start.as_secs())),
+                        );
+                        *expected_txids = these_txids;
                         for tx in history {
                             if let response::Tx::Mempool(tx) = tx {
-                                self.tx_update
-                                    .seen_ats
-                                    .insert((tx.txid, self.start.as_secs()));
+                                update.seen_ats.insert((tx.txid, self.start.as_secs()));
                             }
                         }
                         self.stage = SpkStage::from_txids(history.iter().map(|tx| tx.txid()));
-                        SpkProgress::Continue
+                        SpkProgress::TxUpdate(update)
                     }
                     None => {
                         queuer.enqueue(request::GetHistory {
@@ -240,7 +240,10 @@ impl SpkJob {
                     SpkProgress::Blocked
                 }
             }
-            SpkStage::Done => SpkProgress::Done(core::mem::take(&mut self.tx_update)),
+            SpkStage::Done if !self.tx_update.is_empty() => {
+                SpkProgress::TxUpdate(core::mem::take(&mut self.tx_update))
+            }
+            SpkStage::Done => SpkProgress::Done,
         };
 
         let stage_str = match &self.stage {

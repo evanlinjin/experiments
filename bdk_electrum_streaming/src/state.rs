@@ -1,7 +1,10 @@
 use std::collections::BTreeMap;
 
 use anyhow::Context;
-use bdk_core::{CheckPoint, ConfirmationBlockTime};
+use bdk_core::{
+    bitcoin::{ScriptBuf, Txid},
+    CheckPoint, ConfirmationBlockTime,
+};
 use electrum_streaming_client::{
     notification::Notification, request, AsyncPendingRequest, BlockingPendingRequest,
     ElectrumScriptHash, ElectrumScriptStatus, MaybeBatch, PendingRequest,
@@ -47,10 +50,10 @@ pub struct State<PReq: PendingRequest, K = &'static str> {
     spk_jobs: BTreeMap<ElectrumScriptHash, SpkJob>,
     confirmation_job: Option<ConfirmationJob>,
 
-    /// The update being built up.
+    /// What the jobs have gathered since the last update was handed over.
     ///
-    /// Both job kinds write here as they progress, and it is handed to the caller whole when all
-    /// pending jobs complete.
+    /// Both job kinds write here as they progress, and [`poll`](Self::poll) hands it to the caller
+    /// whenever it is not empty.
     staged: Update<K>,
 
     user_state: electrum_streaming_client::State<PReq>,
@@ -84,16 +87,22 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
     }
 
     /// Insert a descriptor and queue outgoing requests (if needed).
+    /// `expected_spk_txids` are the txids we expect the server to report for the spks this
+    /// registers; see [`DerivedSpkTracker::insert_descriptor`].
     pub fn insert_descriptor(
         &mut self,
         req_queue: &mut ReqQueue,
         keychain: K,
         descriptor: Descriptor<DescriptorPublicKey>,
         next_index: u32,
+        expected_spk_txids: impl IntoIterator<Item = (ScriptBuf, Txid)>,
     ) {
-        let new_script_hashes = self
-            .spk_tracker
-            .insert_descriptor(keychain, descriptor, next_index);
+        let new_script_hashes = self.spk_tracker.insert_descriptor(
+            keychain,
+            descriptor,
+            next_index,
+            expected_spk_txids,
+        );
         for script_hash in new_script_hashes {
             let mut queuer = self.coord.queuer(req_queue, JobId::Spk(script_hash));
             queuer.enqueue(request::ScriptHashSubscribe { script_hash });
@@ -149,24 +158,18 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
     ) -> anyhow::Result<Option<Update<K>>> {
         self.handle(req_queue, raw)?;
 
-        // Any path through `handle` may have been the one that finished a job, so the update is
-        // handed over here rather than in each of them. Both job kinds have to be done.
-        let job = match &mut self.confirmation_job {
-            Some(job) => job,
-            None => return Ok(None),
-        };
-        if !job.is_done() || !self.spk_jobs.values().all(SpkJob::is_done) {
+        // Any path through `handle` may have been the one that staged something, so the update is
+        // handed over here rather than in each of them. Each job stages its part as soon as it
+        // has it, so an update can carry a chain whose anchors are still being proven.
+        if self.staged.is_empty() {
             return Ok(None);
         }
-        job.set_idle();
-        // The scripts have been anchored, so their jobs have served their purpose.
-        self.spk_jobs.clear();
         let update = core::mem::take(&mut self.staged);
         tracing::info!(
             tip_height = self.cp.height(),
             anchors = update.tx_update.anchors.len(),
             txs = update.tx_update.txs.len(),
-            "Confirmation job finished"
+            "Handing over update"
         );
         Ok(Some(update))
     }
@@ -429,7 +432,7 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
             self.cache.subscriptions.remove_spk(spk_hash);
         }
 
-        if spk_status.is_some() || self.cache.tx_cache.spk_txids.contains_key(&spk_hash) {
+        if spk_status.is_some() || self.spk_tracker.has_expected_txids(spk_hash) {
             for script_hash in self.spk_tracker.mark_script_hash_used(&k, i) {
                 self.coord
                     .queuer(req_queue, JobId::Spk(script_hash))
@@ -446,8 +449,12 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
                 .or_insert(i);
         }
 
-        self.spk_jobs
-            .insert(spk_hash, SpkJob::new(&self.cache, spk_hash, spk_status));
+        let job = SpkJob::new(
+            self.spk_tracker.expected_txids(spk_hash),
+            spk_hash,
+            spk_status,
+        );
+        self.spk_jobs.insert(spk_hash, job);
         self.poll_spk_jobs(req_queue, [JobId::Spk(spk_hash)])?;
         // A notification is all that revives a cancelled job, and below the reorg window the
         // tip never moves — so this is where an anchor the server has come back to is picked up.
@@ -474,10 +481,8 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
         self.poll_confirmation_job(req_queue)
     }
 
-    /// Poll the named spk jobs, staging whatever each one has finished gathering.
-    ///
-    /// Jobs are left in place when they finish: the update they contribute to is published
-    /// only once [`ConfirmationJob`] completes, and they are cleared then.
+    /// Poll the named spk jobs, staging whatever each one has finished gathering and dropping the
+    /// jobs that finish.
     fn poll_spk_jobs(
         &mut self,
         req_queue: &mut ReqQueue,
@@ -488,6 +493,7 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
             coord,
             cache,
             spk_jobs,
+            spk_tracker,
             staged,
             ..
         } = self;
@@ -499,10 +505,18 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
             };
             loop {
                 let mut queuer = coord.queuer(req_queue, JobId::Spk(spk_hash));
-                match job.poll(&mut queuer, cache)? {
+                // The tracker's own set, so the job never holds a copy that a `track_descriptor`
+                // arriving mid-job could fall behind.
+                let expected_txids = spk_tracker.expected_txids(spk_hash);
+                let progress = job.poll(&mut queuer, cache, expected_txids)?;
+                match progress {
                     SpkProgress::Continue => continue,
                     SpkProgress::Blocked => break,
-                    SpkProgress::Done(tx_update) => {
+                    SpkProgress::TxUpdate(tx_update) => {
+                        staged.tx_update.extend(tx_update);
+                        continue;
+                    }
+                    SpkProgress::Done => {
                         tracing::info!(
                             elapsed_seconds = job.elapsed_seconds(),
                             spk_hash = spk_hash.to_string(),
@@ -515,7 +529,7 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
                         // initial subscribe or a later notification) resolves to a finished job,
                         // so deriving the index from mere completion would tag every unused
                         // look-ahead spk as active too.
-                        staged.tx_update.extend(tx_update);
+                        spk_jobs.remove(&spk_hash);
                         break;
                     }
                 }
@@ -528,8 +542,7 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
     ///
     /// Held back only until every script has its history. The job works from the heights those
     /// histories name, so a script still downloading the transactions in its own history has
-    /// already told the job everything it needs — and holding for the downloads would serialise
-    /// the header and proof fetches behind them for nothing.
+    /// already told the job everything it needs.
     fn poll_confirmation_job(&mut self, req_queue: &mut ReqQueue) -> anyhow::Result<()> {
         if self
             .spk_jobs
@@ -542,9 +555,7 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
             Some(job) => job,
             None => return Ok(()),
         };
-        // Scoped by what the server has told us about, not by which jobs happen to be live:
-        // those are cleared on every completion, so a single notification arriving between
-        // updates would narrow the next reorg's repair to that one script.
+        // Scoped by what the server has told us about.
         job.set_statuses(self.cache.subscriptions.spk_statuses());
 
         loop {
@@ -579,9 +590,7 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
                     self.staged.tx_update.anchors = anchors;
                     continue;
                 }
-                // Nothing more to do this round. Whether the job owes an update is settled by
-                // `poll`, once the scripts can be checked alongside it.
-                ConfirmationProgress::Blocked | ConfirmationProgress::Done => break,
+                ConfirmationProgress::Blocked => break,
             }
         }
         self.confirmation_job = Some(job);
