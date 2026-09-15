@@ -420,33 +420,35 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
         spk_hash: ElectrumScriptHash,
         spk_status: Option<ElectrumScriptStatus>,
     ) -> anyhow::Result<()> {
-        let (k, i) = self
+        let indices = self
             .spk_tracker
-            .index_of_spk_hash(spk_hash)
-            .ok_or(anyhow::anyhow!(
-                "unexpected script hash notification: {}",
-                spk_hash
-            ))?;
+            .indices_of_spk_hash(spk_hash)
+            .collect::<Vec<_>>();
+        if indices.is_empty() {
+            anyhow::bail!("unexpected script hash notification: {}", spk_hash);
+        }
 
         if spk_status.is_none() {
             self.cache.subscriptions.remove_spk(spk_hash);
         }
 
         if spk_status.is_some() || self.spk_tracker.has_expected_txids(spk_hash) {
-            for script_hash in self.spk_tracker.mark_script_hash_used(&k, i) {
-                self.coord
-                    .queuer(req_queue, JobId::Spk(script_hash))
-                    .enqueue(request::ScriptHashSubscribe { script_hash });
+            for (k, i) in indices {
+                for script_hash in self.spk_tracker.mark_script_hash_used(&k, i) {
+                    self.coord
+                        .queuer(req_queue, JobId::Spk(script_hash))
+                        .enqueue(request::ScriptHashSubscribe { script_hash });
+                }
+                // Notifications for spks of the same keychain can arrive in any order (it is
+                // unrelated to derivation order), so keep the highest index seen rather than the
+                // last one notified. Overwriting would under-report the last active index and
+                // leave a higher spk unrevealed.
+                self.staged
+                    .last_active_indices
+                    .entry(k)
+                    .and_modify(|last| *last = (*last).max(i))
+                    .or_insert(i);
             }
-            // Notifications for spks of the same keychain can arrive in any order (it is
-            // unrelated to derivation order), so keep the highest index seen rather than the
-            // last one notified. Overwriting would under-report the last active index and leave
-            // a higher spk unrevealed.
-            self.staged
-                .last_active_indices
-                .entry(k)
-                .and_modify(|last| *last = (*last).max(i))
-                .or_insert(i);
         }
 
         let job = SpkJob::new(
