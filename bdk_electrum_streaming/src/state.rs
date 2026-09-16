@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::Context;
 use bdk_core::{
@@ -51,6 +51,10 @@ pub struct Progress {
     pub spk_jobs_completed: usize,
     /// Spk jobs still fetching histories, transactions or prevouts.
     pub spk_jobs_pending: usize,
+    /// Distinct transactions the spk jobs are still waiting to download.
+    ///
+    /// Grows as histories arrive and name more transactions.
+    pub txs_remaining: usize,
     /// Headers the confirmation job has in hand for its current pass.
     pub headers_fetched: usize,
     /// Headers the confirmation job is still waiting on for its current pass.
@@ -66,6 +70,7 @@ impl Progress {
     pub fn is_synced(&self) -> bool {
         self.remote_tip_height == Some(self.local_tip_height)
             && self.spk_jobs_pending == 0
+            && self.txs_remaining == 0
             && self.headers_remaining == 0
             && self.anchors_remaining == 0
     }
@@ -138,6 +143,13 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
             remote_tip_height: self.remote_tip_height,
             spk_jobs_completed: self.spk_jobs_completed,
             spk_jobs_pending: self.spk_jobs.len(),
+            // Jobs can wait on the same transaction, so count each one once.
+            txs_remaining: self
+                .spk_jobs
+                .values()
+                .flat_map(SpkJob::txs_remaining)
+                .collect::<BTreeSet<_>>()
+                .len(),
             headers_fetched,
             headers_remaining,
             anchors_fetched,

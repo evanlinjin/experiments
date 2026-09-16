@@ -2485,6 +2485,7 @@ fn progress_counts_down_to_synced() -> anyhow::Result<()> {
         .iter()
         .any(|p| p.remote_tip_height == Some(2) && p.local_tip_height == 0));
     assert!(seen.iter().any(|p| p.spk_jobs_pending > 0));
+    assert!(seen.iter().any(|p| p.txs_remaining == 1));
     assert!(seen.iter().any(|p| p.headers_remaining > 0));
     assert!(seen.iter().any(|p| p.anchors_remaining == 1));
     let last = seen.last().expect("must have polled");

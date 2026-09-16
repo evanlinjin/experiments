@@ -119,6 +119,18 @@ impl SpkJob {
         }
     }
 
+    /// The transactions this job is still waiting to download, including those whose outputs it
+    /// needs.
+    pub fn txs_remaining(&self) -> impl Iterator<Item = Txid> + '_ {
+        let (txids, outpoints) = match &self.stage {
+            SpkStage::ProcessingTxs(txids) => (Some(txids), None),
+            SpkStage::ProcessingPrevouts(outpoints) => (None, Some(outpoints)),
+            SpkStage::ProcessingHistory { .. } | SpkStage::Done => (None, None),
+        };
+        let txids = txids.into_iter().flatten().copied();
+        txids.chain(outpoints.into_iter().flatten().map(|op| op.txid))
+    }
+
     pub fn elapsed_seconds(&self) -> String {
         let now = UNIX_EPOCH.elapsed().expect("must get current timestamp");
         // The system clock can step backwards, which must not bring a log line down with it.
