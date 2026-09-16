@@ -47,6 +47,11 @@ pub struct Progress {
     pub local_tip: BlockId,
     /// Tip the server last announced on this connection.
     pub remote_tip: Option<BlockId>,
+    /// Whether the local chain is at `remote_tip` with every anchor proven against it.
+    ///
+    /// False while the confirmation job is working, and also when it gave up and is waiting for
+    /// the server to tell it something new (a failed proof, inconsistent headers).
+    pub chain_synced: bool,
     /// Spk jobs finished since the last time none were pending.
     pub spk_jobs_completed: usize,
     /// Spk jobs still fetching histories, transactions or prevouts.
@@ -63,22 +68,12 @@ pub struct Progress {
     pub anchors_fetched: usize,
     /// Anchors the confirmation job is still waiting on a proof for in its current pass.
     pub anchors_remaining: usize,
-    /// Whether the confirmation job finished its pass; see [`Self::chain_synced`].
-    confirmation_done: bool,
 }
 
 impl Progress {
-    /// Whether the local chain is at `remote_tip` with every anchor proven against it.
-    ///
-    /// False while the confirmation job is working, and also when it gave up and is waiting for
-    /// the server to tell it something new (a failed proof, inconsistent headers).
-    pub fn chain_synced(&self) -> bool {
-        self.confirmation_done && self.remote_tip == Some(self.local_tip)
-    }
-
     /// Whether the local chain has reached the server's tip with no work outstanding.
     pub fn is_synced(&self) -> bool {
-        self.chain_synced() && self.spk_jobs_pending == 0 && self.txs_remaining == 0
+        self.chain_synced && self.spk_jobs_pending == 0 && self.txs_remaining == 0
     }
 
     /// Rough units of work as `(done, remaining)`, for a progress bar.
@@ -159,6 +154,8 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
         Progress {
             local_tip: self.cp.block_id(),
             remote_tip: self.remote_tip,
+            chain_synced: job.is_some_and(ConfirmationJob::is_done)
+                && self.remote_tip == Some(self.cp.block_id()),
             spk_jobs_completed: self.spk_jobs_completed,
             spk_jobs_pending: self.spk_jobs.len(),
             // Requests are deduplicated, so this counts each transaction once.
@@ -167,7 +164,6 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
             headers_remaining,
             anchors_fetched,
             anchors_remaining,
-            confirmation_done: job.is_some_and(ConfirmationJob::is_done),
         }
     }
 

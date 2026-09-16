@@ -2539,7 +2539,7 @@ fn a_failed_proof_is_not_synced() -> anyhow::Result<()> {
 
     let progress = state.progress();
     assert_eq!(progress.remote_tip, Some(progress.local_tip));
-    assert!(!progress.chain_synced(), "{progress:?}");
+    assert!(!progress.chain_synced, "{progress:?}");
     assert!(!progress.is_synced());
     Ok(())
 }
