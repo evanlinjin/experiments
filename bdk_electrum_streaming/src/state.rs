@@ -74,6 +74,24 @@ impl Progress {
             && self.headers_remaining == 0
             && self.anchors_remaining == 0
     }
+
+    /// A rough measure of how far through the outstanding work we are, from `0.0` to `1.0`.
+    ///
+    /// Every header, anchor, spk job and transaction counts as one unit of work. Good enough for a
+    /// progress bar, but not monotonic: new work can arrive at any time and push it back down.
+    pub fn fraction(&self) -> f32 {
+        let done = self.headers_fetched + self.anchors_fetched + self.spk_jobs_completed;
+        let total = done
+            + self.headers_remaining
+            + self.anchors_remaining
+            + self.spk_jobs_pending
+            + self.txs_remaining;
+        match total {
+            0 if self.is_synced() => 1.0,
+            0 => 0.0,
+            _ => done as f32 / total as f32,
+        }
+    }
 }
 
 pub type AsyncState<K = &'static str> = State<AsyncPendingRequest, K>;

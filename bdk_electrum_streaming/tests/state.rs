@@ -2474,6 +2474,7 @@ fn progress_counts_down_to_synced() -> anyhow::Result<()> {
 
     state.start(&mut queue);
     assert!(!state.progress().is_synced(), "nothing is known yet");
+    assert_eq!(state.progress().fraction(), 0.0);
     let mut seen = Vec::new();
     while let Some(req) = queue.pop_front() {
         let (_, progress) = state.poll(&mut queue, response(&req, &server))?;
@@ -2492,5 +2493,9 @@ fn progress_counts_down_to_synced() -> anyhow::Result<()> {
     assert_eq!(last.local_tip_height, 2);
     assert!(last.spk_jobs_completed > 0);
     assert!(last.is_synced(), "{last:?}");
+    assert_eq!(last.fraction(), 1.0);
+    assert!(seen
+        .iter()
+        .any(|p| p.fraction() > 0.0 && p.fraction() < 1.0));
     Ok(())
 }
