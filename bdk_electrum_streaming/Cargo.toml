@@ -1,6 +1,6 @@
 [package]
 name = "bdk_electrum_streaming"
-version = "0.7.0"
+version = "0.8.0"
 description = "An async/blocking Electrum client for BDK, built as an explicit streaming state machine."
 license = "MIT OR Apache-2.0"
 edition = "2021"
