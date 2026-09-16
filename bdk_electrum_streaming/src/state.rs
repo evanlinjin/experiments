@@ -79,13 +79,17 @@ impl Progress {
     /// Rough units of work as `(done, remaining)`, for a progress bar.
     ///
     /// Every header, anchor, spk job and transaction counts as one unit. Not monotonic: new work
-    /// can arrive at any time and move the bar back.
+    /// can arrive at any time and move the bar back. `remaining` is zero exactly when
+    /// [`Self::is_synced`], so a full bar is never shown early.
     pub fn work(&self) -> (usize, usize) {
         let done = self.headers_fetched + self.anchors_fetched + self.spk_jobs_completed;
         let remaining = self.headers_remaining
             + self.anchors_remaining
             + self.spk_jobs_pending
             + self.txs_remaining;
+        // Being unsynced with nothing counted happens when no job is working: before the server
+        // announces its tip, or after the confirmation job gave up. It is still work left.
+        let remaining = remaining.max(usize::from(!self.is_synced()));
         (done, remaining)
     }
 }

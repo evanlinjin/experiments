@@ -2478,11 +2478,16 @@ fn progress_counts_down_to_synced() -> anyhow::Result<()> {
 
     state.start(&mut queue);
     assert!(!state.progress().is_synced(), "nothing is known yet");
-    assert_eq!(state.progress().work(), (0, 0));
+    assert_eq!(
+        state.progress().work(),
+        (0, 1),
+        "unsynced, so there is work left"
+    );
     let mut seen = Vec::new();
     while let Some(req) = queue.pop_front() {
         let (_, progress) = state.poll(&mut queue, response(&req, &server))?;
         assert_eq!(progress, state.progress());
+        assert_eq!(progress.work().1 == 0, progress.is_synced(), "{progress:?}");
         seen.push(progress);
     }
 
@@ -2541,6 +2546,10 @@ fn a_failed_proof_is_not_synced() -> anyhow::Result<()> {
     assert_eq!(progress.remote_tip, Some(progress.local_tip));
     assert!(!progress.chain_synced, "{progress:?}");
     assert!(!progress.is_synced());
+    assert!(
+        progress.work().1 > 0,
+        "the bar must not look full: {progress:?}"
+    );
     Ok(())
 }
 
@@ -2570,5 +2579,9 @@ fn restarting_forgets_the_remote_tip() -> anyhow::Result<()> {
     let progress = state.progress();
     assert_eq!(progress.remote_tip, None);
     assert!(!progress.is_synced());
+    assert!(
+        progress.work().1 > 0,
+        "the bar must not look full: {progress:?}"
+    );
     Ok(())
 }
