@@ -14,7 +14,7 @@ use electrum_streaming_client::{
 };
 use miniscript::{Descriptor, DescriptorPublicKey};
 
-use crate::{BlockingClientAction, BlockingState, ReqQueue, Update};
+use crate::{BlockingClientAction, BlockingState, Progress, ReqQueue, Update};
 
 #[derive(Debug)]
 pub struct BlockingClient<K> {
@@ -84,10 +84,15 @@ enum StateAction<K> {
     FromClient(BlockingClientAction<K>),
 }
 
+/// Run [`State`](crate::State) with the provided transport, update channel and client channel.
+///
+/// `progress_tx` is sent [`Progress`] whenever it changes. It is informational only, so a dropped
+/// receiver does not stop the state machine.
 pub fn run_blocking<'env, K, R, W>(
     state: &'env mut BlockingState<K>,
     shutdown: &'env AtomicBool,
     update_tx: &'env mut mpsc::Sender<Update<K>>,
+    progress_tx: &'env mut mpsc::Sender<Progress>,
     client_rx: &'env mut BlockingReceiver<K>,
     read: R,
     mut write: W,
@@ -194,6 +199,7 @@ where
 
         // State thread.
         let state_join = s.spawn(shutdown_on_return(shutdown, move || {
+            let mut last_progress = Option::<Progress>::None;
             loop {
                 while let Some(req) = req_queue.pop_front() {
                     write_tx.send(req)?;
@@ -207,11 +213,15 @@ where
                 };
                 match action {
                     StateAction::FromServer(raw) => {
-                        if let Some(update) = state.poll(&mut req_queue, raw)? {
+                        let (update, progress) = state.poll(&mut req_queue, raw)?;
+                        if let Some(update) = update {
                             update_tx
                                 .send(update)
                                 .map_err(|err| anyhow::anyhow!(err.to_string()))
                                 .context("Failed to send to update channel")?;
+                        }
+                        if last_progress.replace(progress) != Some(progress) {
+                            let _ = progress_tx.send(progress);
                         }
                     }
                     StateAction::FromClient(BlockingClientAction::Request(maybe_batch)) => {
