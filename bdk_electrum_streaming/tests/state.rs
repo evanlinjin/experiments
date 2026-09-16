@@ -2463,6 +2463,10 @@ fn progress_counts_down_to_synced() -> anyhow::Result<()> {
     let txid = tx.compute_txid();
     let (genesis, header_1) = base_headers();
     let header_2 = block_with_tx(&header_1, txid, 200, 0);
+    let tip_2 = BlockId {
+        height: 2,
+        hash: header_2.block_hash(),
+    };
 
     let mut state = new_state(Cache::default(), descriptor, genesis);
     let mut queue = ReqQueue::new();
@@ -2484,18 +2488,87 @@ fn progress_counts_down_to_synced() -> anyhow::Result<()> {
 
     assert!(seen
         .iter()
-        .any(|p| p.remote_tip_height == Some(2) && p.local_tip_height == 0));
+        .any(|p| p.remote_tip == Some(tip_2) && p.local_tip.height == 0 && !p.is_synced()));
     assert!(seen.iter().any(|p| p.spk_jobs_pending > 0));
     assert!(seen.iter().any(|p| p.txs_remaining == 1));
     assert!(seen.iter().any(|p| p.headers_remaining > 0));
     assert!(seen.iter().any(|p| p.anchors_remaining == 1));
     let last = seen.last().expect("must have polled");
-    assert_eq!(last.local_tip_height, 2);
+    assert_eq!(last.local_tip, tip_2);
+    assert_eq!(last.txs_remaining, 0);
     assert!(last.spk_jobs_completed > 0);
     assert!(last.is_synced(), "{last:?}");
     assert!(matches!(last.work(), (done, 0) if done > 0));
     assert!(seen
         .iter()
         .any(|p| matches!(p.work(), (done, remaining) if done > 0 && remaining > 0)));
+    Ok(())
+}
+
+/// A proof the server fails to give leaves the anchor unproven, so the tips matching must not be
+/// read as synced.
+#[test]
+fn a_failed_proof_is_not_synced() -> anyhow::Result<()> {
+    let (descriptor, _spk_hash, spk) = tracked_descriptor()?;
+    let tx = tx_paying(&spk, 50_000);
+    let txid = tx.compute_txid();
+    let (genesis, header_1) = base_headers();
+    let header_2 = block_with_tx(&header_1, txid, 200, 0);
+
+    let mut state = new_state(Cache::default(), descriptor, genesis);
+    let mut queue = ReqQueue::new();
+    let server = Server {
+        headers: vec![genesis, header_1, header_2],
+        txs: vec![(tx, 2)],
+        merkle_proof: (Vec::new(), 0),
+    };
+
+    state.start(&mut queue);
+    while let Some(req) = queue.pop_front() {
+        let resp = if req.method.as_ref() == "blockchain.transaction.get_merkle" {
+            raw_msg(json!({
+                "jsonrpc": "2.0",
+                "id": req.id,
+                "error": { "code": 1, "message": "server busy" },
+            }))
+        } else {
+            response(&req, &server)
+        };
+        state.poll(&mut queue, resp)?;
+    }
+
+    let progress = state.progress();
+    assert_eq!(progress.remote_tip, Some(progress.local_tip));
+    assert!(!progress.chain_synced(), "{progress:?}");
+    assert!(!progress.is_synced());
+    Ok(())
+}
+
+/// A new connection may be to another server, so the last one's tip must not carry over.
+#[test]
+fn restarting_forgets_the_remote_tip() -> anyhow::Result<()> {
+    let (descriptor, _spk_hash, spk) = tracked_descriptor()?;
+    let tx = tx_paying(&spk, 50_000);
+    let txid = tx.compute_txid();
+    let (genesis, header_1) = base_headers();
+    let header_2 = block_with_tx(&header_1, txid, 200, 0);
+
+    let mut state = new_state(Cache::default(), descriptor, genesis);
+    let mut queue = ReqQueue::new();
+    let server = Server {
+        headers: vec![genesis, header_1, header_2],
+        txs: vec![(tx, 2)],
+        merkle_proof: (Vec::new(), 0),
+    };
+
+    state.start(&mut queue);
+    drain_requests(&mut state, &mut queue, &server);
+    assert!(state.progress().is_synced());
+
+    queue.clear();
+    state.start(&mut queue);
+    let progress = state.progress();
+    assert_eq!(progress.remote_tip, None);
+    assert!(!progress.is_synced());
     Ok(())
 }

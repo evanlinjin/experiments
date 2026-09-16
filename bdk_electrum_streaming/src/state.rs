@@ -1,9 +1,9 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use anyhow::Context;
 use bdk_core::{
     bitcoin::{ScriptBuf, Txid},
-    CheckPoint, ConfirmationBlockTime,
+    BlockId, CheckPoint, ConfirmationBlockTime,
 };
 use electrum_streaming_client::{
     notification::Notification, request, AsyncPendingRequest, BlockingPendingRequest,
@@ -43,15 +43,15 @@ impl JobId {
 /// work, so `fetched / (fetched + remaining)` is how far through that batch we are.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Progress {
-    /// Height of the local chain.
-    pub local_tip_height: u32,
-    /// Height of the server's tip, once the server has announced one.
-    pub remote_tip_height: Option<u32>,
+    /// Tip of the local chain.
+    pub local_tip: BlockId,
+    /// Tip the server last announced on this connection.
+    pub remote_tip: Option<BlockId>,
     /// Spk jobs finished since the last time none were pending.
     pub spk_jobs_completed: usize,
     /// Spk jobs still fetching histories, transactions or prevouts.
     pub spk_jobs_pending: usize,
-    /// Distinct transactions the spk jobs are still waiting to download.
+    /// Distinct transactions requested from the server and not yet received.
     ///
     /// Grows as histories arrive and name more transactions.
     pub txs_remaining: usize,
@@ -63,16 +63,22 @@ pub struct Progress {
     pub anchors_fetched: usize,
     /// Anchors the confirmation job is still waiting on a proof for in its current pass.
     pub anchors_remaining: usize,
+    /// Whether the confirmation job finished its pass; see [`Self::chain_synced`].
+    confirmation_done: bool,
 }
 
 impl Progress {
+    /// Whether the local chain is at `remote_tip` with every anchor proven against it.
+    ///
+    /// False while the confirmation job is working, and also when it gave up and is waiting for
+    /// the server to tell it something new (a failed proof, inconsistent headers).
+    pub fn chain_synced(&self) -> bool {
+        self.confirmation_done && self.remote_tip == Some(self.local_tip)
+    }
+
     /// Whether the local chain has reached the server's tip with no work outstanding.
     pub fn is_synced(&self) -> bool {
-        self.remote_tip_height == Some(self.local_tip_height)
-            && self.spk_jobs_pending == 0
-            && self.txs_remaining == 0
-            && self.headers_remaining == 0
-            && self.anchors_remaining == 0
+        self.chain_synced() && self.spk_jobs_pending == 0 && self.txs_remaining == 0
     }
 
     /// Rough units of work as `(done, remaining)`, for a progress bar.
@@ -102,8 +108,8 @@ pub struct State<PReq: PendingRequest, K = &'static str> {
     spk_jobs: BTreeMap<ElectrumScriptHash, SpkJob>,
     confirmation_job: Option<ConfirmationJob>,
 
-    /// The height of the last tip the server announced.
-    remote_tip_height: Option<u32>,
+    /// The last tip the server announced on this connection.
+    remote_tip: Option<BlockId>,
     /// Spk jobs finished since `spk_jobs` was last empty; see [`Progress::spk_jobs_completed`].
     spk_jobs_completed: usize,
 
@@ -130,7 +136,7 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
             cache,
             spk_jobs: BTreeMap::new(),
             confirmation_job: None,
-            remote_tip_height: None,
+            remote_tip: None,
             spk_jobs_completed: 0,
             staged: Update::default(),
             user_state: electrum_streaming_client::State::new(),
@@ -147,26 +153,21 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
 
     /// How far along we are; see [`Progress`].
     pub fn progress(&self) -> Progress {
-        let ((headers_fetched, headers_remaining), (anchors_fetched, anchors_remaining)) = self
-            .confirmation_job
-            .as_ref()
-            .map_or(((0, 0), (0, 0)), |job| job.progress(&self.cache));
+        let job = self.confirmation_job.as_ref();
+        let ((headers_fetched, headers_remaining), (anchors_fetched, anchors_remaining)) =
+            job.map_or(((0, 0), (0, 0)), ConfirmationJob::progress);
         Progress {
-            local_tip_height: self.cp.height(),
-            remote_tip_height: self.remote_tip_height,
+            local_tip: self.cp.block_id(),
+            remote_tip: self.remote_tip,
             spk_jobs_completed: self.spk_jobs_completed,
             spk_jobs_pending: self.spk_jobs.len(),
-            // Jobs can wait on the same transaction, so count each one once.
-            txs_remaining: self
-                .spk_jobs
-                .values()
-                .flat_map(SpkJob::txs_remaining)
-                .collect::<BTreeSet<_>>()
-                .len(),
+            // Requests are deduplicated, so this counts each transaction once.
+            txs_remaining: self.coord.txs_in_flight(),
             headers_fetched,
             headers_remaining,
             anchors_fetched,
             anchors_remaining,
+            confirmation_done: job.is_some_and(ConfirmationJob::is_done),
         }
     }
 
@@ -204,6 +205,8 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
     pub fn start(&mut self, req_queue: &mut ReqQueue) {
         tracing::trace!("Starting state");
         self.confirmation_job = None;
+        // A new connection may be to a different server, which has yet to announce its tip.
+        self.remote_tip = None;
 
         // Resend pending requests.
         req_queue.extend(self.user_state.pending_requests());
@@ -482,7 +485,10 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
         height: u32,
         header: bdk_core::bitcoin::block::Header,
     ) -> anyhow::Result<()> {
-        self.remote_tip_height = Some(height);
+        self.remote_tip = Some(BlockId {
+            height,
+            hash: header.block_hash(),
+        });
         // A same-height reorg is applied without fetching anything, so this announcement is the
         // only place the replacement header is ever offered to us. Caching it here saves the
         // anchor refetch a round-trip on the very path it exists for.
