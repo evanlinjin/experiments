@@ -156,6 +156,38 @@ impl ConfirmationJob {
         reorged
     }
 
+    /// The current pass's headers and anchors, each as `(fetched, remaining)`.
+    ///
+    /// Read off the stage rather than counted along the way, so a pass that is abandoned or
+    /// restarted can never leave stale numbers behind. Both are zero outside their stage.
+    pub fn progress(&self, cache: &Cache) -> ((usize, usize), (usize, usize)) {
+        let split = |total: usize, fetched: usize| (fetched, total - fetched);
+        match &self.stage {
+            ConfirmationStage::FetchBlocks { to_fetch } => {
+                let fetched = to_fetch
+                    .iter()
+                    .filter(|h| self.fetched_headers.contains_key(h))
+                    .count();
+                (split(to_fetch.len(), fetched), (0, 0))
+            }
+            ConfirmationStage::FetchAnchors { to_fetch } => {
+                let fetched = to_fetch
+                    .iter()
+                    .filter(|(height, txid)| {
+                        self.fetched_headers.get(height).is_some_and(|header| {
+                            cache
+                                .tx_cache
+                                .anchors
+                                .contains_key(&(*txid, header.block_hash()))
+                        })
+                    })
+                    .count();
+                ((0, 0), split(to_fetch.len(), fetched))
+            }
+            ConfirmationStage::Init | ConfirmationStage::Waiting => ((0, 0), (0, 0)),
+        }
+    }
+
     pub fn set_statuses(&mut self, statuses: impl IntoIterator<Item = ElectrumScriptStatus>) {
         let statuses = statuses.into_iter().collect::<BTreeSet<_>>();
         if self.target_statuses != statuses {

@@ -37,6 +37,40 @@ impl JobId {
     }
 }
 
+/// How far [`State`] has got towards matching the server, for showing to a user.
+///
+/// Returned by every [`State::poll`]. Each `*_fetched`/`*_remaining` pair counts one batch of
+/// work, so `fetched / (fetched + remaining)` is how far through that batch we are.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Progress {
+    /// Height of the local chain.
+    pub local_tip_height: u32,
+    /// Height of the server's tip, once the server has announced one.
+    pub remote_tip_height: Option<u32>,
+    /// Spk jobs finished since the last time none were pending.
+    pub spk_jobs_completed: usize,
+    /// Spk jobs still fetching histories, transactions or prevouts.
+    pub spk_jobs_pending: usize,
+    /// Headers the confirmation job has in hand for its current pass.
+    pub headers_fetched: usize,
+    /// Headers the confirmation job is still waiting on for its current pass.
+    pub headers_remaining: usize,
+    /// Anchors the confirmation job has proven in its current pass.
+    pub anchors_fetched: usize,
+    /// Anchors the confirmation job is still waiting on a proof for in its current pass.
+    pub anchors_remaining: usize,
+}
+
+impl Progress {
+    /// Whether the local chain has reached the server's tip with no work outstanding.
+    pub fn is_synced(&self) -> bool {
+        self.remote_tip_height == Some(self.local_tip_height)
+            && self.spk_jobs_pending == 0
+            && self.headers_remaining == 0
+            && self.anchors_remaining == 0
+    }
+}
+
 pub type AsyncState<K = &'static str> = State<AsyncPendingRequest, K>;
 pub type BlockingState<K = &'static str> = State<BlockingPendingRequest, K>;
 
@@ -49,6 +83,11 @@ pub struct State<PReq: PendingRequest, K = &'static str> {
 
     spk_jobs: BTreeMap<ElectrumScriptHash, SpkJob>,
     confirmation_job: Option<ConfirmationJob>,
+
+    /// The height of the last tip the server announced.
+    remote_tip_height: Option<u32>,
+    /// Spk jobs finished since `spk_jobs` was last empty; see [`Progress::spk_jobs_completed`].
+    spk_jobs_completed: usize,
 
     /// What the jobs have gathered since the last update was handed over.
     ///
@@ -73,6 +112,8 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
             cache,
             spk_jobs: BTreeMap::new(),
             confirmation_job: None,
+            remote_tip_height: None,
+            spk_jobs_completed: 0,
             staged: Update::default(),
             user_state: electrum_streaming_client::State::new(),
         }
@@ -84,6 +125,24 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
 
     pub fn subscriptions(&self) -> &Subscriptions {
         &self.cache.subscriptions
+    }
+
+    /// How far along we are; see [`Progress`].
+    pub fn progress(&self) -> Progress {
+        let ((headers_fetched, headers_remaining), (anchors_fetched, anchors_remaining)) = self
+            .confirmation_job
+            .as_ref()
+            .map_or(((0, 0), (0, 0)), |job| job.progress(&self.cache));
+        Progress {
+            local_tip_height: self.cp.height(),
+            remote_tip_height: self.remote_tip_height,
+            spk_jobs_completed: self.spk_jobs_completed,
+            spk_jobs_pending: self.spk_jobs.len(),
+            headers_fetched,
+            headers_remaining,
+            anchors_fetched,
+            anchors_remaining,
+        }
     }
 
     /// Insert a descriptor and queue outgoing requests (if needed).
@@ -151,18 +210,22 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
         );
     }
 
+    /// Apply one message from the server.
+    ///
+    /// Returns whatever update the message completed, alongside the [`Progress`] after it.
     pub fn poll(
         &mut self,
         req_queue: &mut ReqQueue,
         raw: RawNotificationOrResponse,
-    ) -> anyhow::Result<Option<Update<K>>> {
+    ) -> anyhow::Result<(Option<Update<K>>, Progress)> {
         self.handle(req_queue, raw)?;
+        let progress = self.progress();
 
         // Any path through `handle` may have been the one that staged something, so the update is
         // handed over here rather than in each of them. Each job stages its part as soon as it
         // has it, so an update can carry a chain whose anchors are still being proven.
         if self.staged.is_empty() {
-            return Ok(None);
+            return Ok((None, progress));
         }
         let update = core::mem::take(&mut self.staged);
         tracing::info!(
@@ -171,7 +234,7 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
             txs = update.tx_update.txs.len(),
             "Handing over update"
         );
-        Ok(Some(update))
+        Ok((Some(update), progress))
     }
 
     /// Apply one message from the server, driving whatever jobs it touches.
@@ -394,6 +457,7 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
         height: u32,
         header: bdk_core::bitcoin::block::Header,
     ) -> anyhow::Result<()> {
+        self.remote_tip_height = Some(height);
         // A same-height reorg is applied without fetching anything, so this announcement is the
         // only place the replacement header is ever offered to us. Caching it here saves the
         // anchor refetch a round-trip on the very path it exists for.
@@ -457,6 +521,9 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
             spk_hash,
             spk_status,
         );
+        if self.spk_jobs.is_empty() {
+            self.spk_jobs_completed = 0;
+        }
         self.spk_jobs.insert(spk_hash, job);
         self.poll_spk_jobs(req_queue, [JobId::Spk(spk_hash)])?;
         // A notification is all that revives a cancelled job, and below the reorg window the
@@ -498,6 +565,7 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
             spk_jobs,
             spk_tracker,
             staged,
+            spk_jobs_completed,
             ..
         } = self;
 
@@ -533,6 +601,7 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
                         // so deriving the index from mere completion would tag every unused
                         // look-ahead spk as active too.
                         spk_jobs.remove(&spk_hash);
+                        *spk_jobs_completed += 1;
                         break;
                     }
                 }
