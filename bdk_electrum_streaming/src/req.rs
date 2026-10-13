@@ -105,6 +105,8 @@ pub struct ReqCoord {
     req_to_job: HashMap<JobRequest, BTreeSet<JobId>>,
     /// Bumped every time the local chain drops blocks.
     chain_generation: u64,
+    /// How many requests in `awaiting_responses` are [`JobRequest::GetTx`].
+    txs_in_flight: usize,
 }
 
 impl ReqCoord {
@@ -119,8 +121,16 @@ impl ReqCoord {
         &mut self.next_id
     }
 
+    /// Distinct transactions requested and not yet answered.
+    pub fn txs_in_flight(&self) -> usize {
+        self.txs_in_flight
+    }
+
     pub fn pop(&mut self, req_id: u32) -> Option<PoppedRequest> {
         let (request, generation) = self.awaiting_responses.remove(&req_id)?;
+        if matches!(request, JobRequest::GetTx(_)) {
+            self.txs_in_flight -= 1;
+        }
         let job_ids = self.req_to_job.remove(&request).unwrap_or_default();
         Some(PoppedRequest {
             request,
@@ -139,6 +149,9 @@ impl ReqCoord {
         self.req_to_job.retain(|req, job_ids| {
             if !job_ids.remove(&job_id) || !job_ids.is_empty() {
                 return true;
+            }
+            if matches!(req, JobRequest::GetTx(_)) {
+                self.txs_in_flight -= 1;
             }
             orphaned.push(req.clone());
             false
@@ -195,6 +208,9 @@ impl<'q> ReqQueuer<'q> {
                 let req_id = self.coord.next_id;
                 self.coord.next_id = self.coord.next_id.wrapping_add(1);
                 let generation = self.coord.chain_generation;
+                if matches!(req, JobRequest::GetTx(_)) {
+                    self.coord.txs_in_flight += 1;
+                }
                 self.coord
                     .awaiting_responses
                     .insert(req_id, (req.clone(), generation));

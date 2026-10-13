@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use anyhow::Context;
 use bdk_core::{
     bitcoin::{ScriptBuf, Txid},
-    CheckPoint, ConfirmationBlockTime,
+    BlockId, CheckPoint, ConfirmationBlockTime,
 };
 use electrum_streaming_client::{
     notification::Notification, request, AsyncPendingRequest, BlockingPendingRequest,
@@ -37,6 +37,63 @@ impl JobId {
     }
 }
 
+/// How far [`State`] has got towards matching the server, for showing to a user.
+///
+/// Returned by every [`State::poll`]. Each `*_fetched`/`*_remaining` pair counts one batch of
+/// work, so `fetched / (fetched + remaining)` is how far through that batch we are.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Progress {
+    /// Tip of the local chain.
+    pub local_tip: BlockId,
+    /// Tip the server last announced on this connection.
+    pub remote_tip: Option<BlockId>,
+    /// Whether the local chain is at `remote_tip` with every anchor proven against it.
+    ///
+    /// False while the confirmation job is working, and also when it gave up and is waiting for
+    /// the server to tell it something new (a failed proof, inconsistent headers).
+    pub chain_synced: bool,
+    /// Spk jobs finished since the last time none were pending.
+    pub spk_jobs_completed: usize,
+    /// Spk jobs still fetching histories, transactions or prevouts.
+    pub spk_jobs_pending: usize,
+    /// Distinct transactions requested from the server and not yet received.
+    ///
+    /// Grows as histories arrive and name more transactions.
+    pub txs_remaining: usize,
+    /// Headers the confirmation job has in hand for its current pass.
+    pub headers_fetched: usize,
+    /// Headers the confirmation job is still waiting on for its current pass.
+    pub headers_remaining: usize,
+    /// Anchors the confirmation job has proven in its current pass.
+    pub anchors_fetched: usize,
+    /// Anchors the confirmation job is still waiting on a proof for in its current pass.
+    pub anchors_remaining: usize,
+}
+
+impl Progress {
+    /// Whether the local chain has reached the server's tip with no work outstanding.
+    pub fn is_synced(&self) -> bool {
+        self.chain_synced && self.spk_jobs_pending == 0 && self.txs_remaining == 0
+    }
+
+    /// Rough units of work as `(done, remaining)`, for a progress bar.
+    ///
+    /// Every header, anchor, spk job and transaction counts as one unit. Not monotonic: new work
+    /// can arrive at any time and move the bar back. `remaining` is zero exactly when
+    /// [`Self::is_synced`], so a full bar is never shown early.
+    pub fn work(&self) -> (usize, usize) {
+        let done = self.headers_fetched + self.anchors_fetched + self.spk_jobs_completed;
+        let remaining = self.headers_remaining
+            + self.anchors_remaining
+            + self.spk_jobs_pending
+            + self.txs_remaining;
+        // Being unsynced with nothing counted happens when no job is working: before the server
+        // announces its tip, or after the confirmation job gave up. It is still work left.
+        let remaining = remaining.max(usize::from(!self.is_synced()));
+        (done, remaining)
+    }
+}
+
 pub type AsyncState<K = &'static str> = State<AsyncPendingRequest, K>;
 pub type BlockingState<K = &'static str> = State<BlockingPendingRequest, K>;
 
@@ -49,6 +106,11 @@ pub struct State<PReq: PendingRequest, K = &'static str> {
 
     spk_jobs: BTreeMap<ElectrumScriptHash, SpkJob>,
     confirmation_job: Option<ConfirmationJob>,
+
+    /// The last tip the server announced on this connection.
+    remote_tip: Option<BlockId>,
+    /// Spk jobs finished since `spk_jobs` was last empty; see [`Progress::spk_jobs_completed`].
+    spk_jobs_completed: usize,
 
     /// What the jobs have gathered since the last update was handed over.
     ///
@@ -73,6 +135,8 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
             cache,
             spk_jobs: BTreeMap::new(),
             confirmation_job: None,
+            remote_tip: None,
+            spk_jobs_completed: 0,
             staged: Update::default(),
             user_state: electrum_streaming_client::State::new(),
         }
@@ -84,6 +148,27 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
 
     pub fn subscriptions(&self) -> &Subscriptions {
         &self.cache.subscriptions
+    }
+
+    /// How far along we are; see [`Progress`].
+    pub fn progress(&self) -> Progress {
+        let job = self.confirmation_job.as_ref();
+        let ((headers_fetched, headers_remaining), (anchors_fetched, anchors_remaining)) =
+            job.map_or(((0, 0), (0, 0)), ConfirmationJob::progress);
+        Progress {
+            local_tip: self.cp.block_id(),
+            remote_tip: self.remote_tip,
+            chain_synced: job.is_some_and(ConfirmationJob::is_done)
+                && self.remote_tip == Some(self.cp.block_id()),
+            spk_jobs_completed: self.spk_jobs_completed,
+            spk_jobs_pending: self.spk_jobs.len(),
+            // Requests are deduplicated, so this counts each transaction once.
+            txs_remaining: self.coord.txs_in_flight(),
+            headers_fetched,
+            headers_remaining,
+            anchors_fetched,
+            anchors_remaining,
+        }
     }
 
     /// Insert a descriptor and queue outgoing requests (if needed).
@@ -120,6 +205,8 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
     pub fn start(&mut self, req_queue: &mut ReqQueue) {
         tracing::trace!("Starting state");
         self.confirmation_job = None;
+        // A new connection may be to a different server, which has yet to announce its tip.
+        self.remote_tip = None;
 
         // Resend pending requests.
         req_queue.extend(self.user_state.pending_requests());
@@ -151,18 +238,22 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
         );
     }
 
+    /// Apply one message from the server.
+    ///
+    /// Returns whatever update the message completed, alongside the [`Progress`] after it.
     pub fn poll(
         &mut self,
         req_queue: &mut ReqQueue,
         raw: RawNotificationOrResponse,
-    ) -> anyhow::Result<Option<Update<K>>> {
+    ) -> anyhow::Result<(Option<Update<K>>, Progress)> {
         self.handle(req_queue, raw)?;
+        let progress = self.progress();
 
         // Any path through `handle` may have been the one that staged something, so the update is
         // handed over here rather than in each of them. Each job stages its part as soon as it
         // has it, so an update can carry a chain whose anchors are still being proven.
         if self.staged.is_empty() {
-            return Ok(None);
+            return Ok((None, progress));
         }
         let update = core::mem::take(&mut self.staged);
         tracing::info!(
@@ -171,7 +262,7 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
             txs = update.tx_update.txs.len(),
             "Handing over update"
         );
-        Ok(Some(update))
+        Ok((Some(update), progress))
     }
 
     /// Apply one message from the server, driving whatever jobs it touches.
@@ -394,6 +485,10 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
         height: u32,
         header: bdk_core::bitcoin::block::Header,
     ) -> anyhow::Result<()> {
+        self.remote_tip = Some(BlockId {
+            height,
+            hash: header.block_hash(),
+        });
         // A same-height reorg is applied without fetching anything, so this announcement is the
         // only place the replacement header is ever offered to us. Caching it here saves the
         // anchor refetch a round-trip on the very path it exists for.
@@ -457,6 +552,9 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
             spk_hash,
             spk_status,
         );
+        if self.spk_jobs.is_empty() {
+            self.spk_jobs_completed = 0;
+        }
         self.spk_jobs.insert(spk_hash, job);
         self.poll_spk_jobs(req_queue, [JobId::Spk(spk_hash)])?;
         // A notification is all that revives a cancelled job, and below the reorg window the
@@ -498,6 +596,7 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
             spk_jobs,
             spk_tracker,
             staged,
+            spk_jobs_completed,
             ..
         } = self;
 
@@ -533,6 +632,7 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
                         // so deriving the index from mere completion would tag every unused
                         // look-ahead spk as active too.
                         spk_jobs.remove(&spk_hash);
+                        *spk_jobs_completed += 1;
                         break;
                     }
                 }

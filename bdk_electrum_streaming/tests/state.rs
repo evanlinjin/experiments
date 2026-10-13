@@ -142,7 +142,7 @@ fn drain_requests(
 ) -> Vec<Update<&'static str>> {
     let mut updates = Vec::new();
     while let Some(req) = queue.pop_front() {
-        if let Some(update) = state
+        if let (Some(update), _) = state
             .poll(queue, response(&req, server))
             .expect("must poll")
         {
@@ -169,7 +169,7 @@ fn drain_requests_proofs_first(
             .drain(..)
             .partition(|req| req.method.as_ref() == "blockchain.transaction.get_merkle");
         for req in proofs.into_iter().chain(rest) {
-            if let Some(update) = state
+            if let (Some(update), _) = state
                 .poll(queue, response(&req, server))
                 .expect("must poll")
             {
@@ -541,22 +541,30 @@ fn last_active_index_is_highest_regardless_of_notification_order() -> anyhow::Re
 
     // The higher derivation index is notified first.
     let mut updates = Vec::new();
-    updates.extend(state.poll(
-        &mut queue,
-        raw_msg(json!({
-            "jsonrpc": "2.0",
-            "method": "blockchain.scripthash.subscribe",
-            "params": [spk_hash_4.to_string(), status_4.to_string()],
-        })),
-    )?);
-    updates.extend(state.poll(
-        &mut queue,
-        raw_msg(json!({
-            "jsonrpc": "2.0",
-            "method": "blockchain.scripthash.subscribe",
-            "params": [spk_hash_3.to_string(), status_3.to_string()],
-        })),
-    )?);
+    updates.extend(
+        state
+            .poll(
+                &mut queue,
+                raw_msg(json!({
+                    "jsonrpc": "2.0",
+                    "method": "blockchain.scripthash.subscribe",
+                    "params": [spk_hash_4.to_string(), status_4.to_string()],
+                })),
+            )?
+            .0,
+    );
+    updates.extend(
+        state
+            .poll(
+                &mut queue,
+                raw_msg(json!({
+                    "jsonrpc": "2.0",
+                    "method": "blockchain.scripthash.subscribe",
+                    "params": [spk_hash_3.to_string(), status_3.to_string()],
+                })),
+            )?
+            .0,
+    );
     updates.extend(drain_requests(&mut state, &mut queue, &server));
 
     // Updates are handed over as they are staged, and revealing is monotonic, so what matters is
@@ -705,7 +713,7 @@ fn merkle_proof_predating_a_reorg_is_not_taken_as_a_failed_anchor() -> anyhow::R
 
     // The held answer proves inclusion in the block which was evicted, not in the one which
     // replaced it.
-    updates.extend(state.poll(&mut queue, stale_resp)?);
+    updates.extend(state.poll(&mut queue, stale_resp)?.0);
     updates.extend(drain_requests(&mut state, &mut queue, &server));
 
     let anchors = updates
@@ -774,7 +782,7 @@ fn anchors_staged_before_a_reorg_are_not_emitted_after_it() -> anyhow::Result<()
         })),
     )?;
     let mut updates = drain_requests(&mut state, &mut queue, &server);
-    updates.extend(state.poll(&mut queue, held_resp)?);
+    updates.extend(state.poll(&mut queue, held_resp)?.0);
     updates.extend(drain_requests(&mut state, &mut queue, &server));
 
     let anchors = updates
@@ -912,14 +920,18 @@ fn merkle_error_predating_a_reorg_is_not_taken_as_a_failed_anchor() -> anyhow::R
     // The held request was received while the tx was out of its block, so it is answered with
     // an error — the wording is the one romanz/electrs really sends, a bare JSON string which
     // conflates a genuine fault with the everyday reorg.
-    updates.extend(state.poll(
-        &mut queue,
-        raw_msg(json!({
-            "jsonrpc": "2.0",
-            "id": stale_req.id,
-            "error": "tx not found or is unconfirmed",
-        })),
-    )?);
+    updates.extend(
+        state
+            .poll(
+                &mut queue,
+                raw_msg(json!({
+                    "jsonrpc": "2.0",
+                    "id": stale_req.id,
+                    "error": "tx not found or is unconfirmed",
+                })),
+            )?
+            .0,
+    );
     updates.extend(drain_requests(&mut state, &mut queue, &server));
 
     assert!(
@@ -1255,7 +1267,7 @@ fn header_fetched_before_a_reorg_is_not_spliced_into_the_chain() -> anyhow::Resu
     let mut updates = drain_requests(&mut state, &mut queue, &server);
 
     // The held answer describes the chain we have left behind.
-    updates.extend(state.poll(&mut queue, stale_resp)?);
+    updates.extend(state.poll(&mut queue, stale_resp)?.0);
     updates.extend(drain_requests(&mut state, &mut queue, &server));
 
     let tip = updates
@@ -1359,7 +1371,7 @@ fn a_replayed_job_does_not_displace_one_the_server_started() -> anyhow::Result<(
         })),
     )?;
     let mut updates = drain_requests(&mut state, &mut queue, &server);
-    updates.extend(state.poll(&mut queue, response(&held_req, &server))?);
+    updates.extend(state.poll(&mut queue, response(&held_req, &server))?.0);
     updates.extend(drain_requests(&mut state, &mut queue, &server));
 
     assert!(
@@ -1889,7 +1901,7 @@ fn a_tip_that_moves_while_headers_are_in_flight_is_not_lost() -> anyhow::Result<
     // The held answer describes the chain the server has left.
     let mut updates = Vec::new();
     for resp in held_resp {
-        updates.extend(state.poll(&mut queue, resp)?);
+        updates.extend(state.poll(&mut queue, resp)?.0);
     }
     updates.extend(drain_requests(&mut state, &mut queue, &server));
 
@@ -2185,7 +2197,7 @@ fn confirmation_job_runs_ahead_of_the_scripts() -> anyhow::Result<()> {
     // transaction and its anchor.
     let mut updates = Vec::new();
     for req in deferred {
-        updates.extend(state.poll(&mut queue, response(&req, &server))?);
+        updates.extend(state.poll(&mut queue, response(&req, &server))?.0);
     }
     updates.extend(drain_requests(&mut state, &mut queue, &server));
     assert!(
@@ -2213,7 +2225,7 @@ fn confirmation_job_runs_ahead_of_the_scripts() -> anyhow::Result<()> {
             "params": [{ "hex": serialize_hex(&header_2), "height": 2 }],
         })),
     )?;
-    assert!(again.is_none(), "an update must not be handed over twice");
+    assert!(again.0.is_none(), "an update must not be handed over twice");
     assert!(
         drain_requests(&mut state, &mut queue, &server).is_empty(),
         "a job with nothing left to do must not republish",
@@ -2248,7 +2260,7 @@ fn a_transaction_that_is_not_the_one_asked_for_is_rejected() -> anyhow::Result<(
     // impostor. The subscribe response carries the status, so this drives the whole flow.
     state.start(&mut queue);
     let mut substituted = false;
-    let mut result = Ok(None);
+    let mut result = Ok((None, Default::default()));
     while let Some(req) = queue.pop_front() {
         let msg = if req.method.as_ref() == "blockchain.transaction.get" {
             substituted = true;
@@ -2333,14 +2345,18 @@ fn history_response_replaces_the_expected_txids() -> anyhow::Result<()> {
     // Everything the script had is now gone, so the server reports no history at all.
     server.txs.clear();
     let mut updates = Vec::new();
-    updates.extend(state.poll(
-        &mut queue,
-        raw_msg(json!({
-            "jsonrpc": "2.0",
-            "method": "blockchain.scripthash.subscribe",
-            "params": [spk_hash.to_string(), serde_json::Value::Null],
-        })),
-    )?);
+    updates.extend(
+        state
+            .poll(
+                &mut queue,
+                raw_msg(json!({
+                    "jsonrpc": "2.0",
+                    "method": "blockchain.scripthash.subscribe",
+                    "params": [spk_hash.to_string(), serde_json::Value::Null],
+                })),
+            )?
+            .0,
+    );
     updates.extend(drain_requests(&mut state, &mut queue, &server));
 
     assert_eq!(
@@ -2378,7 +2394,7 @@ fn eviction_survives_its_job_being_replaced() -> anyhow::Result<()> {
         if req.method.as_ref() == "blockchain.transaction.get" {
             deferred.push(req);
         } else {
-            updates.extend(state.poll(&mut queue, response(&req, &server))?);
+            updates.extend(state.poll(&mut queue, response(&req, &server))?.0);
         }
     }
     assert!(
@@ -2389,16 +2405,20 @@ fn eviction_survives_its_job_being_replaced() -> anyhow::Result<()> {
     // The server announces the same status again, which replaces the job.
     let status = ElectrumScriptStatus::from_history(&server.history(&json!(spk_hash.to_string())))
         .expect("history is not empty");
-    updates.extend(state.poll(
-        &mut queue,
-        raw_msg(json!({
-            "jsonrpc": "2.0",
-            "method": "blockchain.scripthash.subscribe",
-            "params": [spk_hash.to_string(), status.to_string()],
-        })),
-    )?);
+    updates.extend(
+        state
+            .poll(
+                &mut queue,
+                raw_msg(json!({
+                    "jsonrpc": "2.0",
+                    "method": "blockchain.scripthash.subscribe",
+                    "params": [spk_hash.to_string(), status.to_string()],
+                })),
+            )?
+            .0,
+    );
     for req in deferred {
-        updates.extend(state.poll(&mut queue, response(&req, &server))?);
+        updates.extend(state.poll(&mut queue, response(&req, &server))?.0);
     }
     updates.extend(drain_requests(&mut state, &mut queue, &server));
 
@@ -2432,5 +2452,136 @@ fn expected_txids_survive_a_reconnect() -> anyhow::Result<()> {
 
     let updates = drain_requests(&mut state, &mut queue, &server);
     assert_eq!(evicted(&updates), vec![cancelled]);
+    Ok(())
+}
+
+/// Progress counts the work of a sync down to nothing, and only then reports it synced.
+#[test]
+fn progress_counts_down_to_synced() -> anyhow::Result<()> {
+    let (descriptor, _spk_hash, spk) = tracked_descriptor()?;
+    let tx = tx_paying(&spk, 50_000);
+    let txid = tx.compute_txid();
+    let (genesis, header_1) = base_headers();
+    let header_2 = block_with_tx(&header_1, txid, 200, 0);
+    let tip_2 = BlockId {
+        height: 2,
+        hash: header_2.block_hash(),
+    };
+
+    let mut state = new_state(Cache::default(), descriptor, genesis);
+    let mut queue = ReqQueue::new();
+    let server = Server {
+        headers: vec![genesis, header_1, header_2],
+        txs: vec![(tx, 2)],
+        merkle_proof: (Vec::new(), 0),
+    };
+
+    state.start(&mut queue);
+    assert!(!state.progress().is_synced(), "nothing is known yet");
+    assert_eq!(
+        state.progress().work(),
+        (0, 1),
+        "unsynced, so there is work left"
+    );
+    let mut seen = Vec::new();
+    while let Some(req) = queue.pop_front() {
+        let (_, progress) = state.poll(&mut queue, response(&req, &server))?;
+        assert_eq!(progress, state.progress());
+        assert_eq!(progress.work().1 == 0, progress.is_synced(), "{progress:?}");
+        seen.push(progress);
+    }
+
+    assert!(seen
+        .iter()
+        .any(|p| p.remote_tip == Some(tip_2) && p.local_tip.height == 0 && !p.is_synced()));
+    assert!(seen.iter().any(|p| p.spk_jobs_pending > 0));
+    assert!(seen.iter().any(|p| p.txs_remaining == 1));
+    assert!(seen.iter().any(|p| p.headers_remaining > 0));
+    assert!(seen.iter().any(|p| p.anchors_remaining == 1));
+    let last = seen.last().expect("must have polled");
+    assert_eq!(last.local_tip, tip_2);
+    assert_eq!(last.txs_remaining, 0);
+    assert!(last.spk_jobs_completed > 0);
+    assert!(last.is_synced(), "{last:?}");
+    assert!(matches!(last.work(), (done, 0) if done > 0));
+    assert!(seen
+        .iter()
+        .any(|p| matches!(p.work(), (done, remaining) if done > 0 && remaining > 0)));
+    Ok(())
+}
+
+/// A proof the server fails to give leaves the anchor unproven, so the tips matching must not be
+/// read as synced.
+#[test]
+fn a_failed_proof_is_not_synced() -> anyhow::Result<()> {
+    let (descriptor, _spk_hash, spk) = tracked_descriptor()?;
+    let tx = tx_paying(&spk, 50_000);
+    let txid = tx.compute_txid();
+    let (genesis, header_1) = base_headers();
+    let header_2 = block_with_tx(&header_1, txid, 200, 0);
+
+    let mut state = new_state(Cache::default(), descriptor, genesis);
+    let mut queue = ReqQueue::new();
+    let server = Server {
+        headers: vec![genesis, header_1, header_2],
+        txs: vec![(tx, 2)],
+        merkle_proof: (Vec::new(), 0),
+    };
+
+    state.start(&mut queue);
+    while let Some(req) = queue.pop_front() {
+        let resp = if req.method.as_ref() == "blockchain.transaction.get_merkle" {
+            raw_msg(json!({
+                "jsonrpc": "2.0",
+                "id": req.id,
+                "error": { "code": 1, "message": "server busy" },
+            }))
+        } else {
+            response(&req, &server)
+        };
+        state.poll(&mut queue, resp)?;
+    }
+
+    let progress = state.progress();
+    assert_eq!(progress.remote_tip, Some(progress.local_tip));
+    assert!(!progress.chain_synced, "{progress:?}");
+    assert!(!progress.is_synced());
+    assert!(
+        progress.work().1 > 0,
+        "the bar must not look full: {progress:?}"
+    );
+    Ok(())
+}
+
+/// A new connection may be to another server, so the last one's tip must not carry over.
+#[test]
+fn restarting_forgets_the_remote_tip() -> anyhow::Result<()> {
+    let (descriptor, _spk_hash, spk) = tracked_descriptor()?;
+    let tx = tx_paying(&spk, 50_000);
+    let txid = tx.compute_txid();
+    let (genesis, header_1) = base_headers();
+    let header_2 = block_with_tx(&header_1, txid, 200, 0);
+
+    let mut state = new_state(Cache::default(), descriptor, genesis);
+    let mut queue = ReqQueue::new();
+    let server = Server {
+        headers: vec![genesis, header_1, header_2],
+        txs: vec![(tx, 2)],
+        merkle_proof: (Vec::new(), 0),
+    };
+
+    state.start(&mut queue);
+    drain_requests(&mut state, &mut queue, &server);
+    assert!(state.progress().is_synced());
+
+    queue.clear();
+    state.start(&mut queue);
+    let progress = state.progress();
+    assert_eq!(progress.remote_tip, None);
+    assert!(!progress.is_synced());
+    assert!(
+        progress.work().1 > 0,
+        "the bar must not look full: {progress:?}"
+    );
     Ok(())
 }

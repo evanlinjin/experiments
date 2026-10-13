@@ -15,15 +15,20 @@ pub enum ConfirmationStage {
     Init,
     FetchBlocks {
         to_fetch: BTreeSet<u32>,
+        /// How many of `to_fetch` we have no header for yet.
+        remaining: usize,
     },
     FetchAnchors {
         to_fetch: BTreeSet<(u32, Txid)>,
+        /// How many of `to_fetch` were unproven as of the last poll.
+        remaining: usize,
     },
-    /// Nothing left to do until the target tip or the statuses move.
-    ///
-    /// Reached once the anchors are handed over, or when the job is abandoned on inconsistent
-    /// headers.
+    /// The anchors are handed over: the local chain is at the target tip and every anchor is
+    /// proven against it. Nothing left to do until the target tip or the statuses move.
     Waiting,
+    /// Abandoned on inconsistent headers. Nothing left to do until the target tip or the statuses
+    /// move, but unlike [`Self::Waiting`] the pass never finished.
+    Abandoned,
 }
 
 impl ConfirmationStage {
@@ -31,7 +36,7 @@ impl ConfirmationStage {
         cache: &Cache,
         spk_statuses: impl IntoIterator<Item = ElectrumScriptStatus>,
     ) -> Self {
-        let to_fetch = cache
+        let to_fetch: BTreeSet<_> = cache
             .subscriptions
             .spk_histories(spk_statuses)
             .filter_map(|tx| {
@@ -39,7 +44,11 @@ impl ConfirmationStage {
                 Some((conf_height, tx.txid()))
             })
             .collect();
-        Self::FetchAnchors { to_fetch }
+        let remaining = to_fetch.len();
+        Self::FetchAnchors {
+            to_fetch,
+            remaining,
+        }
     }
 }
 
@@ -156,6 +165,32 @@ impl ConfirmationJob {
         reorged
     }
 
+    /// The current pass's headers and anchors, each as `(fetched, remaining)`.
+    ///
+    /// Kept in the stage, so a pass that is abandoned or restarted takes its numbers with it.
+    /// Both are zero outside their stage.
+    pub fn progress(&self) -> ((usize, usize), (usize, usize)) {
+        match &self.stage {
+            ConfirmationStage::FetchBlocks {
+                to_fetch,
+                remaining,
+            } => ((to_fetch.len() - remaining, *remaining), (0, 0)),
+            ConfirmationStage::FetchAnchors {
+                to_fetch,
+                remaining,
+            } => ((0, 0), (to_fetch.len() - remaining, *remaining)),
+            ConfirmationStage::Init | ConfirmationStage::Waiting | ConfirmationStage::Abandoned => {
+                ((0, 0), (0, 0))
+            }
+        }
+    }
+
+    /// Whether the pass finished: the local chain reached the target tip and every anchor is
+    /// proven against it.
+    pub fn is_done(&self) -> bool {
+        matches!(self.stage, ConfirmationStage::Waiting)
+    }
+
     pub fn set_statuses(&mut self, statuses: impl IntoIterator<Item = ElectrumScriptStatus>) {
         let statuses = statuses.into_iter().collect::<BTreeSet<_>>();
         if self.target_statuses != statuses {
@@ -166,7 +201,18 @@ impl ConfirmationJob {
 
     /// Answer the heights the job asked for.
     pub fn resolve_blocks(&mut self, blocks: impl IntoIterator<Item = (u32, Header)>) {
-        self.fetched_headers.extend(blocks);
+        for (height, header) in blocks {
+            let is_new = self.fetched_headers.insert(height, header).is_none();
+            if let ConfirmationStage::FetchBlocks {
+                to_fetch,
+                remaining,
+            } = &mut self.stage
+            {
+                if is_new && to_fetch.contains(&height) {
+                    *remaining -= 1;
+                }
+            }
+        }
     }
 
     /// Polls the job as far as it will go.
@@ -184,6 +230,7 @@ impl ConfirmationJob {
                 // changes between calls to `ConfirmationJob::poll`. Let's not fix it here as we will
                 // change this crate to download all headers and verify PoW later so there will be
                 // no need for this logic.
+                let mut remaining = 0;
                 let mut start_height_opt = Option::<u32>::None;
                 let mut iter = to_fetch
                     .iter()
@@ -191,6 +238,7 @@ impl ConfirmationJob {
                     .filter(|h| !self.fetched_headers.contains_key(h))
                     .peekable();
                 while let Some(h) = iter.next() {
+                    remaining += 1;
                     if start_height_opt.is_none() {
                         start_height_opt = Some(h);
                     }
@@ -208,15 +256,28 @@ impl ConfirmationJob {
                     start_height_opt = None;
                 }
 
-                self.stage = ConfirmationStage::FetchBlocks { to_fetch };
+                self.stage = ConfirmationStage::FetchBlocks {
+                    to_fetch,
+                    remaining,
+                };
                 Ok(ConfirmationProgress::Continue)
             }
-            ConfirmationStage::FetchBlocks { to_fetch } => {
-                if !to_fetch
-                    .iter()
-                    .all(|h| self.fetched_headers.contains_key(h))
-                {
-                    self.stage = ConfirmationStage::FetchBlocks { to_fetch };
+            ConfirmationStage::FetchBlocks {
+                to_fetch,
+                remaining,
+            } => {
+                debug_assert_eq!(
+                    remaining,
+                    to_fetch
+                        .iter()
+                        .filter(|h| !self.fetched_headers.contains_key(h))
+                        .count(),
+                );
+                if remaining > 0 {
+                    self.stage = ConfirmationStage::FetchBlocks {
+                        to_fetch,
+                        remaining,
+                    };
                     return Ok(ConfirmationProgress::Blocked);
                 }
 
@@ -239,7 +300,7 @@ impl ConfirmationJob {
                                 "Fetched headers are inconsistent. Reorg? Abandoning."
                             );
                             self.reset_headers();
-                            self.stage = ConfirmationStage::Waiting;
+                            self.stage = ConfirmationStage::Abandoned;
                             return Ok(ConfirmationProgress::Blocked);
                         }
                     }
@@ -298,9 +359,9 @@ impl ConfirmationJob {
                     evicted: evicted_heights,
                 })
             }
-            ConfirmationStage::FetchAnchors { to_fetch } => {
+            ConfirmationStage::FetchAnchors { to_fetch, .. } => {
                 let mut resolved = AnchorUpdate::new();
-                let mut all_resolved = true;
+                let mut remaining = 0;
                 for &(height, txid) in &to_fetch {
                     let header = match self.fetched_headers.get(&height) {
                         Some(header) => header,
@@ -321,24 +382,27 @@ impl ConfirmationJob {
                             resolved.insert((anchor, txid));
                         }
                         None => {
-                            all_resolved = false;
+                            remaining += 1;
                             queuer.enqueue(request::GetTxMerkle { txid, height });
                         }
                     }
                 }
-                if !all_resolved {
+                if remaining > 0 {
                     // The whole set is kept, not just what is left: each pass resolves all of it
                     // afresh against the chain as it stands right then, so a reorg landing
                     // midway cannot leave anchors from two chains in one update.
-                    self.stage = ConfirmationStage::FetchAnchors { to_fetch };
+                    self.stage = ConfirmationStage::FetchAnchors {
+                        to_fetch,
+                        remaining,
+                    };
                     return Ok(ConfirmationProgress::Blocked);
                 }
                 self.stage = ConfirmationStage::Waiting;
                 Ok(ConfirmationProgress::AnchorUpdate(resolved))
             }
-            // `poll` took the stage, so the terminal stage has to put itself back.
-            ConfirmationStage::Waiting => {
-                self.stage = ConfirmationStage::Waiting;
+            // `poll` took the stage, so the terminal stages have to put themselves back.
+            stage @ (ConfirmationStage::Waiting | ConfirmationStage::Abandoned) => {
+                self.stage = stage;
                 Ok(ConfirmationProgress::Blocked)
             }
         }

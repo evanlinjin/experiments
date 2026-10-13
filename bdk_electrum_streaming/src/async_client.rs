@@ -10,7 +10,7 @@ use futures::{channel::mpsc, SinkExt, StreamExt};
 use futures::{pin_mut, select, FutureExt, TryFutureExt};
 use miniscript::{Descriptor, DescriptorPublicKey};
 
-use crate::{AsyncClientAction, AsyncState, ReqQueue, Update};
+use crate::{AsyncClientAction, AsyncState, Progress, ReqQueue, Update};
 
 #[derive(Debug, Clone)]
 pub struct AsyncClient<K> {
@@ -87,11 +87,14 @@ impl<K: Sync + Send + 'static> AsyncClient<K> {
 ///
 /// * The transport is provided with the `read` and `write` halfs separately.
 /// * `update_tx` is the sending end of the update channel. Wallet updates will be sent through here.
+/// * `progress_tx` is the sending end of the progress channel. [`Progress`] is sent whenever it
+///   changes. It is informational only, so a dropped receiver does not stop the state machine.
 /// * `client_rx` is the receiving end of the client channel. The sending end can be transformed
 ///   into a [`AsyncClient`] for requests.
 pub async fn run_async<K, R, W>(
     state: &mut AsyncState<K>,
     update_tx: &mut mpsc::UnboundedSender<Update<K>>,
+    progress_tx: &mut mpsc::UnboundedSender<Progress>,
     client_rx: &mut AsyncReceiver<K>,
     read: R,
     write: W,
@@ -101,13 +104,14 @@ where
     R: futures::io::AsyncRead + Unpin,
     W: futures::io::AsyncWrite + Unpin,
 {
-    let res = _run_async(state, update_tx, client_rx, read, write).await;
+    let res = _run_async(state, update_tx, progress_tx, client_rx, read, write).await;
     res
 }
 
 async fn _run_async<K, R, W>(
     state: &mut AsyncState<K>,
     update_tx: &mut mpsc::UnboundedSender<Update<K>>,
+    progress_tx: &mut mpsc::UnboundedSender<Progress>,
     client_rx: &mut AsyncReceiver<K>,
     read: R,
     mut write: W,
@@ -123,6 +127,7 @@ where
         electrum_streaming_client::io::ReadStreamer::new(futures::io::BufReader::new(read));
     let mut req_queue = ReqQueue::new();
     state.start(&mut req_queue);
+    let mut last_progress = Option::<Progress>::None;
 
     let read_fut = async move {
         loop {
@@ -153,8 +158,12 @@ where
                             );
                         },
                     };
-                    if let Some(update) = state.poll(&mut req_queue, raw)? {
+                    let (update, progress) = state.poll(&mut req_queue, raw)?;
+                    if let Some(update) = update {
                         update_tx.unbounded_send(update).map_err(|err| anyhow::anyhow!(err.to_string()))?;
+                    }
+                    if last_progress.replace(progress) != Some(progress) {
+                        let _ = progress_tx.unbounded_send(progress);
                     }
                 }
                 opt = client_rx.next().fuse() => {

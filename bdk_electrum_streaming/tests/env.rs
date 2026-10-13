@@ -100,6 +100,8 @@ fn blocking_env() -> anyhow::Result<()> {
     );
 
     let (mut update_tx, update_rx) = std::sync::mpsc::channel::<Update<&'static str>>();
+
+    let mut progress_tx = std::sync::mpsc::channel().0;
     let (client, mut client_rx) = BlockingClient::new();
 
     let conn = std::net::TcpStream::connect(&electrum_url)?;
@@ -109,6 +111,7 @@ fn blocking_env() -> anyhow::Result<()> {
             &mut state,
             &AtomicBool::new(false),
             &mut update_tx,
+            &mut progress_tx,
             &mut client_rx,
             &run_conn,
             &run_conn,
@@ -186,6 +189,8 @@ async fn env() -> anyhow::Result<()> {
     );
 
     let (mut update_tx, mut update_rx) = mpsc::unbounded::<Update<&'static str>>();
+
+    let mut progress_tx = mpsc::unbounded().0;
     let (client, mut client_rx) = AsyncClient::new();
 
     let run_handle = tokio::spawn(async move {
@@ -194,6 +199,7 @@ async fn env() -> anyhow::Result<()> {
         run_async(
             &mut state,
             &mut update_tx,
+            &mut progress_tx,
             &mut client_rx,
             read.compat(),
             write.compat_write(),
@@ -284,6 +290,8 @@ async fn new_block_confirmation_is_anchored_live() -> anyhow::Result<()> {
     );
 
     let (mut update_tx, mut update_rx) = mpsc::unbounded::<Update<&'static str>>();
+
+    let mut progress_tx = mpsc::unbounded().0;
     let (client, mut client_rx) = AsyncClient::new();
 
     let run_handle = tokio::spawn(async move {
@@ -292,6 +300,7 @@ async fn new_block_confirmation_is_anchored_live() -> anyhow::Result<()> {
         run_async(
             &mut state,
             &mut update_tx,
+            &mut progress_tx,
             &mut client_rx,
             read.compat(),
             write.compat_write(),
@@ -445,6 +454,8 @@ impl LiveWallet {
         );
 
         let (mut update_tx, mut update_rx) = mpsc::unbounded::<Update<&'static str>>();
+
+        let mut progress_tx = mpsc::unbounded().0;
         let (client, mut client_rx) = AsyncClient::new();
 
         let run_handle = tokio::spawn(async move {
@@ -453,6 +464,7 @@ impl LiveWallet {
             run_async(
                 &mut state,
                 &mut update_tx,
+                &mut progress_tx,
                 &mut client_rx,
                 read.compat(),
                 write.compat_write(),
@@ -774,6 +786,7 @@ fn spawn_session(
         chain.tip(),
     );
     let (mut update_tx, update_rx) = mpsc::unbounded::<Update<&'static str>>();
+    let mut progress_tx = mpsc::unbounded().0;
     let (client, mut client_rx) = AsyncClient::new();
     let electrum_url = electrum_url.to_string();
 
@@ -783,6 +796,7 @@ fn spawn_session(
         run_async(
             &mut state,
             &mut update_tx,
+            &mut progress_tx,
             &mut client_rx,
             read.compat(),
             write.compat_write(),
