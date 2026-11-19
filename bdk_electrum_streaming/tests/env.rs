@@ -36,21 +36,13 @@ fn init() {
         .try_init();
 }
 
-/// The expected txids the client needs for `keychain`: every txid the wallet's canonical view
-/// says the chain source should still be reporting under one of that keychain's spks. This is the
-/// whole integration -- the client cannot derive it, because a transaction cancelled while the
-/// client was not running left no trace in anything the client can see.
-fn expected_spk_txids(
-    chain: &LocalChain,
-    graph: &Graph,
-    keychain: &'static str,
-) -> Vec<(ScriptBuf, Txid)> {
+/// The expected txids the client needs: every txid the wallet's canonical view says the chain
+/// source should still be reporting under one of its spks. This is the whole integration -- the
+/// client cannot derive it, because a transaction cancelled while the client was not running left
+/// no trace in anything the client can see.
+fn expected_spk_txids(chain: &LocalChain, graph: &Graph) -> Vec<(ScriptBuf, Txid)> {
     graph
-        .list_expected_spk_txids(
-            chain,
-            chain.tip().block_id(),
-            (keychain, u32::MIN)..=(keychain, u32::MAX),
-        )
+        .list_expected_spk_txids(chain, chain.tip().block_id(), ..)
         .collect()
 }
 
@@ -89,8 +81,8 @@ fn blocking_env() -> anyhow::Result<()> {
     let (mut chain, _cs) = LocalChain::from_genesis_hash(env.genesis_hash()?);
 
     let mut spk_tracker = DerivedSpkTracker::<&'static str>::new(LOOKAHEAD);
-    spk_tracker.insert_descriptor(EXTERNAL, external, 0, []);
-    spk_tracker.insert_descriptor(INTERNAL, internal, 0, []);
+    spk_tracker.insert_descriptor(EXTERNAL, external, 0);
+    spk_tracker.insert_descriptor(INTERNAL, internal, 0);
 
     let mut state = BlockingState::new(
         ReqCoord::default(),
@@ -175,8 +167,8 @@ async fn env() -> anyhow::Result<()> {
     let (mut chain, _cs) = LocalChain::from_genesis_hash(env.genesis_hash()?);
 
     let mut spk_tracker = DerivedSpkTracker::<&'static str>::new(LOOKAHEAD);
-    spk_tracker.insert_descriptor(EXTERNAL, external, 0, []);
-    spk_tracker.insert_descriptor(INTERNAL, internal, 0, []);
+    spk_tracker.insert_descriptor(EXTERNAL, external, 0);
+    spk_tracker.insert_descriptor(INTERNAL, internal, 0);
 
     let mut state = AsyncState::new(
         ReqCoord::default(),
@@ -273,8 +265,8 @@ async fn new_block_confirmation_is_anchored_live() -> anyhow::Result<()> {
     let (mut chain, _cs) = LocalChain::from_genesis_hash(env.genesis_hash()?);
 
     let mut spk_tracker = DerivedSpkTracker::<&'static str>::new(LOOKAHEAD);
-    spk_tracker.insert_descriptor(EXTERNAL, external, 0, []);
-    spk_tracker.insert_descriptor(INTERNAL, internal, 0, []);
+    spk_tracker.insert_descriptor(EXTERNAL, external, 0);
+    spk_tracker.insert_descriptor(INTERNAL, internal, 0);
 
     let mut state = AsyncState::new(
         ReqCoord::default(),
@@ -434,8 +426,8 @@ impl LiveWallet {
         let (mut chain, _cs) = LocalChain::from_genesis_hash(env.genesis_hash()?);
 
         let mut spk_tracker = DerivedSpkTracker::<&'static str>::new(LOOKAHEAD);
-        spk_tracker.insert_descriptor(EXTERNAL, external, 0, []);
-        spk_tracker.insert_descriptor(INTERNAL, internal, 0, []);
+        spk_tracker.insert_descriptor(EXTERNAL, external, 0);
+        spk_tracker.insert_descriptor(INTERNAL, internal, 0);
 
         let mut state = AsyncState::new(
             ReqCoord::default(),
@@ -754,18 +746,9 @@ fn spawn_session(
             .last_revealed_index(keychain)
             .map_or(0, |last| last + 1)
     };
-    spk_tracker.insert_descriptor(
-        EXTERNAL,
-        external,
-        next_index(EXTERNAL),
-        expected_spk_txids(chain, graph, EXTERNAL),
-    );
-    spk_tracker.insert_descriptor(
-        INTERNAL,
-        internal,
-        next_index(INTERNAL),
-        expected_spk_txids(chain, graph, INTERNAL),
-    );
+    spk_tracker.insert_descriptor(EXTERNAL, external, next_index(EXTERNAL));
+    spk_tracker.insert_descriptor(INTERNAL, internal, next_index(INTERNAL));
+    spk_tracker.insert_expected_spk_txids(expected_spk_txids(chain, graph));
 
     let mut state = AsyncState::new(
         ReqCoord::default(),

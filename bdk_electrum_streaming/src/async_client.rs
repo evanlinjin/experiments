@@ -52,16 +52,11 @@ impl<K: Sync + Send + 'static> AsyncClient<K> {
     }
 
     /// Track `descriptor` under `keychain` through `next_index` plus lookahead.
-    ///
-    /// `expected_spk_txids` are the txids we expect the server to report for the spks this
-    /// registers; see
-    /// [`DerivedSpkTracker::insert_descriptor`](crate::DerivedSpkTracker::insert_descriptor).
     pub fn track_descriptor<D>(
         &self,
         keychain: K,
         descriptor: D,
         next_index: u32,
-        expected_spk_txids: impl IntoIterator<Item = (ScriptBuf, Txid)>,
     ) -> anyhow::Result<()>
     where
         D: Into<Box<Descriptor<DescriptorPublicKey>>>,
@@ -72,8 +67,21 @@ impl<K: Sync + Send + 'static> AsyncClient<K> {
                 keychain,
                 descriptor: descriptor.into(),
                 next_index,
-                expected_spk_txids: expected_spk_txids.into_iter().collect(),
             })?)
+    }
+
+    /// Add to the txids we expect the server to report, such as the output of
+    /// `TxGraph::list_expected_spk_txids`; see
+    /// [`DerivedSpkTracker::insert_expected_spk_txids`](crate::DerivedSpkTracker::insert_expected_spk_txids).
+    pub fn expect_spk_txids(
+        &self,
+        expected_spk_txids: impl IntoIterator<Item = (ScriptBuf, Txid)>,
+    ) -> anyhow::Result<()> {
+        Ok(self
+            .client_tx
+            .unbounded_send(AsyncClientAction::ExpectSpkTxids(
+                expected_spk_txids.into_iter().collect(),
+            ))?)
     }
 
     pub async fn stop(&self) -> anyhow::Result<()> {
@@ -166,8 +174,11 @@ where
                         crate::ClientAction::Request(batch) => {
                             state.user_request(&mut req_queue, batch);
                         },
-                        crate::ClientAction::AddDescriptor { keychain, descriptor, next_index, expected_spk_txids } => {
-                            state.insert_descriptor(&mut req_queue, keychain, *descriptor, next_index, expected_spk_txids);
+                        crate::ClientAction::AddDescriptor { keychain, descriptor, next_index } => {
+                            state.insert_descriptor(&mut req_queue, keychain, *descriptor, next_index);
+                        },
+                        crate::ClientAction::ExpectSpkTxids(expected_spk_txids) => {
+                            state.insert_expected_spk_txids(&mut req_queue, expected_spk_txids);
                         },
                         crate::ClientAction::Stop => {
                             tracing::info!("Client sent stop signal");                           

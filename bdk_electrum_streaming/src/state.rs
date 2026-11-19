@@ -87,23 +87,35 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
     }
 
     /// Insert a descriptor and queue outgoing requests (if needed).
-    /// `expected_spk_txids` are the txids we expect the server to report for the spks this
-    /// registers; see [`DerivedSpkTracker::insert_descriptor`].
     pub fn insert_descriptor(
         &mut self,
         req_queue: &mut ReqQueue,
         keychain: K,
         descriptor: Descriptor<DescriptorPublicKey>,
         next_index: u32,
+    ) {
+        let new_script_hashes = self
+            .spk_tracker
+            .insert_descriptor(keychain, descriptor, next_index);
+        for script_hash in new_script_hashes {
+            let mut queuer = self.coord.queuer(req_queue, JobId::Spk(script_hash));
+            queuer.enqueue(request::ScriptHashSubscribe { script_hash });
+        }
+    }
+
+    /// Add to the txids we expect the server to report; see
+    /// [`DerivedSpkTracker::insert_expected_spk_txids`].
+    pub fn insert_expected_spk_txids(
+        &mut self,
+        req_queue: &mut ReqQueue,
         expected_spk_txids: impl IntoIterator<Item = (ScriptBuf, Txid)>,
     ) {
-        let new_script_hashes = self.spk_tracker.insert_descriptor(
-            keychain,
-            descriptor,
-            next_index,
-            expected_spk_txids,
-        );
-        for script_hash in new_script_hashes {
+        for script_hash in self
+            .spk_tracker
+            .insert_expected_spk_txids(expected_spk_txids)
+        {
+            // The spk's history may already be in, and nothing compares a new expectation against
+            // it until the server next notifies. Resubscribing makes the server report it now.
             let mut queuer = self.coord.queuer(req_queue, JobId::Spk(script_hash));
             queuer.enqueue(request::ScriptHashSubscribe { script_hash });
         }
@@ -508,7 +520,7 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
             };
             loop {
                 let mut queuer = coord.queuer(req_queue, JobId::Spk(spk_hash));
-                // The tracker's own set, so the job never holds a copy that a `track_descriptor`
+                // The tracker's own set, so the job never holds a copy that an `expect_spk_txids`
                 // arriving mid-job could fall behind.
                 let expected_txids = spk_tracker.expected_txids(spk_hash);
                 let progress = job.poll(&mut queuer, cache, expected_txids)?;
