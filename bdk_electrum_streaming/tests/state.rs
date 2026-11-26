@@ -279,7 +279,7 @@ fn new_state_with_cp(
     cp: CheckPoint,
 ) -> BlockingState {
     let mut spk_tracker = DerivedSpkTracker::new(0);
-    spk_tracker.insert_descriptor("external", descriptor, 0, []);
+    spk_tracker.insert_descriptor("external", descriptor, 0);
     BlockingState::new(ReqCoord::default(), cache, spk_tracker, cp)
 }
 
@@ -290,7 +290,8 @@ fn new_state_expecting(
     expected: impl IntoIterator<Item = (ScriptBuf, Txid)>,
 ) -> BlockingState {
     let mut spk_tracker = DerivedSpkTracker::new(0);
-    spk_tracker.insert_descriptor("external", descriptor, 0, expected);
+    spk_tracker.insert_descriptor("external", descriptor, 0);
+    spk_tracker.insert_expected_spk_txids(expected);
     BlockingState::new(
         ReqCoord::default(),
         Cache::default(),
@@ -422,7 +423,7 @@ fn descriptor_inserted_mid_connection_is_subscribed() -> anyhow::Result<()> {
     state.start(&mut queue);
     queue.clear();
 
-    state.insert_descriptor(&mut queue, "external", descriptor, 0, []);
+    state.insert_descriptor(&mut queue, "external", descriptor, 0);
     assert!(
         queue
             .iter()
@@ -451,7 +452,7 @@ fn last_active_index_is_index_of_active_spk() -> anyhow::Result<()> {
     let header_2 = block_with_tx(&header_1, txid, 200, 0);
 
     let mut spk_tracker = DerivedSpkTracker::new(LOOKAHEAD);
-    spk_tracker.insert_descriptor("external", descriptor, 0, []);
+    spk_tracker.insert_descriptor("external", descriptor, 0);
     let mut state = BlockingState::new(
         ReqCoord::default(),
         Cache::default(),
@@ -509,7 +510,7 @@ fn last_active_index_is_highest_regardless_of_notification_order() -> anyhow::Re
     let header_3 = block_with_tx(&header_2, txid_4, 300, 0);
 
     let mut spk_tracker = DerivedSpkTracker::new(LOOKAHEAD);
-    spk_tracker.insert_descriptor("external", descriptor, 0, []);
+    spk_tracker.insert_descriptor("external", descriptor, 0);
     let mut state = BlockingState::new(
         ReqCoord::default(),
         Cache::default(),
@@ -2347,6 +2348,65 @@ fn history_response_replaces_the_expected_txids() -> anyhow::Result<()> {
         evicted(&updates),
         vec![replacement],
         "the expected txids follow the server's last report, so only that is evicted a second time",
+    );
+    Ok(())
+}
+
+/// Expected txids come as one flat list of `(spk, txid)` across every keychain, and can arrive
+/// after the server has already reported each spk's history. Each must still be checked against
+/// what the server holds, whether the spk has history or none at all.
+#[test]
+fn flat_expectations_after_the_histories_are_in_are_evicted() -> anyhow::Result<()> {
+    let external = Descriptor::<DescriptorPublicKey>::from_str(&format!("wpkh({XPUB}/0/*)"))?;
+    let internal = Descriptor::<DescriptorPublicKey>::from_str(&format!("wpkh({XPUB}/1/*)"))?;
+    let external_spk = external.at_derivation_index(0)?.script_pubkey();
+    let internal_spk = internal.at_derivation_index(0)?.script_pubkey();
+    let tx = tx_paying(&external_spk, 50_000);
+    let kept = tx.compute_txid();
+    let cancelled_external = absent_txid(1);
+    let cancelled_internal = absent_txid(2);
+    let (genesis, header_1) = base_headers();
+    let header_2 = block_with_tx(&header_1, kept, 200, 0);
+
+    let mut spk_tracker = DerivedSpkTracker::new(0);
+    spk_tracker.insert_descriptor("external", external, 0);
+    spk_tracker.insert_descriptor("internal", internal, 0);
+    let mut state = BlockingState::new(
+        ReqCoord::default(),
+        Cache::default(),
+        spk_tracker,
+        CheckPoint::new(BlockId {
+            height: 0,
+            hash: genesis.block_hash(),
+        }),
+    );
+    let mut queue = ReqQueue::new();
+    let server = Server {
+        headers: vec![genesis, header_1, header_2],
+        txs: vec![(tx, 2)],
+        merkle_proof: (Vec::new(), 0),
+    };
+
+    state.start(&mut queue);
+    let updates = drain_requests(&mut state, &mut queue, &server);
+    assert!(evicted(&updates).is_empty());
+
+    state.insert_expected_spk_txids(
+        &mut queue,
+        [
+            (external_spk.clone(), kept),
+            (external_spk, cancelled_external),
+            (internal_spk, cancelled_internal),
+        ],
+    );
+    let updates = drain_requests(&mut state, &mut queue, &server);
+
+    let mut expected = vec![cancelled_external, cancelled_internal];
+    expected.sort();
+    assert_eq!(
+        evicted(&updates),
+        expected,
+        "every expected txid the server does not report is evicted, and only those",
     );
     Ok(())
 }

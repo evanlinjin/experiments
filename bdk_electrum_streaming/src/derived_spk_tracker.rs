@@ -116,16 +116,11 @@ impl<K: Ord + Clone> DerivedSpkTracker<K> {
     /// the widening, while an equal or smaller `next_index` is a no-op. Inserting a different
     /// descriptor discards the keychain's tracked spks and rebuilds the window from scratch. A
     /// descriptor without a wildcard derives one spk, so it is tracked at index 0 only.
-    ///
-    /// `expected_spk_txids` are the `(spk, txid)` pairs we expect the server to report, as
-    /// produced by `TxGraph::list_expected_spk_txids`. Only these txids can be reported as
-    /// evicted. They add to what is already expected.
     pub fn insert_descriptor(
         &mut self,
         keychain: K,
         descriptor: Descriptor<DescriptorPublicKey>,
         next_index: u32,
-        expected_spk_txids: impl IntoIterator<Item = (ScriptBuf, Txid)>,
     ) -> Vec<ElectrumScriptHash> {
         if let Some(old_descriptor) = self
             .descriptors
@@ -135,16 +130,35 @@ impl<K: Ord + Clone> DerivedSpkTracker<K> {
                 self._clear_tracked_spks_of_keychain(keychain.clone());
             }
         }
-        let new_script_hashes = (0_u32..=self._window_top(next_index))
+        (0_u32..=self._window_top(next_index))
             .filter_map(|index| self._add_derived_spk(keychain.clone(), index))
-            .collect();
+            .collect()
+    }
+
+    /// Add to the txids we expect the server to report, and return the tracked script hashes
+    /// whose expectations grew.
+    ///
+    /// `expected_spk_txids` are `(spk, txid)` pairs, as produced by
+    /// `TxGraph::list_expected_spk_txids`. Only these txids can be reported as evicted. A spk need
+    /// not be tracked yet: its expectations apply once a descriptor derives it.
+    pub fn insert_expected_spk_txids(
+        &mut self,
+        expected_spk_txids: impl IntoIterator<Item = (ScriptBuf, Txid)>,
+    ) -> BTreeSet<ElectrumScriptHash> {
+        let mut grown = BTreeSet::new();
         for (spk, txid) in expected_spk_txids {
-            self.expected_txids
-                .entry(ElectrumScriptHash::new(&spk))
+            let script_hash = ElectrumScriptHash::new(&spk);
+            if self
+                .expected_txids
+                .entry(script_hash)
                 .or_default()
-                .insert(txid);
+                .insert(txid)
+                && self.derived_spks_rev.contains_key(&script_hash)
+            {
+                grown.insert(script_hash);
+            }
         }
-        new_script_hashes
+        grown
     }
 
     /// Whether we expect any txids in `script_hash`'s history.
@@ -224,10 +238,10 @@ mod test {
         let desc = descriptor("0");
         let mut tracker = DerivedSpkTracker::<&str>::new(LOOKAHEAD);
 
-        let initial = tracker.insert_descriptor("keychain", desc.clone(), 0, []);
+        let initial = tracker.insert_descriptor("keychain", desc.clone(), 0);
         assert_eq!(initial, spk_hashes(&desc, 0..=LOOKAHEAD + 1));
 
-        let widened = tracker.insert_descriptor("keychain", desc.clone(), 10, []);
+        let widened = tracker.insert_descriptor("keychain", desc.clone(), 10);
         assert_eq!(
             widened,
             spk_hashes(&desc, LOOKAHEAD + 2..=10 + LOOKAHEAD + 1)
@@ -245,14 +259,14 @@ mod test {
         let desc = descriptor("0");
         let mut tracker = DerivedSpkTracker::<&str>::new(LOOKAHEAD);
 
-        tracker.insert_descriptor("keychain", desc.clone(), 10, []);
+        tracker.insert_descriptor("keychain", desc.clone(), 10);
         let window_before = tracker.all_spk_hashes().collect::<Vec<_>>();
 
         assert!(tracker
-            .insert_descriptor("keychain", desc.clone(), 10, [])
+            .insert_descriptor("keychain", desc.clone(), 10)
             .is_empty());
         assert!(tracker
-            .insert_descriptor("keychain", desc.clone(), 3, [])
+            .insert_descriptor("keychain", desc.clone(), 3)
             .is_empty());
         assert_eq!(tracker.all_spk_hashes().collect::<Vec<_>>(), window_before);
     }
@@ -263,8 +277,8 @@ mod test {
         let new_desc = descriptor("1");
         let mut tracker = DerivedSpkTracker::<&str>::new(LOOKAHEAD);
 
-        let old_hashes = tracker.insert_descriptor("keychain", old_desc, 3, []);
-        let new_hashes = tracker.insert_descriptor("keychain", new_desc.clone(), 0, []);
+        let old_hashes = tracker.insert_descriptor("keychain", old_desc, 3);
+        let new_hashes = tracker.insert_descriptor("keychain", new_desc.clone(), 0);
 
         assert_eq!(new_hashes, spk_hashes(&new_desc, 0..=LOOKAHEAD + 1));
         for old_hash in old_hashes {
@@ -278,7 +292,7 @@ mod test {
         let desc = descriptor("0");
         let mut tracker = DerivedSpkTracker::<&str>::new(LOOKAHEAD);
 
-        tracker.insert_descriptor("keychain", desc.clone(), 0, []);
+        tracker.insert_descriptor("keychain", desc.clone(), 0);
         let from_activity = tracker.mark_script_hash_used(&"keychain", LOOKAHEAD + 1);
         let activity_top = LOOKAHEAD + 2 + 1 + LOOKAHEAD;
         assert_eq!(
@@ -286,7 +300,7 @@ mod test {
             spk_hashes(&desc, (LOOKAHEAD + 2..=activity_top).rev()),
         );
 
-        let widened = tracker.insert_descriptor("keychain", desc.clone(), activity_top, []);
+        let widened = tracker.insert_descriptor("keychain", desc.clone(), activity_top);
         assert_eq!(
             widened,
             spk_hashes(&desc, activity_top + 1..=activity_top + LOOKAHEAD + 1),
@@ -300,16 +314,17 @@ mod test {
         let mut tracker = DerivedSpkTracker::<&str>::new(LOOKAHEAD);
         let hash = ElectrumScriptHash::new(spk(&desc, 0));
 
-        tracker.insert_descriptor("keychain", desc.clone(), 0, [(spk(&desc, 0), txid(1))]);
+        tracker.insert_descriptor("keychain", desc.clone(), 0);
+        tracker.insert_expected_spk_txids([(spk(&desc, 0), txid(1))]);
         assert_eq!(*tracker.expected_txids(hash), BTreeSet::from([txid(1)]));
 
         // A caller whose view has not caught up must not drop what it has not heard about yet.
-        tracker.insert_descriptor("keychain", desc.clone(), 0, [(spk(&desc, 0), txid(2))]);
+        tracker.insert_expected_spk_txids([(spk(&desc, 0), txid(2))]);
         assert_eq!(
             *tracker.expected_txids(hash),
             BTreeSet::from([txid(1), txid(2)]),
         );
-        tracker.insert_descriptor("keychain", desc.clone(), 0, []);
+        tracker.insert_expected_spk_txids([]);
         assert_eq!(
             *tracker.expected_txids(hash),
             BTreeSet::from([txid(1), txid(2)]),
@@ -331,15 +346,16 @@ mod test {
         let outside = LOOKAHEAD + 2;
         let hash = ElectrumScriptHash::new(spk(&desc, outside));
 
-        tracker.insert_descriptor(
-            "keychain",
-            desc.clone(),
-            0,
-            [(spk(&desc, outside), txid(1))],
+        tracker.insert_descriptor("keychain", desc.clone(), 0);
+        assert!(
+            tracker
+                .insert_expected_spk_txids([(spk(&desc, outside), txid(1))])
+                .is_empty(),
+            "an untracked spk has no subscription to recheck",
         );
         assert_eq!(tracker.indices_of_spk_hash(hash).next(), None);
 
-        tracker.insert_descriptor("keychain", desc.clone(), outside, []);
+        tracker.insert_descriptor("keychain", desc.clone(), outside);
         assert_eq!(
             tracker.indices_of_spk_hash(hash).collect::<Vec<_>>(),
             [("keychain", outside)],
@@ -354,15 +370,11 @@ mod test {
         let mut tracker = DerivedSpkTracker::<&str>::new(LOOKAHEAD);
         let old_hash = ElectrumScriptHash::new(spk(&old_desc, 0));
 
-        tracker.insert_descriptor(
-            "keychain",
-            old_desc.clone(),
-            0,
-            [(spk(&old_desc, 0), txid(1))],
-        );
+        tracker.insert_descriptor("keychain", old_desc.clone(), 0);
+        tracker.insert_expected_spk_txids([(spk(&old_desc, 0), txid(1))]);
         assert!(tracker.has_expected_txids(old_hash));
 
-        tracker.insert_descriptor("keychain", new_desc, 0, []);
+        tracker.insert_descriptor("keychain", new_desc, 0);
         assert!(!tracker.has_expected_txids(old_hash));
     }
 
@@ -371,7 +383,7 @@ mod test {
         let desc = Descriptor::from_str(&format!("wpkh({XPUB}/0/0)")).expect("must parse");
         let mut tracker = DerivedSpkTracker::<&str>::new(LOOKAHEAD);
 
-        let hashes = tracker.insert_descriptor("keychain", desc.clone(), 10, []);
+        let hashes = tracker.insert_descriptor("keychain", desc.clone(), 10);
         assert_eq!(hashes, spk_hashes(&desc, 0..=0));
         assert!(tracker.mark_script_hash_used(&"keychain", 0).is_empty());
         assert_eq!(tracker.all_spk_hashes().collect::<Vec<_>>(), hashes);
@@ -383,18 +395,36 @@ mod test {
         let mut tracker = DerivedSpkTracker::<&str>::new(LOOKAHEAD);
         let hash = ElectrumScriptHash::new(spk(&desc, 0));
 
-        tracker.insert_descriptor("a", desc.clone(), 0, [(spk(&desc, 0), txid(1))]);
-        tracker.insert_descriptor("b", desc.clone(), 0, []);
+        tracker.insert_descriptor("a", desc.clone(), 0);
+        tracker.insert_expected_spk_txids([(spk(&desc, 0), txid(1))]);
+        tracker.insert_descriptor("b", desc.clone(), 0);
         assert_eq!(
             tracker.indices_of_spk_hash(hash).collect::<Vec<_>>(),
             [("a", 0), ("b", 0)],
         );
 
-        tracker.insert_descriptor("a", descriptor("1"), 0, []);
+        tracker.insert_descriptor("a", descriptor("1"), 0);
         assert_eq!(
             tracker.indices_of_spk_hash(hash).collect::<Vec<_>>(),
             [("b", 0)],
         );
         assert!(tracker.has_expected_txids(hash));
+    }
+
+    /// A tracked spk's subscription may have resolved already, so the caller must learn which
+    /// expectations are new to recheck them; an expectation already held needs no recheck.
+    #[test]
+    fn only_new_expectations_of_tracked_spks_are_returned() {
+        let desc = descriptor("0");
+        let mut tracker = DerivedSpkTracker::<&str>::new(LOOKAHEAD);
+        tracker.insert_descriptor("keychain", desc.clone(), 0);
+        let hash = ElectrumScriptHash::new(spk(&desc, 0));
+
+        let grown =
+            tracker.insert_expected_spk_txids([(spk(&desc, 0), txid(1)), (spk(&desc, 0), txid(2))]);
+        assert_eq!(grown, BTreeSet::from([hash]));
+        assert!(tracker
+            .insert_expected_spk_txids([(spk(&desc, 0), txid(1))])
+            .is_empty());
     }
 }

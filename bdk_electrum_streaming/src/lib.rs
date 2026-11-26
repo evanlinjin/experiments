@@ -42,11 +42,10 @@ pub enum ClientAction<K, PReq: PendingRequest> {
         keychain: K,
         descriptor: Box<Descriptor<DescriptorPublicKey>>,
         next_index: u32,
-        /// The txids we expect the server to report for the spks this registers; see
-        /// [`DerivedSpkTracker::insert_descriptor`].
-        ///
-        /// [`DerivedSpkTracker::insert_descriptor`]: crate::DerivedSpkTracker::insert_descriptor
-        expected_spk_txids: Vec<(ScriptBuf, Txid)>,
     },
+    /// See [`DerivedSpkTracker::insert_expected_spk_txids`].
+    ///
+    /// [`DerivedSpkTracker::insert_expected_spk_txids`]: crate::DerivedSpkTracker::insert_expected_spk_txids
+    ExpectSpkTxids(Vec<(ScriptBuf, Txid)>),
     Stop,
 }

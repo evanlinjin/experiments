@@ -54,24 +54,30 @@ impl<K: Sync + Send + 'static> BlockingClient<K> {
     }
 
     /// Track `descriptor` under `keychain` through `next_index` plus lookahead.
-    ///
-    /// `expected_spk_txids` are the txids we expect the server to report for the spks this
-    /// registers; see
-    /// [`DerivedSpkTracker::insert_descriptor`](crate::DerivedSpkTracker::insert_descriptor).
     pub fn track_descriptor(
         &self,
         keychain: K,
         descriptor: Descriptor<DescriptorPublicKey>,
         next_index: u32,
-        expected_spk_txids: impl IntoIterator<Item = (ScriptBuf, Txid)>,
     ) -> anyhow::Result<()> {
         let descriptor = Box::new(descriptor);
         Ok(self.client_tx.send(BlockingClientAction::AddDescriptor {
             keychain,
             descriptor,
             next_index,
-            expected_spk_txids: expected_spk_txids.into_iter().collect(),
         })?)
+    }
+
+    /// Add to the txids we expect the server to report, such as the output of
+    /// `TxGraph::list_expected_spk_txids`; see
+    /// [`DerivedSpkTracker::insert_expected_spk_txids`](crate::DerivedSpkTracker::insert_expected_spk_txids).
+    pub fn expect_spk_txids(
+        &self,
+        expected_spk_txids: impl IntoIterator<Item = (ScriptBuf, Txid)>,
+    ) -> anyhow::Result<()> {
+        Ok(self.client_tx.send(BlockingClientAction::ExpectSpkTxids(
+            expected_spk_txids.into_iter().collect(),
+        ))?)
     }
 
     pub fn stop(self) -> anyhow::Result<()> {
@@ -221,15 +227,13 @@ where
                         keychain,
                         descriptor,
                         next_index,
-                        expected_spk_txids,
                     }) => {
-                        state.insert_descriptor(
-                            &mut req_queue,
-                            keychain,
-                            *descriptor,
-                            next_index,
-                            expected_spk_txids,
-                        );
+                        state.insert_descriptor(&mut req_queue, keychain, *descriptor, next_index);
+                    }
+                    StateAction::FromClient(BlockingClientAction::ExpectSpkTxids(
+                        expected_spk_txids,
+                    )) => {
+                        state.insert_expected_spk_txids(&mut req_queue, expected_spk_txids);
                     }
                     StateAction::FromClient(BlockingClientAction::Stop) => {
                         drop(write_tx);
